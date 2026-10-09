@@ -1,5 +1,13 @@
 # Traccar Live (QGIS) — Changes
 
+## v0.2.3
+
+Code-quality clean-up; no change in behaviour. flake8, pylint (errors), vulture, Bandit and
+detect-secrets all report nothing.
+- Removed unused imports; restored a collapsed multi-line expression; simpler nearest-marker lookup
+  and saved-password fallback.
+- `.flake8` in the package documents the deliberate column alignment (E221 / E272).
+
 ## v0.2.2
 
 Passes the QGIS plugin repository's security scan (Bandit), which blocked 0.2.1; no change in behaviour.

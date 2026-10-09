@@ -17,7 +17,6 @@ import shutil
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 TMP = tempfile.mkdtemp(prefix="traccar_real_")

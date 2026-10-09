@@ -1,0 +1,4 @@
+[flake8]
+max-line-length = 120
+# Assignments and keyword arguments are deliberately aligned in columns for readability.
+extend-ignore = E221, E272

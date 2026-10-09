@@ -38,7 +38,7 @@ from qgis.testing import start_app            # noqa: E402
 from qgis.testing.mocked import get_iface     # noqa: E402
 from qgis.core import (                       # noqa: E402
     Qgis, QgsProject, QgsVectorLayer, QgsVectorFileWriter, QgsWkbTypes, QgsFeature,
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsPointXY,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -46,7 +46,7 @@ PKG = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 # ── Fake Traccar server ──────────────────────────────────────────────────────
 NOW  = datetime.now(timezone.utc).replace(microsecond=0)
-USER, PWD = "test@example.com", "secret"
+USER, PWD = "test@example.com", "secret"  # pragma: allowlist secret  (fake server)
 DEVICES = [{"id": 1, "name": "Phone A", "status": "online"},
            {"id": 2, "name": "Van 3", "status": "offline"},
            {"id": 3, "name": "Spare", "status": "unknown"}]
@@ -423,7 +423,8 @@ def t12_edit_session_respected():
 
 @test
 def t13_custom_past_window():
-    loc = lambda d: d.astimezone().strftime("%Y-%m-%d %H:%M")
+    def loc(d):
+        return d.astimezone().strftime("%Y-%m-%d %H:%M")
     plugin.cfg.update(window_minutes=-1, custom_from=loc(VAN_START - timedelta(minutes=5)),
                       custom_to=loc(VAN_START + timedelta(minutes=30)))
     ok = load()
