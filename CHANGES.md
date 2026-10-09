@@ -1,12 +1,19 @@
 # Traccar Live (QGIS) — Changes
 
+## v0.2.4
+
+No change in behaviour.
+- The `.flake8` file is gone: the repository's scanner treats any included tool config as possibly
+  suppressing checks ("Validated (configured)", needing an administrator's review). The column
+  alignment it allowed has been removed instead, so flake8 is clean with the site's default settings.
+
 ## v0.2.3
 
 Code-quality clean-up; no change in behaviour. flake8, pylint (errors), vulture, Bandit and
 detect-secrets all report nothing.
 - Removed unused imports; restored a collapsed multi-line expression; simpler nearest-marker lookup
   and saved-password fallback.
-- `.flake8` in the package documents the deliberate column alignment (E221 / E272).
+- `.flake8` in the package documents the deliberate column alignment (E221 / E272) — removed again in 0.2.4.
 
 ## v0.2.2
 

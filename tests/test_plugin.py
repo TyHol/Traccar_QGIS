@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 PKG = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # ── Fake Traccar server ──────────────────────────────────────────────────────
-NOW  = datetime.now(timezone.utc).replace(microsecond=0)
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 USER, PWD = "test@example.com", "secret"  # pragma: allowlist secret  (fake server)
 DEVICES = [{"id": 1, "name": "Phone A", "status": "online"},
            {"id": 2, "name": "Van 3", "status": "offline"},
