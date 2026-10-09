@@ -1,0 +1,11 @@
+[general]
+name=Traccar Live
+qgisMinimumVersion=3.16
+description=Poll a Traccar server and display latest device positions as a live layer
+version=0.1.0
+author=TyHol
+email=itonyholmes@gmail.com
+homepage=https://www.traccar.org/traccar-api/
+tracker=
+repository=
+hasProcessingProvider=no
