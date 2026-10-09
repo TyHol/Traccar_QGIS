@@ -8,12 +8,12 @@ A QGIS plugin that shows your [Traccar](https://www.traccar.org) GPS devices on 
 - **Two layers, saved on demand** — positions and tracks, into any point / line layers, in any CRS.
 - **Same layers and fields as the QField plugin [Traccar_QField](https://github.com/TyHol/Traccar_QField)**, so one GeoPackage works in the office and in the field.
 
-Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.2.3](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
+Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.2.4](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
 
 ---
 
 ## Install
-1. Download **`Traccar_QGIS_v0.2.3.zip`** from the [release page](https://github.com/TyHol/Traccar_QGIS/releases/latest) (don't unzip it).
+1. Download **`Traccar_QGIS_v0.2.4.zip`** from the [release page](https://github.com/TyHol/Traccar_QGIS/releases/latest) (don't unzip it).
 2. In QGIS: **Plugins → Manage and Install Plugins → Install from ZIP**, choose the file, click *Install Plugin*.
 
 You need a Traccar account — your own server or e.g. `https://server.traccar.org`.

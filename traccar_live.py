@@ -88,37 +88,37 @@ def _new_or_old(new_root, new_name, old_root, old_name):
         return getattr(old_root, old_name)
 
 
-_GEOM_POINT   = _new_or_old(getattr(Qgis, "GeometryType", None), "Point", QgsWkbTypes, "PointGeometry")
-_GEOM_LINE    = _new_or_old(getattr(Qgis, "GeometryType", None), "Line",  QgsWkbTypes, "LineGeometry")
-_LF_POINT     = _new_or_old(getattr(Qgis, "LayerFilter", None), "PointLayer",
-                            getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "PointLayer")
-_LF_LINE      = _new_or_old(getattr(Qgis, "LayerFilter", None), "LineLayer",
-                            getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "LineLayer")
-_LF_VECTOR    = _new_or_old(getattr(Qgis, "LayerFilter", None), "VectorLayer",
-                            getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "VectorLayer")
-_FF_STRING    = _e(QgsFieldProxyModel, "Filter", "String")
-_RENDER_M     = _new_or_old(getattr(Qgis, "RenderUnit", None), "MetersInMapUnits",
-                            QgsUnitTypes, "RenderMetersInMapUnits")
-_MSG_INFO     = _e(Qgis, "MessageLevel", "Info")
-_MSG_WARN     = _e(Qgis, "MessageLevel", "Warning")
-_MSG_OK       = _e(Qgis, "MessageLevel", "Success")
-_HTTP_STATUS  = _e(QNetworkRequest, "Attribute", "HttpStatusCodeAttribute")
-_NET_OK       = _e(QNetworkReply, "NetworkError", "NoError")
-_BTN_OK       = _e(QDialogButtonBox, "StandardButton", "Ok")
-_BTN_CANCEL   = _e(QDialogButtonBox, "StandardButton", "Cancel")
-_DLG_OK       = _e(QDialog, "DialogCode", "Accepted")
-_ECHO_PWD     = _e(QLineEdit, "EchoMode", "Password")
-_NO_EDIT      = _e(QAbstractItemView, "EditTrigger", "NoEditTriggers")
-_SEL_ROWS     = _e(QAbstractItemView, "SelectionBehavior", "SelectRows")
-_HV_STRETCH   = _e(QHeaderView, "ResizeMode", "Stretch")
-_HV_CONTENTS  = _e(QHeaderView, "ResizeMode", "ResizeToContents")
-_VFW_OK       = _e(QgsVectorFileWriter, "WriterError", "NoError")
-_GPKG_NEW     = _e(QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteFile")
-_GPKG_LAYER   = _e(QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteLayer")
-_ANTIALIAS    = _e(QPainter, "RenderHint", "Antialiasing")
-_CAP_ROUND    = _e(Qt, "PenCapStyle", "RoundCap")
-_JOIN_ROUND   = _e(Qt, "PenJoinStyle", "RoundJoin")
-_NO_BRUSH     = _e(Qt, "BrushStyle", "NoBrush")
+_GEOM_POINT = _new_or_old(getattr(Qgis, "GeometryType", None), "Point", QgsWkbTypes, "PointGeometry")
+_GEOM_LINE = _new_or_old(getattr(Qgis, "GeometryType", None), "Line",  QgsWkbTypes, "LineGeometry")
+_LF_POINT = _new_or_old(getattr(Qgis, "LayerFilter", None), "PointLayer",
+                        getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "PointLayer")
+_LF_LINE = _new_or_old(getattr(Qgis, "LayerFilter", None), "LineLayer",
+                       getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "LineLayer")
+_LF_VECTOR = _new_or_old(getattr(Qgis, "LayerFilter", None), "VectorLayer",
+                         getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "VectorLayer")
+_FF_STRING = _e(QgsFieldProxyModel, "Filter", "String")
+_RENDER_M = _new_or_old(getattr(Qgis, "RenderUnit", None), "MetersInMapUnits",
+                        QgsUnitTypes, "RenderMetersInMapUnits")
+_MSG_INFO = _e(Qgis, "MessageLevel", "Info")
+_MSG_WARN = _e(Qgis, "MessageLevel", "Warning")
+_MSG_OK = _e(Qgis, "MessageLevel", "Success")
+_HTTP_STATUS = _e(QNetworkRequest, "Attribute", "HttpStatusCodeAttribute")
+_NET_OK = _e(QNetworkReply, "NetworkError", "NoError")
+_BTN_OK = _e(QDialogButtonBox, "StandardButton", "Ok")
+_BTN_CANCEL = _e(QDialogButtonBox, "StandardButton", "Cancel")
+_DLG_OK = _e(QDialog, "DialogCode", "Accepted")
+_ECHO_PWD = _e(QLineEdit, "EchoMode", "Password")
+_NO_EDIT = _e(QAbstractItemView, "EditTrigger", "NoEditTriggers")
+_SEL_ROWS = _e(QAbstractItemView, "SelectionBehavior", "SelectRows")
+_HV_STRETCH = _e(QHeaderView, "ResizeMode", "Stretch")
+_HV_CONTENTS = _e(QHeaderView, "ResizeMode", "ResizeToContents")
+_VFW_OK = _e(QgsVectorFileWriter, "WriterError", "NoError")
+_GPKG_NEW = _e(QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteFile")
+_GPKG_LAYER = _e(QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteLayer")
+_ANTIALIAS = _e(QPainter, "RenderHint", "Antialiasing")
+_CAP_ROUND = _e(Qt, "PenCapStyle", "RoundCap")
+_JOIN_ROUND = _e(Qt, "PenJoinStyle", "RoundJoin")
+_NO_BRUSH = _e(Qt, "BrushStyle", "NoBrush")
 
 
 def _sl_prop(name):
@@ -137,12 +137,12 @@ def _is_null(v):
 #  Constants
 # ════════════════════════════════════════════════════════════════════════════
 
-SETTINGS_NS   = "TraccarLive"
-MENU_LABEL    = "&Traccar Live"
-DEFAULT_URL   = "https://server.traccar.org"
-GROUP_NAME    = "Traccar (live)"
-OVERLAY_PROP  = "traccar_overlay"
-WGS84         = QgsCoordinateReferenceSystem("EPSG:4326")
+SETTINGS_NS = "TraccarLive"
+MENU_LABEL = "&Traccar Live"
+DEFAULT_URL = "https://server.traccar.org"
+GROUP_NAME = "Traccar (live)"
+OVERLAY_PROP = "traccar_overlay"
+WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
 # Time window choices: minutes > 0 = moving "Last …", -1 = custom dates, -2 = from feature
 WINDOW_CHOICES = [
@@ -353,8 +353,8 @@ class _Api:
     """creds() → (username, password) or None (no login saved)."""
 
     def __init__(self, cfg, creds):
-        self.cfg      = cfg
-        self.creds    = creds
+        self.cfg = cfg
+        self.creds = creds
         self._pending = set()
 
     def get(self, path, on_ok, on_err):
@@ -377,9 +377,9 @@ class _Api:
         def finished():
             self._pending.discard(reply)
             status = reply.attribute(_HTTP_STATUS)
-            err    = reply.error()
+            err = reply.error()
             errstr = reply.errorString()
-            data   = bytes(reply.readAll())
+            data = bytes(reply.readAll())
             reply.deleteLater()
             if err == _NET_OK and (status is None or int(status) == 200):
                 try:
@@ -464,7 +464,7 @@ class _LiveItem(QgsMapCanvasItem):
     def __init__(self, canvas):
         super().__init__(canvas)
         self._canvas = canvas
-        self.tracks  = []     # [(QColor, [QgsPointXY])]
+        self.tracks = []     # [(QColor, [QgsPointXY])]
         self.markers = []     # [{"pt", "acc_pt", "color", "label", "tip"}]
         self.show_markers = self.show_labels = self.show_tracks = True
         self.show_accuracy = False
@@ -550,7 +550,7 @@ class MainDialog(QDialog):
         cl = QHBoxLayout(self.custom_w)
         cl.setContentsMargins(0, 0, 0, 0)
         self.from_edit = QDateTimeEdit()
-        self.to_edit   = QDateTimeEdit()
+        self.to_edit = QDateTimeEdit()
         for ed in (self.from_edit, self.to_edit):
             ed.setCalendarPopup(True)
             ed.setDisplayFormat("yyyy-MM-dd HH:mm")
@@ -605,9 +605,9 @@ class MainDialog(QDialog):
         # ── What to show ──────────────────────────────────────────────────
         show = QHBoxLayout()
         show.addWidget(QLabel("Show:"))
-        self.chk_markers  = QCheckBox("Markers")
-        self.chk_labels   = QCheckBox("Labels")
-        self.chk_tracks   = QCheckBox("Tracks")
+        self.chk_markers = QCheckBox("Markers")
+        self.chk_labels = QCheckBox("Labels")
+        self.chk_tracks = QCheckBox("Tracks")
         self.chk_accuracy = QCheckBox("Accuracy")
         for c in (self.chk_markers, self.chk_labels, self.chk_tracks, self.chk_accuracy):
             show.addWidget(c)
@@ -847,7 +847,7 @@ class SettingsDialog(QDialog):
         self.pt_name.setFilters(_FF_STRING)
         self.pt_name.setAllowEmptyFieldName(True)
         self.pt_latest = QRadioButton("Save the latest fix per device")
-        self.pt_every  = QRadioButton("Save every fix in the time window")
+        self.pt_every = QRadioButton("Save every fix in the time window")
         self._pt_group = QButtonGroup(self)
         self._pt_group.addButton(self.pt_latest)
         self._pt_group.addButton(self.pt_every)
@@ -866,7 +866,7 @@ class SettingsDialog(QDialog):
         self.ln_name = QgsFieldComboBox()
         self.ln_name.setFilters(_FF_STRING)
         self.ln_name.setAllowEmptyFieldName(True)
-        self.ln_add  = QRadioButton("Add a new track for each device on every save")
+        self.ln_add = QRadioButton("Add a new track for each device on every save")
         self.ln_keep = QRadioButton("Keep only the most recent track per device")
         self._ln_group = QButtonGroup(self)
         self._ln_group.addButton(self.ln_add)
@@ -959,9 +959,9 @@ class SettingsDialog(QDialog):
         self.ev_combo = QgsMapLayerComboBox()
         self.ev_combo.setFilters(_LF_VECTOR)
         self.ev_combo.setAllowEmptyLayer(True)
-        self.ev_disp  = QgsFieldComboBox()
+        self.ev_disp = QgsFieldComboBox()
         self.ev_start = QgsFieldComboBox()
-        self.ev_end   = QgsFieldComboBox()
+        self.ev_end = QgsFieldComboBox()
         for fc in (self.ev_disp, self.ev_start, self.ev_end):
             fc.setAllowEmptyFieldName(True)
         gf.addRow("Layer (e.g. incidents):", self.ev_combo)
@@ -1129,32 +1129,32 @@ local time. For a local date/time in labels use <code>datetime_from_epoch(epoch(
 class TraccarLive:
 
     def __init__(self, iface):
-        self.iface   = iface
-        self.cfg     = {}
+        self.iface = iface
+        self.cfg = {}
         self._load_settings()
-        self._login  = None         # (username, password) for this session, from the auth manager
-        self.api     = _Api(self.cfg, self._credentials)
-        self.timer   = QTimer()
+        self._login = None         # (username, password) for this session, from the auth manager
+        self.api = _Api(self.cfg, self._credentials)
+        self.timer = QTimer()
         self.timer.timeout.connect(self.poll_live)
         self._actions = []
-        self.dlg      = None
+        self.dlg = None
 
         # Runtime state
-        self.live         = False
-        self.loading      = False
+        self.live = False
+        self.loading = False
         self.load_started = 0.0
-        self.devices      = {}      # dev_id → {name, status}
-        self.win          = None    # see _compute_window()
-        self.tracks       = {}      # dev_id → [positions in window], oldest first
-        self.latest       = {}      # dev_id → latest position
-        self.marker_pos   = {}      # dev_id → position drawn as the marker
-        self.device_rows  = []
-        self.last_update  = ""
-        self.status_msg   = ""
-        self.last_error   = ""
+        self.devices = {}      # dev_id → {name, status}
+        self.win = None    # see _compute_window()
+        self.tracks = {}      # dev_id → [positions in window], oldest first
+        self.latest = {}      # dev_id → latest position
+        self.marker_pos = {}      # dev_id → position drawn as the marker
+        self.device_rows = []
+        self.last_update = ""
+        self.status_msg = ""
+        self.last_error = ""
         self._mk_id = ""            # Temp layer ids ("layers" live view)
         self._tk_id = ""
-        self._item  = None          # canvas item ("canvas" live view)
+        self._item = None          # canvas item ("canvas" live view)
         self._tip_on = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
@@ -1410,7 +1410,7 @@ class TraccarLive:
         tag = ""
         if m == -1:
             frm = _parse_local(self.cfg["custom_from"])
-            to  = _parse_local(self.cfg["custom_to"])
+            to = _parse_local(self.cfg["custom_to"])
             if not frm or not to:
                 return {"error": "Set From and To, then click Show this window."}
         else:
@@ -1461,10 +1461,10 @@ class TraccarLive:
         for feat in lyr.getFeatures():
             def val(field):
                 return feat[field] if field and field in names else None
-            disp  = val(self.cfg["event_display_field"])
-            disp  = "" if _is_null(disp) else str(disp)
+            disp = val(self.cfg["event_display_field"])
+            disp = "" if _is_null(disp) else str(disp)
             start = _attr_to_utc(val(self.cfg["event_start_field"]))
-            end   = _attr_to_utc(val(self.cfg["event_end_field"]))
+            end = _attr_to_utc(val(self.cfg["event_end_field"]))
             label = disp or "#%d" % feat.id()
             if start:
                 label += "  (%s – %s)" % (_fmt_local(start), _fmt_local(end) if end else "ongoing")
@@ -1629,7 +1629,7 @@ class TraccarLive:
 
         rows = []
         for dev_id, info in self.devices.items():
-            tr  = self.tracks.get(dev_id, [])
+            tr = self.tracks.get(dev_id, [])
             pos = mp.get(dev_id)
             attrs = (pos or {}).get("attributes") or {}
             bat = attrs.get("batteryLevel")
@@ -1675,7 +1675,7 @@ class TraccarLive:
             lyr = QgsVectorLayer(uri, "Temp Tracks", "memory")
         lyr.setCustomProperty(OVERLAY_PROP, 1)
         lyr.setCustomProperty("skipMemoryLayersCheck", 1)   # no "save scratch layers?" prompt
-        root  = QgsProject.instance().layerTreeRoot()
+        root = QgsProject.instance().layerTreeRoot()
         group = root.findGroup(GROUP_NAME) or root.insertGroup(0, GROUP_NAME)
         QgsProject.instance().addMapLayer(lyr, False)
         if which == "markers":
@@ -1768,9 +1768,9 @@ class TraccarLive:
     # ── Drawn on the map ──────────────────────────────────────────────────
     def _apply_item_flags(self):
         it = self._item
-        it.show_markers  = bool(self.cfg["show_markers"])
-        it.show_labels   = bool(self.cfg["show_labels"])
-        it.show_tracks   = bool(self.cfg["show_tracks"])
+        it.show_markers = bool(self.cfg["show_markers"])
+        it.show_labels = bool(self.cfg["show_labels"])
+        it.show_tracks = bool(self.cfg["show_tracks"])
         it.show_accuracy = bool(self.cfg["show_accuracy"])
 
     def _marker_tip(self, dev_id, p):
@@ -2073,17 +2073,17 @@ class TraccarLive:
 
     def _write_points(self, lyr, positions):
         fields = lyr.fields()
-        names  = fields.names()
+        names = fields.names()
         name_field = self._name_field(names, self.cfg["points_name_field"])
-        tr     = QgsCoordinateTransform(WGS84, lyr.crs(), QgsProject.instance())
-        has_z  = QgsWkbTypes.hasZ(lyr.wkbType())
-        saved  = datetime.now(timezone.utc)
-        tag    = self.win["tag"] if self.win else ""
-        feats  = []
+        tr = QgsCoordinateTransform(WGS84, lyr.crs(), QgsProject.instance())
+        has_z = QgsWkbTypes.hasZ(lyr.wkbType())
+        saved = datetime.now(timezone.utc)
+        tag = self.win["tag"] if self.win else ""
+        feats = []
         for p in positions:
             dev_id = p.get("deviceId")
-            info   = self.devices.get(dev_id, {})
-            attrs  = p.get("attributes") or {}
+            info = self.devices.get(dev_id, {})
+            attrs = p.get("attributes") or {}
             vals = {
                 "device_id": dev_id, "name": self._name(dev_id), "status": info.get("status", ""),
                 "fix_time": p["_t"], "fix_local": _local_text(p["_t"]),
@@ -2106,9 +2106,9 @@ class TraccarLive:
 
     def _write_tracks(self, lyr, by_dev):
         fields = lyr.fields()
-        names  = fields.names()
+        names = fields.names()
         name_field = self._name_field(names, self.cfg["tracks_name_field"])
-        w      = self.win
+        w = self.win
 
         # "Keep most recent": earlier tracks of the same device, by device_id or name
         delete_ids = []
@@ -2125,7 +2125,7 @@ class TraccarLive:
                     if not _is_null(v) and str(v) in keys:
                         delete_ids.append(f.id())
 
-        tr    = QgsCoordinateTransform(WGS84, lyr.crs(), QgsProject.instance())
+        tr = QgsCoordinateTransform(WGS84, lyr.crs(), QgsProject.instance())
         saved = datetime.now(timezone.utc)
         feats = []
         for dev_id, pts in by_dev.items():
