@@ -1,5 +1,12 @@
 # Traccar Live (QGIS) — Changes
 
+## v0.2.2
+
+Passes the QGIS plugin repository's security scan (Bandit), which blocked 0.2.1; no change in behaviour.
+- The old plain-text password setting is no longer part of the settings defaults; it is read once,
+  only to move it into QGIS's password manager.
+- The MD5 hash that picks each device's colour is marked as not used for security.
+
 ## v0.2.1
 
 Packaging for the QGIS plugin repository (plugins.qgis.org), and the login moves to QGIS's password manager.
