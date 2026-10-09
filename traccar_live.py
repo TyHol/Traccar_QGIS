@@ -37,7 +37,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import quote as _quote
 
 from qgis.PyQt.QtCore import QTimer, QSettings, QDateTime, QDate, QTime, QUrl, Qt, QPointF
-from qgis.PyQt.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPolygonF, QPainterPath
+from qgis.PyQt.QtGui import QColor, QIcon, QPainter, QPen, QBrush, QFont, QPolygonF, QPainterPath
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
@@ -1092,7 +1092,8 @@ class TraccarLive:
     # ── Lifecycle ─────────────────────────────────────────────────────────
     def initGui(self):
         mw = self.iface.mainWindow()
-        self.act_open = QAction("Traccar Live", mw)
+        self.act_open = QAction(QIcon(os.path.join(os.path.dirname(__file__), "icon.png")),
+                                "Traccar Live", mw)
         self.act_open.setToolTip("Traccar Live — time window, devices and saving")
         self.act_open.triggered.connect(self.open_main)
         self.act_live = QAction("▶ Live", mw)

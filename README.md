@@ -8,12 +8,12 @@ A QGIS plugin that shows your [Traccar](https://www.traccar.org) GPS devices on 
 - **Two layers, saved on demand** — positions and tracks, into any point / line layers, in any CRS.
 - **Same layers and fields as the QField plugin [Traccar_QField](https://github.com/TyHol/Traccar_QField)**, so one GeoPackage works in the office and in the field.
 
-Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.2.0](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
+Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.2.1](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
 
 ---
 
 ## Install
-1. Download **`Traccar_QGIS_v0.2.0.zip`** from the [release page](https://github.com/TyHol/Traccar_QGIS/releases/latest) (don't unzip it).
+1. Download **`Traccar_QGIS_v0.2.1.zip`** from the [release page](https://github.com/TyHol/Traccar_QGIS/releases/latest) (don't unzip it).
 2. In QGIS: **Plugins → Manage and Install Plugins → Install from ZIP**, choose the file, click *Install Plugin*.
 
 You need a Traccar account — your own server or e.g. `https://server.traccar.org`.
@@ -115,7 +115,7 @@ Settings are stored in your QGIS user profile (the password too), so a new compu
   python-qgis.bat tests\test_plugin.py          (QGIS 4.x)
   ```
 - [`tests/real_server_check.py`](tests/real_server_check.py) — a read-only check against a real Traccar server, using the login saved in a QGIS profile (never printed).
-- The release zip contains a `Traccar_QGIS/` folder with the plugin files and `LICENSE`.
+- The release zip contains a `traccar_live/` folder with the plugin files, `icon.png` and `LICENSE` (the layout plugins.qgis.org requires).
 
 ## Licence
 Copyright © 2026 TyHol. Released under the [GNU General Public License v2.0 or later](LICENSE) (GPL-2.0-or-later), the same licence as QGIS.
