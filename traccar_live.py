@@ -24,6 +24,7 @@ Compatible with QGIS 3.28 LTR … 3.44 (Qt5 / PyQt5) and QGIS 4.x (Qt6 / PyQt6).
 """
 
 import json
+import os
 import base64
 import hashlib
 import re
@@ -346,6 +347,17 @@ class _Api:
 
 def _memory_uri(geom, schema, crs="EPSG:4326"):
     return geom + "?crs=" + crs + "".join("&field=%s:%s" % f for f in schema)
+
+
+def default_gpkg_path():
+    """Suggested file for New GeoPackage: traccar.gpkg in the project's home folder
+    (else the last folder used, else the user's home), never an existing file."""
+    folder = QgsProject.instance().homePath()         or QSettings().value(SETTINGS_NS + "/last_gpkg_dir", "", type=str)         or os.path.expanduser("~")
+    path, n = os.path.join(folder, "traccar.gpkg"), 2
+    while os.path.exists(path):
+        path = os.path.join(folder, "traccar_%d.gpkg" % n)
+        n += 1
+    return path
 
 
 def create_template_gpkg(path, crs_authid="EPSG:4326"):
@@ -846,12 +858,13 @@ class SettingsDialog(QDialog):
                 lambda m: self.test_lbl.setText("<span style='color:#B71C1C'>✕ %s</span>" % m))
 
     def _new_gpkg(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Create Traccar GeoPackage", "",
-                                              "GeoPackage (*.gpkg)")
+        path, _ = QFileDialog.getSaveFileName(self, "Create Traccar GeoPackage",
+                                              default_gpkg_path(), "GeoPackage (*.gpkg)")
         if not path:
             return
         if not path.lower().endswith(".gpkg"):
             path += ".gpkg"
+        QSettings().setValue(SETTINGS_NS + "/last_gpkg_dir", os.path.dirname(path))
         pts, trk, errors = create_template_gpkg(path)
         for lyr, name, combo in ((pts, "Traccar positions", self.pt_combo),
                                  (trk, "Traccar tracks", self.ln_combo)):

@@ -238,6 +238,21 @@ def t06_template_gpkg():
 
 
 @test
+def t06b_default_gpkg_in_project_home():
+    home = os.path.join(TMP, "project home")
+    os.makedirs(home, exist_ok=True)
+    QgsProject.instance().setPresetHomePath(home)
+    first = mod.default_gpkg_path()
+    check("New GeoPackage suggests traccar.gpkg in the project home",
+          first == os.path.join(home, "traccar.gpkg"), first)
+    open(first, "w").close()
+    second = mod.default_gpkg_path()
+    check("existing traccar.gpkg is never offered again",
+          second == os.path.join(home, "traccar_2.gpkg"), second)
+    QgsProject.instance().setPresetHomePath("")
+
+
+@test
 def t07_save_latest_positions():
     lyr = QgsProject.instance().mapLayer(plugin.cfg["points_layer_id"])
     plugin.save_positions()
