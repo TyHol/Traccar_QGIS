@@ -85,10 +85,16 @@ for f in trk.getFeatures():
     print("  track %-20s %5d vertices  start %s (stored UTC: %s)" % (
         f["name"], len(list(g.vertices())), f["start_local"],
         f["start_time"].toString("yyyy-MM-dd HH:mm:ss t")))
-mk = QgsProject.instance().mapLayer(plugin._mk_id)
-print("Overlay: %d marker(s)" % (mk.featureCount() if mk else 0))
+if plugin._item is not None:
+    print("Live view (drawn on map): %d marker(s), %d track(s)"
+          % (len(plugin._item.markers), len(plugin._item.tracks)))
+else:
+    mk = QgsProject.instance().mapLayer(plugin._mk_id)
+    print("Live view (Temp layers): %d marker(s)" % (mk.featureCount() if mk else 0))
 plugin.clear()
 QgsProject.instance().clear()
 shutil.rmtree(TMP, ignore_errors=True)
 sys.stdout.flush()
+from qgis.core import QgsApplication  # noqa: E402
+QgsApplication.exitQgis()
 os._exit(0)

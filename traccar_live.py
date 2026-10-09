@@ -24,6 +24,7 @@ Compatible with QGIS 3.28 LTR … 3.44 (Qt5 / PyQt5) and QGIS 4.x (Qt6 / PyQt6).
 """
 
 import json
+import math
 import os
 import base64
 import hashlib
@@ -32,15 +33,15 @@ import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote as _quote
 
-from qgis.PyQt.QtCore import QTimer, QSettings, QDateTime, QDate, QTime, QUrl, Qt
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtCore import QTimer, QSettings, QDateTime, QDate, QTime, QUrl, Qt, QPointF
+from qgis.PyQt.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPolygonF, QPainterPath
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
     QLabel, QLineEdit, QSpinBox, QDateTimeEdit, QComboBox, QCheckBox,
     QRadioButton, QButtonGroup, QPushButton, QDialogButtonBox, QTabWidget,
     QWidget, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton,
+    QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton, QToolTip,
 )
 from qgis.core import (
     Qgis, QgsProject, QgsVectorLayer, QgsField, QgsFields, QgsFeature,
@@ -53,7 +54,7 @@ from qgis.core import (
     QgsPalLayerSettings, QgsTextFormat, QgsTextBufferSettings,
     QgsVectorLayerSimpleLabeling,
 )
-from qgis.gui import QgsMapLayerComboBox, QgsFieldComboBox
+from qgis.gui import QgsMapLayerComboBox, QgsFieldComboBox, QgsMapCanvasItem
 
 try:
     from qgis.core import NULL
@@ -111,6 +112,10 @@ _HV_CONTENTS  = _e(QHeaderView, "ResizeMode", "ResizeToContents")
 _VFW_OK       = _e(QgsVectorFileWriter, "WriterError", "NoError")
 _GPKG_NEW     = _e(QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteFile")
 _GPKG_LAYER   = _e(QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteLayer")
+_ANTIALIAS    = _e(QPainter, "RenderHint", "Antialiasing")
+_CAP_ROUND    = _e(Qt, "PenCapStyle", "RoundCap")
+_JOIN_ROUND   = _e(Qt, "PenJoinStyle", "RoundJoin")
+_NO_BRUSH     = _e(Qt, "BrushStyle", "NoBrush")
 
 
 def _sl_prop(name):
@@ -171,6 +176,7 @@ DEFAULTS = {
     "points_layer_id": "", "points_name_field": "", "points_mode": 0,
     "tracks_layer_id": "", "tracks_name_field": "", "tracks_mode": 0,
     "tag_enabled": False, "tag_text": "", "tag_field": "", "tag_from_feature": False,
+    "live_view": "canvas",          # "canvas" = drawn on the map, "layers" = Temp Markers / Temp Tracks
     "v2_migrated": False,
 }
 
@@ -383,6 +389,79 @@ def create_template_gpkg(path, crs_authid="EPSG:4326"):
         if not lyr.isValid():
             errors.append("%s: could not open the new table" % table)
     return out[0], out[1], errors
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Live view drawn on the map (no layers)
+# ════════════════════════════════════════════════════════════════════════════
+
+class _LiveItem(QgsMapCanvasItem):
+    """Tracks, markers, labels and accuracy circles painted straight onto the map
+    canvas. Covers the visible extent; QGIS calls updatePosition() on every pan /
+    zoom. Points are held in the canvas CRS. Screen only — not in print layouts."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self._canvas = canvas
+        self.tracks  = []     # [(QColor, [QgsPointXY])]
+        self.markers = []     # [{"pt", "acc_pt", "color", "label", "tip"}]
+        self.show_markers = self.show_labels = self.show_tracks = True
+        self.show_accuracy = False
+        self.setZValue(50)
+        self.updatePosition()
+
+    def updatePosition(self):
+        self.setRect(self._canvas.mapSettings().visibleExtent())
+
+    def paint(self, painter, option=None, widget=None):
+        off = self.pos()
+
+        def px(pt):
+            return self.toCanvasCoordinates(pt) - off
+
+        painter.setRenderHint(_ANTIALIAS, True)
+        if self.show_tracks:
+            for color, pts in self.tracks:
+                pen = QPen(color)
+                pen.setWidthF(3.0)
+                pen.setCapStyle(_CAP_ROUND)
+                pen.setJoinStyle(_JOIN_ROUND)
+                painter.setPen(pen)
+                painter.setBrush(QBrush(_NO_BRUSH))
+                painter.drawPolyline(QPolygonF([px(p) for p in pts]))
+        if not self.show_markers:
+            return
+        font = QFont()
+        font.setPointSizeF(9)
+        font.setBold(True)
+        for m in self.markers:
+            c = px(m["pt"])
+            if self.show_accuracy and m["acc_pt"] is not None:
+                e = px(m["acc_pt"])
+                r = math.hypot(e.x() - c.x(), e.y() - c.y())
+                if 3 < r < 4000:
+                    fill, edge = QColor(m["color"]), QColor(m["color"])
+                    fill.setAlpha(40)
+                    edge.setAlpha(150)
+                    painter.setPen(QPen(edge, 1))
+                    painter.setBrush(QBrush(fill))
+                    painter.drawEllipse(c, r, r)
+            painter.setPen(QPen(QColor("white"), 2))
+            painter.setBrush(QBrush(m["color"]))
+            painter.drawEllipse(c, 6.5, 6.5)
+            if self.show_labels and m["label"]:
+                path = QPainterPath()
+                path.addText(c + QPointF(9, -7), font, m["label"])
+                painter.strokePath(path, QPen(QColor(255, 255, 255, 230), 3))
+                painter.fillPath(path, QBrush(m["color"].darker(130)))
+
+
+def _decimate(items, max_n):
+    """At most max_n items, evenly spaced, always keeping the first and last."""
+    if len(items) <= max_n:
+        return items
+    step = (len(items) - 1) / float(max_n - 1)
+    return [items[int(round(i * step))] for i in range(max_n)]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -657,6 +736,7 @@ class SettingsDialog(QDialog):
     def __init__(self, plugin, parent, tab=0):
         super().__init__(parent)
         self.p = plugin
+        self._closed = False
         c = plugin.cfg
         self.setWindowTitle("Traccar Live – Settings")
         self.setMinimumWidth(480)
@@ -795,6 +875,20 @@ class SettingsDialog(QDialog):
         gf.addRow("Grey when last fix is older than:", self.stale_spin)
         v.addWidget(g)
 
+        g = QGroupBox("Live view")
+        gv = QVBoxLayout(g)
+        self.view_canvas = QRadioButton("Drawn on the map — nothing in the Layers panel; "
+                                        "hover a marker for details")
+        self.view_layers = QRadioButton("As temporary layers (Temp Markers / Temp Tracks) — "
+                                        "Identify, restyle, and include in print layouts")
+        self._view_group = QButtonGroup(self)
+        self._view_group.addButton(self.view_canvas)
+        self._view_group.addButton(self.view_layers)
+        (self.view_layers if c["live_view"] == "layers" else self.view_canvas).setChecked(True)
+        gv.addWidget(self.view_canvas)
+        gv.addWidget(self.view_layers)
+        v.addWidget(g)
+
         g = QGroupBox("Time window 'From feature'")
         gf = QFormLayout(g)
         self.ev_combo = QgsMapLayerComboBox()
@@ -833,6 +927,8 @@ class SettingsDialog(QDialog):
         combo.setLayer(lyr)
 
     def _fill_tag_fields(self):
+        if self._closed:          # closed dialog: ignore layers changing / project closing
+            return
         current = self.tag_field.currentText() or self.p.cfg["tag_field"]
         names = []
         for combo in (self.pt_combo, self.ln_combo):
@@ -894,6 +990,7 @@ class SettingsDialog(QDialog):
             "tag_field":         self.tag_field.currentText().strip(),
             "tag_from_feature":  self.tag_feat.isChecked(),
             "live_interval_s":   self.interval_spin.value(),
+            "live_view":         "layers" if self.view_layers.isChecked() else "canvas",
             "stale_minutes":     self.stale_spin.value(),
             "event_layer_id":      ev.id() if ev else "",
             "event_display_field": self.ev_disp.currentField() if ev else "",
@@ -926,12 +1023,16 @@ window — Live keeps running; the <b>▶ Live</b> toolbar button starts and sto
 in the past cannot change, so Live pauses for it and the markers show each device's last fix in it.
 <b>↻ Refresh</b> loads the window once; <b>Clear</b> stops Live and removes the overlay.</p>
 <h3>On the map</h3>
-<p>The live view is two temporary layers in the <i>Traccar (live)</i> group, <i>Temp Markers</i> and
-<i>Temp Tracks</i> — separate from the layers you save to (e.g. <i>Traccar Positions</i> and
-<i>Traccar Tracks</i>). Each
-device in its own colour (grey when its last fix is older than the limit in Settings → Advanced).
-They are never written to file and QGIS won't ask to save them. Switch Markers, Labels, Tracks and
-Accuracy circles on or off here or in the Layers panel; use Identify on them as on any layer.
+<p>By default the live view is <b>drawn straight onto the map</b>, so nothing is added to the Layers
+panel: hover over a marker for its name, fix age, speed and battery. In <b>Settings → Advanced →
+Live view</b> you can switch to <b>temporary layers</b> instead (<i>Temp Markers</i> and
+<i>Temp Tracks</i> in the <i>Traccar (live)</i> group) — use those when you want Identify, your own
+styling, or the live view in a print layout (drawn-on-map items appear on screen only). Either way
+they are separate from the layers you save to (e.g. <i>Traccar Positions</i> / <i>Traccar Tracks</i>).
+In both views each
+device has its own colour (grey when its last fix is older than the limit in Settings → Advanced),
+nothing is written to file, and QGIS won't ask to save anything. Switch Markers, Labels, Tracks and
+Accuracy circles on or off in the main window.
 Double-click a device in the list to centre the map on it.</p>
 <h3>Saving</h3>
 <p><b>📍 Save positions</b> adds a point per device — its latest fix, or every fix in the window.<br>
@@ -980,8 +1081,10 @@ class TraccarLive:
         self.last_update  = ""
         self.status_msg   = ""
         self.last_error   = ""
-        self._mk_id = ""            # overlay layer ids
+        self._mk_id = ""            # Temp layer ids ("layers" live view)
         self._tk_id = ""
+        self._item  = None          # canvas item ("canvas" live view)
+        self._tip_on = False
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
     def initGui(self):
@@ -1004,14 +1107,21 @@ class TraccarLive:
             self._actions.append(act)
         QgsProject.instance().readProject.connect(self._on_project_changed)
         QgsProject.instance().cleared.connect(self._on_project_changed)
+        canvas = self.iface.mapCanvas()
+        canvas.xyCoordinates.connect(self._on_canvas_move)
+        canvas.destinationCrsChanged.connect(self._on_crs_changed)
         self._remove_stale_overlays()
 
     def unload(self):
         self.timer.stop()
         self.api.abort_all()
-        for sig in (QgsProject.instance().readProject, QgsProject.instance().cleared):
+        canvas = self.iface.mapCanvas()
+        for sig, slot in ((QgsProject.instance().readProject, self._on_project_changed),
+                          (QgsProject.instance().cleared, self._on_project_changed),
+                          (canvas.xyCoordinates, self._on_canvas_move),
+                          (canvas.destinationCrsChanged, self._on_crs_changed)):
             try:
-                sig.disconnect(self._on_project_changed)
+                sig.disconnect(slot)
             except (TypeError, RuntimeError):
                 pass
         self._remove_overlays()
@@ -1075,12 +1185,20 @@ class TraccarLive:
 
     def open_settings(self, tab=0):
         dlg = SettingsDialog(self, self.iface.mainWindow(), tab)
-        if dlg.exec() == _DLG_OK:
-            vals = dlg.values()
+        accepted = dlg.exec() == _DLG_OK
+        vals = dlg.values() if accepted else None
+        # A kept-alive dialog stays connected to the layer combos; closing / switching
+        # projects then makes it touch layers being deleted (crashed QGIS 3.44).
+        dlg._closed = True
+        dlg.deleteLater()
+        if accepted:
             interval_changed = vals["live_interval_s"] != self.cfg["live_interval_s"]
+            view_changed = vals["live_view"] != self.cfg["live_view"]
             for k, v in vals.items():
                 self.cfg[k] = v
             self._save_settings()
+            if view_changed:
+                self._remove_overlays()
             if interval_changed and self.timer.isActive():
                 self.timer.start(int(self.cfg["live_interval_s"]) * 1000)
             self._rebuild()
@@ -1099,6 +1217,7 @@ class TraccarLive:
         bb.accepted.connect(d.accept)
         lay.addWidget(bb)
         d.exec()
+        d.deleteLater()
 
     def _ui(self):
         if self.dlg is not None and self.dlg.isVisible():
@@ -1505,6 +1624,10 @@ class TraccarLive:
 
     def set_show(self, key, on):
         self.set_cfg(key, bool(on))
+        if self._item is not None:
+            self._apply_item_flags()
+            self._item.update()
+            return
         mk = QgsProject.instance().mapLayer(self._mk_id) if self._mk_id else None
         if key == "show_labels" and mk is not None:
             mk.setLabelsEnabled(bool(on))
@@ -1514,7 +1637,104 @@ class TraccarLive:
         else:
             self._apply_visibility()
 
+    def set_live_view(self, mode):
+        """'canvas' (drawn on the map) or 'layers' (Temp Markers / Temp Tracks)."""
+        self.set_cfg("live_view", mode)
+        self._remove_overlays()
+        if self.win is not None:
+            self._update_overlays()
+
     def _update_overlays(self):
+        if self.cfg["live_view"] == "layers":
+            self._update_layers()
+        else:
+            self._update_canvas()
+
+    # ── Drawn on the map ──────────────────────────────────────────────────
+    def _apply_item_flags(self):
+        it = self._item
+        it.show_markers  = bool(self.cfg["show_markers"])
+        it.show_labels   = bool(self.cfg["show_labels"])
+        it.show_tracks   = bool(self.cfg["show_tracks"])
+        it.show_accuracy = bool(self.cfg["show_accuracy"])
+
+    def _marker_tip(self, dev_id, p):
+        attrs = p.get("attributes") or {}
+        bat = attrs.get("batteryLevel")
+        tip = "%s\nFix %s ago  (%s)\n%d km/h" % (
+            self._name(dev_id), _age_text(p["_t"]), _fmt_local(p["_t"]),
+            round((p.get("speed") or 0) * 1.852))
+        if isinstance(bat, (int, float)):
+            tip += "  ·  battery %g%%" % float(bat)
+        return tip
+
+    def _update_canvas(self):
+        canvas = self.iface.mapCanvas()
+        if self._item is None:
+            self._item = _LiveItem(canvas)
+        tr = QgsCoordinateTransform(WGS84, canvas.mapSettings().destinationCrs(), QgsProject.instance())
+
+        def T(lon, lat):
+            return tr.transform(QgsPointXY(lon, lat))
+
+        tracks, markers = [], []
+        try:
+            for dev_id, pts in self.tracks.items():
+                if len(pts) < 2:
+                    continue
+                col = QColor(_device_color(self._name(dev_id)) if self._fresh(pts[-1]["_t"]) else "#9E9E9E")
+                col.setAlpha(215)
+                tracks.append((col, [T(p["longitude"], p["latitude"]) for p in _decimate(pts, 2000)]))
+            for dev_id, p in self.marker_pos.items():
+                acc = float(p.get("accuracy") or 0)
+                acc_pt = None
+                if acc > 0:      # a point `acc` metres east → circle radius in any map CRS
+                    dlon = acc / (111320.0 * max(0.01, math.cos(math.radians(p["latitude"]))))
+                    acc_pt = T(p["longitude"] + dlon, p["latitude"])
+                name = self._name(dev_id)
+                markers.append({
+                    "pt": T(p["longitude"], p["latitude"]), "acc_pt": acc_pt,
+                    "color": QColor(_device_color(name) if self._fresh(p["_t"]) else "#9E9E9E"),
+                    "label": name, "tip": self._marker_tip(dev_id, p)})
+        except Exception as exc:          # e.g. a map CRS that can't take these points
+            self._log("Could not draw the live view: %s" % exc, _MSG_WARN)
+        self._item.tracks, self._item.markers = tracks, markers
+        self._apply_item_flags()
+        self._item.updatePosition()
+        self._item.update()
+
+    def marker_tip_at(self, x, y):
+        """Tooltip text for a marker within 10 px of canvas pixel (x, y), else ''."""
+        if self._item is None or not self.cfg["show_markers"]:
+            return ""
+        m2p = self.iface.mapCanvas().getCoordinateTransform()
+        best = None
+        for m in self._item.markers:
+            q = m2p.transform(m["pt"])
+            d = math.hypot(q.x() - x, q.y() - y)
+            if d <= 10 and (best is None or d < best[0]):
+                best = (d, m["tip"])
+        return best[1] if best else ""
+
+    def _on_canvas_move(self, _pt):
+        if self._item is None:
+            return
+        canvas = self.iface.mapCanvas()
+        pos = canvas.mouseLastXY()
+        tip = self.marker_tip_at(pos.x(), pos.y())
+        if tip:
+            QToolTip.showText(canvas.mapToGlobal(pos), tip, canvas)
+            self._tip_on = True
+        elif self._tip_on:
+            QToolTip.hideText()
+            self._tip_on = False
+
+    def _on_crs_changed(self):
+        if self._item is not None and self.win is not None:
+            self._update_canvas()
+
+    # ── As temporary layers ───────────────────────────────────────────────
+    def _update_layers(self):
         mk = self._overlay("markers")
         feats = []
         for dev_id, p in self.marker_pos.items():
@@ -1553,6 +1773,13 @@ class TraccarLive:
         tk.triggerRepaint()
 
     def _remove_overlays(self):
+        if self._item is not None:
+            try:
+                self._item.scene().removeItem(self._item)
+            except (RuntimeError, AttributeError):
+                pass
+            self._item = None
+            self.iface.mapCanvas().refresh()
         prj = QgsProject.instance()
         for lid in (self._mk_id, self._tk_id):
             if lid and prj.mapLayer(lid) is not None:
@@ -1577,7 +1804,7 @@ class TraccarLive:
             root.removeChildNode(group)
 
     def _on_project_changed(self, *_args):
-        self._mk_id = self._tk_id = ""
+        self._mk_id = self._tk_id = ""      # a new project has none of our Temp layers
         self._remove_stale_overlays()
         if self.win is not None:
             self._update_overlays()

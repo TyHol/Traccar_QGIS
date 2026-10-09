@@ -112,6 +112,12 @@ IFACE = get_iface()
 RESULTS = []
 
 
+def flush_deletes():
+    from qgis.PyQt.QtCore import QEvent
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete
+                                      if hasattr(QEvent, "Type") else QEvent.DeferredDelete)
+
+
 def wait(cond, timeout=10.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -181,6 +187,61 @@ def t02_load_last_3h():
     check("device list: 3 rows, Spare says 'no fixes'",
           len(rows) == 3 and rows["Spare"]["span"] == "no fixes in window")
     check("Phone A fresh, Van 3 stale", rows["Phone A"]["fresh"] and not rows["Van 3"]["fresh"])
+
+
+@test
+def t02b_drawn_on_map_by_default():
+    from qgis.PyQt.QtGui import QImage, QPainter
+    prj = QgsProject.instance()
+    check("default live view = drawn on the map", plugin.cfg["live_view"] == "canvas")
+    check("drawn on map: no Temp layers, no group",
+          not plugin._mk_id and prj.layerTreeRoot().findGroup(mod.GROUP_NAME) is None)
+    canvas = IFACE.mapCanvas()
+    item = plugin._item
+    check("drawn on map: one canvas item with 2 markers + 1 track",
+          item is not None and item in canvas.scene().items()
+          and len(item.markers) == 2 and len(item.tracks) == 1)
+
+    win = IFACE.mainWindow()
+    win.resize(500, 500)
+    win.setCentralWidget(canvas)
+    win.show()
+    canvas.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:2157"))   # Irish Transverse Mercator
+    wait(lambda: False, 0.3)
+    plugin.zoom_to_all()
+    wait(lambda: False, 0.3)
+
+    fmt = QImage.Format.Format_ARGB32 if hasattr(QImage, "Format") else QImage.Format_ARGB32
+    sz = canvas.viewport().size()
+    img = QImage(sz.width(), sz.height(), fmt)
+    img.fill(0)
+    painter = QPainter(img)
+    item.paint(painter)
+    painter.end()
+    drawn = sum(1 for x in range(0, img.width(), 2) for y in range(0, img.height(), 2)
+                if (img.pixel(x, y) >> 24) & 0xFF)
+    check("drawn on map: tracks and markers actually paint (map CRS EPSG:2157)", drawn > 200, drawn)
+
+    m = [mm for mm in item.markers if mm["label"] == "Phone A"][0]
+    q = canvas.getCoordinateTransform().transform(m["pt"])
+    tip = plugin.marker_tip_at(q.x() + 4, q.y() - 3)
+    check("hover over a marker → tooltip with name, age, speed, battery",
+          tip.startswith("Phone A") and "ago" in tip and "km/h" in tip and "battery 81%" in tip, tip)
+    check("hover away from markers → no tooltip", plugin.marker_tip_at(q.x() + 60, q.y() + 60) == "")
+
+    plugin.set_show("show_labels", False)
+    plugin.set_show("show_accuracy", True)
+    check("toggles apply to the drawing", item.show_labels is False and item.show_accuracy is True)
+    plugin.set_show("show_labels", True)
+    plugin.set_show("show_accuracy", False)
+
+
+@test
+def t02c_switch_to_layers():
+    plugin.set_live_view("layers")
+    prj = QgsProject.instance()
+    check("switch to temporary layers: canvas item removed, Temp layers added",
+          plugin._item is None and prj.mapLayer(plugin._mk_id) is not None)
 
 
 @test
@@ -424,12 +485,24 @@ def t16_dialogs():
     d.close()
     check("closing the window keeps Live running", plugin.live and plugin.timer.isActive())
     plugin.set_live(False)
+    from qgis.PyQt.QtWidgets import QDialog
+    orig_exec = QDialog.exec
+    QDialog.exec = lambda self: 0          # "Cancel" straight away
+    try:
+        before = len(IFACE.mainWindow().findChildren(mod.SettingsDialog))
+        for _ in range(3):
+            plugin.open_settings(1)
+        flush_deletes()
+        after = len(IFACE.mainWindow().findChildren(mod.SettingsDialog))
+        check("Settings windows are deleted after closing (no leak)", after == before, (before, after))
+    finally:
+        QDialog.exec = orig_exec
     s = mod.SettingsDialog(plugin, IFACE.mainWindow(), 1)
     v = s.values()
     check("settings dialog round-trips values", v["points_layer_id"] == plugin.cfg["points_layer_id"]
-          and v["server_url"] == URL)
+          and v["server_url"] == URL and v["live_view"] == plugin.cfg["live_view"])
     s.deleteLater()
-    from qgis.PyQt.QtWidgets import QDialog
+    flush_deletes()
     orig = QDialog.exec
     QDialog.exec = lambda self: 0
     try:
@@ -445,6 +518,12 @@ def t17_clear_and_stale():
     prj = QgsProject.instance()
     check("Clear removes overlay layers and group",
           not plugin._mk_id and prj.layerTreeRoot().findGroup(mod.GROUP_NAME) is None)
+    plugin.set_live_view("canvas")
+    load(60)
+    item = plugin._item
+    plugin.clear()
+    check("Clear removes the drawn-on-map view",
+          plugin._item is None and item not in IFACE.mapCanvas().scene().items())
     stale = add(QgsVectorLayer("Point?crs=EPSG:4326", "Traccar markers", "memory"))
     stale.setCustomProperty(mod.OVERLAY_PROP, 1)
     sid = stale.id()
@@ -488,4 +567,6 @@ QgsProject.instance().clear()
 shutil.rmtree(TMP, ignore_errors=True)
 sys.stdout.flush()
 sys.stderr.flush()
+from qgis.core import QgsApplication  # noqa: E402
+QgsApplication.exitQgis()              # shut QGIS down cleanly before leaving
 os._exit(0 if passed == len(RESULTS) else 1)

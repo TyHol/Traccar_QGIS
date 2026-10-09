@@ -23,6 +23,13 @@ Brings the QGIS plugin in line with the QField plugin (Traccar_QField v0.4).
   grey when stale, labels, accuracy circles in metres; Identify works. Flagged so QGIS never asks
   to save them; stale copies saved into a project are removed on load.
 
+### Live view: drawn on the map (default) or temporary layers
+- **Settings → Advanced → Live view.** Default: drawn straight onto the map canvas — nothing in the
+  Layers panel; hover a marker for name, fix age, speed and battery; labels and accuracy circles
+  drawn by the plugin. Screen only (not in print layouts).
+- Alternative: the temporary layers (Temp Markers / Temp Tracks) — Identify, restyling, print layouts.
+- Zoom to a device / Zoom to all work the same in both.
+
 ### Unobtrusive
 - Main window is a **non-modal pop-up**; close it and Live keeps running. Toolbar: *Traccar Live*
   (open) and *▶ Live* (start/stop). Live status and last error are in the ▶ Live tooltip.
@@ -38,13 +45,15 @@ Brings the QGIS plugin in line with the QField plugin (Traccar_QField v0.4).
 - No duplicate history points while a device is idle.
 - Layer styling is no longer overwritten on every fetch.
 - If the target layer is already being edited, features go into that edit session.
+- Settings and Help windows are deleted when closed. Before, every Settings window stayed alive,
+  connected to the layer pickers, and closing or switching projects could crash QGIS 3.44.
 - Times: shown in local time (incl. summer time); DateTime fields stored as UTC; optional
   `fix_local` / `start_local` / `last_local` text fields.
 
 ### Compatibility
 - `qgisMinimumVersion=3.28`, **`qgisMaximumVersion=4.99`** — without a maximum, QGIS treats a 3.x
   plugin as "3.99 max" and QGIS 4 refuses to load it.
-- Tested (tests/test_plugin.py, 58 checks against a fake Traccar server) on QGIS 3.44.15 LTR
+- Tested (tests/test_plugin.py, 71 checks against a fake Traccar server) on QGIS 3.44.15 LTR
   (Qt 5), 4.2.3 and 4.3-dev (Qt 6): all pass, no Python warnings. Read-only check against
   server.traccar.org (tests/real_server_check.py) in 3.44 and 4.2. Python 3.9 syntax verified for
   QGIS 3.28; 3.28–3.40 not run.
