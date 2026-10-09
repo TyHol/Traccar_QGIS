@@ -8,18 +8,18 @@ A QGIS plugin that shows your [Traccar](https://www.traccar.org) GPS devices on 
 - **Two layers, saved on demand** — positions and tracks, into any point / line layers, in any CRS.
 - **Same layers and fields as the QField plugin [Traccar_QField](https://github.com/TyHol/Traccar_QField)**, so one GeoPackage works in the office and in the field.
 
-Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.2.0](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
+Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.2.1](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
 
 ---
 
 ## Install
-1. Download **`Traccar_QGIS_v0.2.0.zip`** from the [release page](https://github.com/TyHol/Traccar_QGIS/releases/latest) (don't unzip it).
+1. Download **`Traccar_QGIS_v0.2.1.zip`** from the [release page](https://github.com/TyHol/Traccar_QGIS/releases/latest) (don't unzip it).
 2. In QGIS: **Plugins → Manage and Install Plugins → Install from ZIP**, choose the file, click *Install Plugin*.
 
 You need a Traccar account — your own server or e.g. `https://server.traccar.org`.
 
 ## Getting started
-1. Click **Traccar Live** on the toolbar, then **Settings… → Connection**: enter the server address (the one you open in a browser), your Traccar email / username and password, and click *Test connection*.
+1. Click **Traccar Live** on the toolbar, then **Settings… → Connection**: enter the server address (the one you open in a browser), your Traccar email / username and password, and click *Test connection*. The login is saved in QGIS's password manager; the first time, QGIS asks you to create (or enter) its **master password**.
 2. Choose a **Time window** and click **▶ Live** to follow devices, or **↻ Refresh** to load the window once.
 3. To keep what you see: **Settings… → Layers** → pick a positions layer and a tracks layer — or click **New GeoPackage…** to create both (`traccar.gpkg` in your project folder) — then use **📍 Save positions** / **〰 Save tracks**.
 
@@ -91,17 +91,18 @@ Everything in the plugin is shown in local time, with the right summer/winter of
 ## Settings
 | Tab | Contains |
 |---|---|
-| **Connection** | Server URL, email / username, password, *Test connection* |
+| **Connection** | Server URL, email / username, password (leave blank to keep the saved one), *Test connection* |
 | **Layers** | Positions layer, device-name field, latest / every fix · Tracks layer, device-name field, add / keep most recent · *New GeoPackage…* |
 | **Tag** | On/off, tag text, field, use the feature's display value |
 | **Advanced** | Refresh interval (30 s by default), grey-marker limit, live view (on the map / temporary layers), the layer and fields used by *From feature* |
 
-Settings are stored in your QGIS user profile (the password too), so a new computer or QGIS profile needs them entering once. Settings from v0.1 are carried over automatically.
+Your Traccar login is kept in **QGIS's password manager** (Settings → Options → Authentication, entry *Traccar Live*), encrypted behind QGIS's master password — never in the plugin's settings. The other settings are stored in your QGIS user profile, so a new computer or QGIS profile needs them entering once. Settings from earlier versions are carried over automatically, and a password saved by an earlier version is moved into the password manager and removed from the settings.
 
 ## Troubleshooting
 | Message | What to check |
 |---|---|
 | *Wrong username or password (HTTP 401)* | Settings… → Connection; use the same login as the Traccar web page. |
+| *No saved Traccar login* | Enter the password again in Settings… → Connection (e.g. after the QGIS master password prompt was cancelled, or on a new profile). |
 | *No response — check the server URL* | The address (including `https://`) and your connection / QGIS proxy settings. |
 | A device shows *no fixes in window* | Pick a longer window, or check the device's clock. |
 | *Could not save to … — see the log* | The layer must be editable and the right kind (points / lines). Details: View → Panels → Log Messages → *Traccar Live*. |
@@ -115,7 +116,7 @@ Settings are stored in your QGIS user profile (the password too), so a new compu
   python-qgis.bat tests\test_plugin.py          (QGIS 4.x)
   ```
 - [`tests/real_server_check.py`](tests/real_server_check.py) — a read-only check against a real Traccar server, using the login saved in a QGIS profile (never printed).
-- The release zip contains a `Traccar_QGIS/` folder with the plugin files and `LICENSE`.
+- The release zip contains a `traccar_live/` folder with the plugin files, `icon.png` and `LICENSE` (the layout plugins.qgis.org requires).
 
 ## Licence
 Copyright © 2026 TyHol. Released under the [GNU General Public License v2.0 or later](LICENSE) (GPL-2.0-or-later), the same licence as QGIS.

@@ -1,5 +1,20 @@
 # Traccar Live (QGIS) — Changes
 
+## v0.2.1
+
+Packaging for the QGIS plugin repository (plugins.qgis.org), and the login moves to QGIS's password manager.
+- **Login in QGIS's password manager**: the Traccar username and password are kept as a *Basic* login
+  (*Traccar Live*) in QGIS's Authentication Manager, encrypted behind the master password; the plugin's
+  settings keep only its id. A plain-text password saved by v0.1 / v0.2.0 is moved there the first time
+  it is needed and then deleted from the settings. In Settings → Connection the password box stays empty
+  — leave it blank to keep the saved password.
+- The plugin folder inside the zip is now `traccar_live` (new plugins must use a lowercase, PEP 8
+  folder name). If you installed v0.2.0 from its zip, remove the old `Traccar_QGIS` plugin folder
+  so the plugin isn't loaded twice.
+- Icon (`icon.png`, also on the toolbar button), changelog and category in `metadata.txt`;
+  marked experimental for its first release on the plugin repository.
+- GPL-2.0-or-later `LICENSE` in the package (required by the repository).
+
 ## v0.2.0
 
 Brings the QGIS plugin in line with the QField plugin (Traccar_QField v0.4).

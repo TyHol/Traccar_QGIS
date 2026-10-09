@@ -3,12 +3,19 @@ name=Traccar Live
 qgisMinimumVersion=3.28
 qgisMaximumVersion=4.99
 description=Follow Traccar devices on the map within a chosen time window, and save their positions and tracks to project layers
-about=Shows Traccar GPS devices as temporary map layers (markers and tracks) for one time window — last N minutes, custom dates, or a feature's start/end — refreshed live in the background. Save positions (latest fix or every fix) and tracks (one line per device, Z = altitude, M = time) to your own layers. Same layer schema as the QField plugin Traccar_QField.
-version=0.2.0
+about=Shows Traccar GPS devices on the map (markers and tracks) for one time window — last N minutes, custom dates, or a feature's start/end — refreshed live in the background, drawn on the map or as temporary layers. Save positions (latest fix or every fix) and tracks (one line per device, Z = altitude, M = time) to your own layers in any CRS. Same layer schema as the QField plugin Traccar_QField. Needs a Traccar server account.
+version=0.2.1
 author=TyHol
-email=96470691+TyHol@users.noreply.github.com
+email=tonyholmes@hotmail.com
 homepage=https://github.com/TyHol/Traccar_QGIS
 repository=https://github.com/TyHol/Traccar_QGIS
 tracker=https://github.com/TyHol/Traccar_QGIS/issues
-tags=traccar,gps,tracking,live,tracks
+icon=icon.png
+tags=traccar,gps,tracking,live,tracks,fleet,field
+category=Web
+experimental=True
 hasProcessingProvider=no
+changelog=
+    0.2.1 - Traccar login kept in QGIS's password manager (moved there from the settings automatically). Packaging for the QGIS plugin repository: lowercase package folder (traccar_live), icon, licence (GPL-2.0-or-later).
+    0.2.0 - One time window drives the map and saving; positions and tracks layers replace A/B/C; live view drawn on the map or as temporary layers; asynchronous network; reprojection to the layer CRS; QGIS 4 support.
+    0.1.0 - First version.
