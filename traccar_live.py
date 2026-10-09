@@ -47,7 +47,7 @@ from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton, QToolTip,
 )
 from qgis.core import (
-    Qgis, QgsApplication, QgsAuthMethodConfig, QgsProject, QgsVectorLayer, QgsField, QgsFields, QgsFeature,
+    Qgis, QgsApplication, QgsAuthMethodConfig, QgsProject, QgsVectorLayer, QgsFeature,
     QgsFeatureRequest, QgsGeometry, QgsPoint, QgsPointXY, QgsLineString,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRectangle,
     QgsVectorFileWriter, QgsVectorLayerUtils, QgsWkbTypes, QgsMessageLog,
@@ -417,7 +417,9 @@ def _memory_uri(geom, schema, crs="EPSG:4326"):
 def default_gpkg_path():
     """Suggested file for New GeoPackage: traccar.gpkg in the project's home folder
     (else the last folder used, else the user's home), never an existing file."""
-    folder = QgsProject.instance().homePath()         or QSettings().value(SETTINGS_NS + "/last_gpkg_dir", "", type=str)         or os.path.expanduser("~")
+    folder = (QgsProject.instance().homePath()
+              or QSettings().value(SETTINGS_NS + "/last_gpkg_dir", "", type=str)
+              or os.path.expanduser("~"))
     path, n = os.path.join(folder, "traccar.gpkg"), 2
     while os.path.exists(path):
         path = os.path.join(folder, "traccar_%d.gpkg" % n)
@@ -472,7 +474,7 @@ class _LiveItem(QgsMapCanvasItem):
     def updatePosition(self):
         self.setRect(self._canvas.mapSettings().visibleExtent())
 
-    def paint(self, painter, option=None, widget=None):
+    def paint(self, painter, _option=None, _widget=None):
         off = self.pos()
 
         def px(pt):
@@ -1256,8 +1258,9 @@ class TraccarLive:
         """Save the login in QGIS's password manager. A blank password keeps the
         saved one. Returns True when it is stored there."""
         if not password:
-            old = load_login(self.cfg["authcfg"]) or ((self.cfg["username"], self._old_pw)
-                                                     if self._old_pw else None)
+            old = load_login(self.cfg["authcfg"])
+            if not old and self._old_pw:
+                old = (self.cfg["username"], self._old_pw)
             password = old[1] if old else ""
         self.cfg["server_url"], self.cfg["username"] = url, username
         self._login = (username, password) if password else None
@@ -1820,13 +1823,13 @@ class TraccarLive:
         if self._item is None or not self.cfg["show_markers"]:
             return ""
         m2p = self.iface.mapCanvas().getCoordinateTransform()
-        best = None
+        best_d, best_tip = 10.0, ""
         for m in self._item.markers:
             q = m2p.transform(m["pt"])
             d = math.hypot(q.x() - x, q.y() - y)
-            if d <= 10 and (best is None or d < best[0]):
-                best = (d, m["tip"])
-        return best[1] if best else ""
+            if d <= best_d:
+                best_d, best_tip = d, m["tip"]
+        return best_tip
 
     def _on_canvas_move(self, _pt):
         if self._item is None:
