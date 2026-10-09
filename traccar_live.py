@@ -1,3 +1,6 @@
+# Copyright (C) 2026 TyHol
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """
 Traccar Live – QGIS Plugin  v0.2
 

@@ -26,6 +26,9 @@ from urllib.parse import urlparse, parse_qs
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 TMP = tempfile.mkdtemp(prefix="traccar_qgis_test_")
 
+import faulthandler  # noqa: E402
+faulthandler.dump_traceback_later(300, exit=True)   # never hang: show where it is stuck and stop
+
 from qgis.PyQt.QtCore import QSettings, QCoreApplication, QDateTime  # noqa: E402
 QSettings.setDefaultFormat(QSettings.Format.IniFormat if hasattr(QSettings, "Format") else QSettings.IniFormat)
 QSettings.setPath(QSettings.Format.IniFormat if hasattr(QSettings, "Format") else QSettings.IniFormat,
@@ -59,10 +62,10 @@ def _fix(dev, t, lon, lat, i):
 POS = {1: [], 2: [], 3: []}
 for i in range(240):                                   # last 2 h, every 30 s
     t = NOW - timedelta(seconds=30 * (239 - i))
-    POS[1].append(_fix(1, t, -9.50 + i * 0.0001, 52.05 + i * 0.00005, i))
+    POS[1].append(_fix(1, t, -6.33 + i * 0.0001, 53.355 + i * 0.00005, i))
 VAN_START = NOW - timedelta(days=2)
 for i in range(20):                                    # two days ago, 10 minutes
-    POS[2].append(_fix(2, VAN_START + timedelta(seconds=30 * i), -9.40 + i * 0.0002, 52.10, i))
+    POS[2].append(_fix(2, VAN_START + timedelta(seconds=30 * i), -6.25 + i * 0.0002, 53.35, i))
 
 
 def _p(s):
@@ -458,7 +461,7 @@ def t14_from_feature_with_tag():
 def t15_live_poll_appends_and_trims():
     load(60)
     n0 = len(plugin.tracks[1])
-    new = _fix(1, datetime.now(timezone.utc) + timedelta(seconds=1), -9.47, 52.06, 999)
+    new = _fix(1, datetime.now(timezone.utc) + timedelta(seconds=1), -6.31, 53.365, 999)
     POS[1].append(new)
     plugin.poll_live()
     wait(lambda: len(plugin.tracks.get(1, [])) != n0, 5)
