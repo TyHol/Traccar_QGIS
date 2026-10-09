@@ -1,60 +1,71 @@
 """
-Traccar Live – QGIS Plugin
-Polls /api/devices and /api/positions (Basic Auth) on a configurable schedule.
+Traccar Live – QGIS Plugin  v0.2
 
-On each fetch, three independent options can be active simultaneously:
-  A  Keep live    – replace a point layer with current positions
-  B  Add points   – append every position as a new point feature (history)
-  C  Add to lines – append every position as a new vertex on the device's line track
+Follows Traccar devices on the QGIS map within one chosen time window, and saves
+their positions and tracks to two project layers on demand. Mirrors the QField
+plugin Traccar_QField v0.4, and uses the same layer schema, so one GeoPackage
+works in both.
 
-B and C can share a single GeoPackage (two tables in one file).
-Last-fetch status is shown at the top of the Settings dialog, not the message bar.
+  Time window  — Last 15 min … 3 months, custom dates, or a feature's start/end.
+                 The tracks shown are the fixes inside the window; the Save
+                 buttons write exactly that.
+  Overlay      — two temporary layers in a "Traccar (live)" group (markers and
+                 tracks). Never written to file.
+  Live         — refreshes in the background; a "Last …" window keeps moving.
+  Save         — positions layer (latest fix, or every fix in the window) and
+                 tracks layer (add a new line per device, or keep only the most
+                 recent).
 
-Compatible with QGIS 3.16+ (PyQt5) and QGIS 4.x (PyQt6).
+Unobtrusive by design: the main window is a non-modal pop-up that can be closed
+while Live runs (toolbar button ▶ Live starts/stops it), network requests are
+asynchronous, and Live errors are reported once per error streak.
+
+Compatible with QGIS 3.28 LTR … 3.44 (Qt5 / PyQt5) and QGIS 4.x (Qt6 / PyQt6).
 """
 
 import json
 import base64
 import hashlib
-import calendar
-import urllib.request
-import urllib.error
+import re
+import time
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote as _quote
 
-from qgis.PyQt.QtCore    import QTimer, QSettings, QDateTime, Qt
-from qgis.PyQt.QtWidgets import (
-    QAction, QApplication, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLabel, QLineEdit, QSpinBox, QDateTimeEdit, QComboBox,
-    QDialogButtonBox, QPushButton, QTabWidget, QTextEdit,
-    QGroupBox, QMessageBox, QCheckBox, QRadioButton, QWidget,
-    QFileDialog, QFrame,
-)
-from qgis.gui  import QgsMapLayerComboBox
+from qgis.PyQt.QtCore import QTimer, QSettings, QDateTime, QDate, QTime, QUrl, Qt
 from qgis.PyQt.QtGui import QColor
-from qgis.core import (
-    QgsMapLayerProxyModel,
-    QgsProject, QgsVectorLayer, QgsField, QgsFields,
-    QgsFeature, QgsGeometry, QgsPointXY, QgsPoint,
-    QgsCoordinateReferenceSystem, QgsVectorFileWriter,
-    QgsMessageLog, Qgis,
-    QgsCategorizedSymbolRenderer, QgsRendererCategory,
-    QgsMarkerSymbol, QgsLineSymbol, QgsWkbTypes, NULL,
+from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
+from qgis.PyQt.QtWidgets import (
+    QAction, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
+    QLabel, QLineEdit, QSpinBox, QDateTimeEdit, QComboBox, QCheckBox,
+    QRadioButton, QButtonGroup, QPushButton, QDialogButtonBox, QTabWidget,
+    QWidget, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
+    QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton,
 )
-
-# ── QGIS 3 / 4  (PyQt5 / PyQt6) compatibility ───────────────────────────────
+from qgis.core import (
+    Qgis, QgsProject, QgsVectorLayer, QgsField, QgsFields, QgsFeature,
+    QgsFeatureRequest, QgsGeometry, QgsPoint, QgsPointXY, QgsLineString,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRectangle,
+    QgsVectorFileWriter, QgsVectorLayerUtils, QgsWkbTypes, QgsMessageLog,
+    QgsNetworkAccessManager, QgsMapLayerProxyModel, QgsFieldProxyModel,
+    QgsMarkerSymbol, QgsLineSymbol, QgsSimpleMarkerSymbolLayer, QgsSymbolLayer,
+    QgsSingleSymbolRenderer, QgsProperty, QgsUnitTypes,
+    QgsPalLayerSettings, QgsTextFormat, QgsTextBufferSettings,
+    QgsVectorLayerSimpleLabeling,
+)
+from qgis.gui import QgsMapLayerComboBox, QgsFieldComboBox
 
 try:
-    from qgis.PyQt.QtCore import QVariant
-    _INT, _STR, _DBL = QVariant.Int, QVariant.String, QVariant.Double
-    _DT = QVariant.DateTime
-except (ImportError, AttributeError):
-    _INT, _STR, _DBL = 2, 10, 6
-    _DT = 16   # QMetaType::QDateTime
+    from qgis.core import NULL
+except ImportError:          # pragma: no cover
+    NULL = None
 
+
+# ════════════════════════════════════════════════════════════════════════════
+#  QGIS 3 / 4  (PyQt5 / PyQt6) compatibility
+# ════════════════════════════════════════════════════════════════════════════
 
 def _e(root, *chain):
-    """Resolve root.a.b (PyQt6) with fallback to root.b (PyQt5)."""
+    """Resolve root.a.b (PyQt6 scoped enums) with fallback to root.b (PyQt5)."""
     try:
         obj = root
         for attr in chain:
@@ -64,1437 +75,1720 @@ def _e(root, *chain):
         return getattr(root, chain[-1])
 
 
-_ECHO_PWD   = _e(QLineEdit,              "EchoMode",             "Password")
-_BTN_OK     = _e(QDialogButtonBox,       "StandardButton",       "Ok")
-_BTN_CANCEL = _e(QDialogButtonBox,       "StandardButton",       "Cancel")
-_DLG_OK     = _e(QDialog,               "DialogCode",           "Accepted")
-_MSG_WARN   = _e(Qgis,                  "MessageLevel",         "Warning")
-_MSG_CRIT   = _e(Qgis,                  "MessageLevel",         "Critical")
-_MSG_INFO   = _e(Qgis,                  "MessageLevel",         "Info")
-_PT_LYR     = _e(QgsMapLayerProxyModel, "LayerType",            "PointLayer")
-_LN_LYR     = _e(QgsMapLayerProxyModel, "LayerType",            "LineLayer")
-_VFW_OK     = _e(QgsVectorFileWriter,   "WriterError",          "NoError")
-_GPKG_NEW   = _e(QgsVectorFileWriter,   "ActionOnExistingFile", "CreateOrOverwriteFile")
-_GPKG_LAYER = _e(QgsVectorFileWriter,   "ActionOnExistingFile", "CreateOrOverwriteLayer")
+def _new_or_old(new_root, new_name, old_root, old_name):
+    """A QGIS enum that moved (e.g. QgsWkbTypes.PointGeometry → Qgis.GeometryType.Point)."""
+    try:
+        return getattr(new_root, new_name)
+    except AttributeError:
+        return getattr(old_root, old_name)
 
-# ── Constants ────────────────────────────────────────────────────────────────
 
-LIVE_LAYER_NAME = "Traccar – Live Positions"
-SETTINGS_NS     = "TraccarLive"
-MENU_LABEL      = "&Traccar Live"
-DEFAULT_URL     = "https://server.traccar.org"
+_GEOM_POINT   = _new_or_old(getattr(Qgis, "GeometryType", None), "Point", QgsWkbTypes, "PointGeometry")
+_GEOM_LINE    = _new_or_old(getattr(Qgis, "GeometryType", None), "Line",  QgsWkbTypes, "LineGeometry")
+_LF_POINT     = _new_or_old(getattr(Qgis, "LayerFilter", None), "PointLayer",
+                            getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "PointLayer")
+_LF_LINE      = _new_or_old(getattr(Qgis, "LayerFilter", None), "LineLayer",
+                            getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "LineLayer")
+_LF_VECTOR    = _new_or_old(getattr(Qgis, "LayerFilter", None), "VectorLayer",
+                            getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "VectorLayer")
+_FF_STRING    = _e(QgsFieldProxyModel, "Filter", "String")
+_RENDER_M     = _new_or_old(getattr(Qgis, "RenderUnit", None), "MetersInMapUnits",
+                            QgsUnitTypes, "RenderMetersInMapUnits")
+_MSG_INFO     = _e(Qgis, "MessageLevel", "Info")
+_MSG_WARN     = _e(Qgis, "MessageLevel", "Warning")
+_MSG_OK       = _e(Qgis, "MessageLevel", "Success")
+_HTTP_STATUS  = _e(QNetworkRequest, "Attribute", "HttpStatusCodeAttribute")
+_NET_OK       = _e(QNetworkReply, "NetworkError", "NoError")
+_BTN_OK       = _e(QDialogButtonBox, "StandardButton", "Ok")
+_BTN_CANCEL   = _e(QDialogButtonBox, "StandardButton", "Cancel")
+_DLG_OK       = _e(QDialog, "DialogCode", "Accepted")
+_ECHO_PWD     = _e(QLineEdit, "EchoMode", "Password")
+_NO_EDIT      = _e(QAbstractItemView, "EditTrigger", "NoEditTriggers")
+_SEL_ROWS     = _e(QAbstractItemView, "SelectionBehavior", "SelectRows")
+_HV_STRETCH   = _e(QHeaderView, "ResizeMode", "Stretch")
+_HV_CONTENTS  = _e(QHeaderView, "ResizeMode", "ResizeToContents")
+_VFW_OK       = _e(QgsVectorFileWriter, "WriterError", "NoError")
+_GPKG_NEW     = _e(QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteFile")
+_GPKG_LAYER   = _e(QgsVectorFileWriter, "ActionOnExistingFile", "CreateOrOverwriteLayer")
 
-POINT_FIELDS = [
-    QgsField("device_id",  _INT, "Device ID"),
-    QgsField("name",       _STR, "Device Name"),
-    QgsField("status",     _STR, "Status"),
-    QgsField("speed_kmh",  _DBL, "Speed (km/h)"),
-    QgsField("course",     _DBL, "Course (°)"),
-    QgsField("altitude_m", _DBL, "Altitude (m)"),
-    QgsField("fix_time",   _DT,  "Fix Time"),
-    QgsField("battery",    _DBL, "Battery (%)"),
-    QgsField("address",    _STR, "Address"),
-    QgsField("motion",     _STR, "Motion"),
+
+def _sl_prop(name):
+    """Symbol-layer data-defined property: QgsSymbolLayer.Property.X (3.30+) or .PropertyX."""
+    prop = getattr(QgsSymbolLayer, "Property", None)
+    if prop is not None and hasattr(prop, name):
+        return getattr(prop, name)
+    return getattr(QgsSymbolLayer, "Property" + name)
+
+
+def _is_null(v):
+    return v is None or (NULL is not None and v == NULL)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Constants
+# ════════════════════════════════════════════════════════════════════════════
+
+SETTINGS_NS   = "TraccarLive"
+MENU_LABEL    = "&Traccar Live"
+DEFAULT_URL   = "https://server.traccar.org"
+GROUP_NAME    = "Traccar (live)"
+OVERLAY_PROP  = "traccar_overlay"
+WGS84         = QgsCoordinateReferenceSystem("EPSG:4326")
+
+# Time window choices: minutes > 0 = moving "Last …", -1 = custom dates, -2 = from feature
+WINDOW_CHOICES = [
+    ("Last 15 minutes", 15), ("Last 30 minutes", 30), ("Last 1 hour", 60),
+    ("Last 2 hours", 120), ("Last 3 hours", 180), ("Last 6 hours", 360),
+    ("Last 12 hours", 720), ("Last 1 day", 1440), ("Last 3 days", 4320),
+    ("Last 1 week", 10080), ("Last 2 weeks", 20160), ("Last 1 month", 43200),
+    ("Last 3 months", 129600), ("Custom dates…", -1), ("From feature…", -2),
 ]
-POINT_HISTORY_EXTRA = QgsField("fetched_at", _DT, "Fetched At (UTC)")
 
-LINE_FIELDS = [
-    QgsField("device_id",   _INT, "Device ID"),
-    QgsField("name",        _STR, "Device Name"),
-    QgsField("start_time",  _DT,  "Track Start"),
-    QgsField("last_update", _DT,  "Last Update"),
+# Layer schema shared with Traccar_QField (tools/make_template_gpkg.py there).
+# (name, memory-provider type)
+POINT_SCHEMA = [
+    ("device_id", "integer"), ("name", "string(80)"), ("status", "string(20)"),
+    ("fix_time", "datetime"), ("fix_local", "string(40)"), ("speed_kmh", "double"),
+    ("course", "double"), ("altitude_m", "double"), ("accuracy_m", "double"),
+    ("battery", "double"), ("address", "string(255)"), ("motion", "string(10)"),
+    ("fetched_at", "datetime"), ("tag", "string(80)"),
+]
+TRACK_SCHEMA = [
+    ("device_id", "integer"), ("name", "string(80)"), ("start_time", "datetime"),
+    ("last_update", "datetime"), ("start_local", "string(40)"), ("last_local", "string(40)"),
+    ("from_time", "datetime"), ("to_time", "datetime"), ("n_points", "integer"),
+    ("saved_at", "datetime"), ("tag", "string(80)"),
 ]
 
-# Optional field auto-filled by QField plugins (e.g. Traccar_QField) with a
-# project-defined expression such as:
-#   'KMRT-' || format_date(now(),'ddd-dd/MM/yy')||'-1'
-# Added to new GeoPackage layers below, unless the schema already has it.
-INCIDENT_REF_FIELD = QgsField("incident_ref", _STR, "Incident Ref")
-
-
-def _fields_with_incident_ref(fields):
-    """Return `fields` plus an `incident_ref` text field, unless already present."""
-    if any(f.name() == "incident_ref" for f in fields):
-        return list(fields)
-    return list(fields) + [INCIDENT_REF_FIELD]
-
-_PT_FIELD_MAP = {
-    "device_id": "device_id", "name": "name", "status": "status",
-    "speed_kmh": "speed_kmh", "course": "course", "altitude_m": "altitude",
-    "fix_time":  "fix_time",  "battery": "battery", "address": "address",
-    "motion":    "motion",
+DEFAULTS = {
+    "server_url": DEFAULT_URL, "username": "", "password": "",
+    "window_minutes": 60, "custom_from": "", "custom_to": "",
+    "event_layer_id": "", "event_display_field": "", "event_start_field": "",
+    "event_end_field": "", "event_feature_fid": -1, "feature_span": 0, "feature_duration": 120,
+    "live_interval_s": 30, "stale_minutes": 10,
+    "show_markers": True, "show_labels": True, "show_tracks": True, "show_accuracy": False,
+    "points_layer_id": "", "points_name_field": "", "points_mode": 0,
+    "tracks_layer_id": "", "tracks_name_field": "", "tracks_mode": 0,
+    "tag_enabled": False, "tag_text": "", "tag_field": "", "tag_from_feature": False,
+    "v2_migrated": False,
 }
 
-# ── Shared "quick range" timeframe options ──────────────────────────────────
-# Used both by the Fetch Logs quick-range combo and the cull-by-age combo.
-# (label, minutes) — minutes == 0 means "— custom date range —".
-TIMEFRAME_OPTIONS = [
-    ("— custom date range —", 0),
-    ("Last 15 minutes",       15),
-    ("Last 30 minutes",       30),
-    ("Last 1 hour",           60),
-    ("Last 2 hours",          120),
-    ("Last 3 hours",          180),
-    ("Last 6 hours",          360),
-    ("Last 12 hours",         720),
-    ("Last 18 hours",         1080),
-    ("Last 1 day",            1440),
-    ("Last 3 days",           4320),
-    ("Last 1 week",           10080),
-    ("Last 2 weeks",          20160),
-    ("Last 1 month",          43200),
-    ("Last 3 months",         129600),
-]
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Time helpers
+#  Traccar API times are ISO 8601 UTC ("2026-10-09T08:15:30.000+00:00").
+#  Everything shown to the user is local time (incl. summer time for that date);
+#  DateTime fields are written as UTC; *_local text fields hold local wall-clock.
+# ════════════════════════════════════════════════════════════════════════════
+
+_TZ_NO_COLON = re.compile(r"([+-]\d{2})(\d{2})$")
 
 
-# ── M-value helper ───────────────────────────────────────────────────────────
-
-def _to_qdt(s: str):
-    """Convert a Traccar fixTime ISO string to a UTC QDateTime.
-    e.g. '2026-06-16T12:34:56.000+0000' → QDateTime(2026,6,16,12,34,56, UTC)
-    Returns None if the string is empty or unparseable."""
+def _parse_utc(s):
+    """Traccar ISO string → aware UTC datetime, or None. Naive strings are UTC."""
     if not s:
         return None
+    s = _TZ_NO_COLON.sub(r"\1:\2", str(s).strip().replace("Z", "+00:00"))
     try:
-        dt = QDateTime.fromString(s[:19], "yyyy-MM-ddTHH:mm:ss")
-        if not dt.isValid():
-            return None
+        dt = datetime.fromisoformat(s)
+    except ValueError:
         try:
-            dt.setTimeSpec(Qt.UTC)
-        except AttributeError:
-            dt.setTimeSpec(Qt.TimeSpec.UTC)   # Qt6
-        return dt
-    except Exception:
+            dt = datetime.fromisoformat(s[:19])
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_local(s):
+    """'YYYY-MM-DD HH:MM' (or with offset) entered by the user → aware UTC datetime."""
+    if not s:
         return None
-
-
-def _epoch_from_fix_time(fix_time_str: str) -> float:
-    """Convert Traccar fixTime ISO string to Unix epoch seconds (UTC).
-    Strips milliseconds and timezone suffix, then uses calendar.timegm so
-    the bare datetime is treated as UTC (not local time).
-    e.g. '2026-06-16T12:34:56.000+0000' → 1750074896.0
-    Returns 0.0 if the string is empty or unparseable."""
-    if not fix_time_str:
-        return 0.0
+    s = _TZ_NO_COLON.sub(r"\1:\2", str(s).strip().replace("Z", "+00:00"))
     try:
-        s = fix_time_str[:19]   # "YYYY-MM-DDTHH:MM:SS" — drop ms and tz
-        dt = datetime.strptime(s, "%Y-%m-%dT%H:%M:%S")
-        return float(calendar.timegm(dt.timetuple()))
-    except Exception:
-        return 0.0
+        dt = datetime.fromisoformat(s.replace(" ", "T", 1) if len(s) > 10 else s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()          # naive → local time zone (DST-aware)
+    return dt.astimezone(timezone.utc)
 
 
-# ── Categorized-renderer auto-update ─────────────────────────────────────────
+def _attr_to_utc(v):
+    """Event-layer attribute (QDateTime, QDate, datetime or text) → aware UTC datetime."""
+    if _is_null(v):
+        return None
+    if isinstance(v, QDateTime):
+        return datetime.fromtimestamp(v.toMSecsSinceEpoch() / 1000, timezone.utc) if v.isValid() else None
+    if isinstance(v, QDate):
+        return datetime(v.year(), v.month(), v.day()).astimezone().astimezone(timezone.utc) if v.isValid() else None
+    if isinstance(v, datetime):
+        return (v if v.tzinfo else v.astimezone()).astimezone(timezone.utc)
+    return _parse_local(str(v))
 
-def _device_color(name: str) -> QColor:
-    """Deterministic hue from device name — same name always gets same colour."""
-    hue = int(hashlib.md5(name.encode()).hexdigest()[:4], 16) % 360
-    return QColor.fromHsv(hue, 180, 210)
+
+def _iso(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + \
+        "%03dZ" % (dt.microsecond // 1000)
 
 
-def _sync_categorized_renderer(lyr, new_names: set) -> bool:
-    """
-    Rebuild the categorized renderer on `lyr` (categorized by the `name` field).
+def _qdt(dt):
+    """aware datetime → QDateTime in UTC."""
+    return QDateTime.fromMSecsSinceEpoch(int(dt.timestamp() * 1000)).toUTC()
 
-    - Reads ALL device names currently stored in the layer features.
-    - Adds any names from `new_names` that aren't in the layer yet
-      (i.e. the batch being written right now).
-    - Preserves the colour of any device already in the renderer so
-      that user-customised colours survive a refresh.
-    - Assigns a deterministic colour (from device-name hash) for new devices.
-    - Works whether or not the layer already had a categorized renderer.
 
-    Returns True if the renderer was (re)applied.
-    """
-    # ── Collect all device names in the layer ─────────────────────────────
-    all_names = set(new_names)
-    for feat in lyr.getFeatures():
-        val = feat["name"]
-        if val is not None and val != NULL and str(val).strip():
-            all_names.add(str(val))
+def _fmt_local(dt):
+    return dt.astimezone().strftime("%d %b %H:%M") if dt else "—"
 
-    if not all_names:
-        return False
 
-    # ── Preserve colours already assigned by the user / previous sync ─────
-    old_colors: dict = {}
-    old_renderer = lyr.renderer()
-    if isinstance(old_renderer, QgsCategorizedSymbolRenderer):
-        for cat in old_renderer.categories():
-            v = cat.value()
-            if v and v != NULL:
-                old_colors[str(v)] = cat.symbol().color()
+def _local_text(dt):
+    """'2026-10-09 09:15:30 UTC+01:00' — local wall-clock time with its offset."""
+    if not dt:
+        return None
+    loc = dt.astimezone()
+    off = loc.strftime("%z")
+    return loc.strftime("%Y-%m-%d %H:%M:%S") + " UTC" + off[:3] + ":" + off[3:]
 
-    # ── Build fresh category list ─────────────────────────────────────────
-    is_point   = lyr.geometryType() == QgsWkbTypes.PointGeometry
-    categories = []
-    for name in sorted(all_names):
-        color = old_colors.get(name, _device_color(name))
-        if is_point:
-            sym = QgsMarkerSymbol.createSimple({"color": color.name()})
+
+def _span_text(a, b):
+    """'09:09 – 09:22' for today, otherwise with dates. Local time."""
+    if not a or not b:
+        return "—"
+    la, lb = a.astimezone(), b.astimezone()
+    today = datetime.now().astimezone().date()
+    if la.date() == lb.date() == today:
+        return la.strftime("%H:%M") + " – " + lb.strftime("%H:%M")
+    if la.date() == lb.date():
+        return la.strftime("%d %b %H:%M") + " – " + lb.strftime("%H:%M")
+    return la.strftime("%d %b %H:%M") + " – " + lb.strftime("%d %b %H:%M")
+
+
+def _age_text(dt):
+    if not dt:
+        return "?"
+    s = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    if s < 60:
+        return "%d s" % s
+    if s < 3600:
+        return "%d min" % (s // 60)
+    if s < 86400:
+        return "%d h" % (s // 3600)
+    return "%d d" % (s // 86400)
+
+
+def _device_color(name):
+    """Deterministic colour from the device name — same name, same colour."""
+    hue = int(hashlib.md5(str(name).encode()).hexdigest()[:4], 16) % 360
+    return QColor.fromHsv(hue, 190, 200).name()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Asynchronous Traccar API client (QGIS network manager → proxy settings apply,
+#  QGIS never freezes). Accept: application/json stops Traccar sending a
+#  WWW-Authenticate challenge, so a wrong password never pops up a login box.
+# ════════════════════════════════════════════════════════════════════════════
+
+class _Api:
+    def __init__(self, cfg):
+        self.cfg      = cfg
+        self._pending = set()
+
+    def get(self, path, on_ok, on_err):
+        url = self.cfg["server_url"].rstrip("/") + path
+        req = QNetworkRequest(QUrl(url))
+        token = base64.b64encode(
+            ("%s:%s" % (self.cfg["username"], self.cfg["password"])).encode("utf-8")).decode()
+        req.setRawHeader(b"Authorization", ("Basic " + token).encode())
+        req.setRawHeader(b"Accept", b"application/json")
+        try:
+            req.setTransferTimeout(30000)
+        except AttributeError:     # pragma: no cover
+            pass
+        reply = QgsNetworkAccessManager.instance().get(req)
+        self._pending.add(reply)
+
+        def finished():
+            self._pending.discard(reply)
+            status = reply.attribute(_HTTP_STATUS)
+            err    = reply.error()
+            errstr = reply.errorString()
+            data   = bytes(reply.readAll())
+            reply.deleteLater()
+            if err == _NET_OK and (status is None or int(status) == 200):
+                try:
+                    obj = json.loads(data.decode("utf-8"))
+                except Exception as exc:
+                    on_err("Unexpected response from server: %s" % exc)
+                    return
+                on_ok(obj)
+            elif status:
+                status = int(status)
+                on_err("Wrong username or password (HTTP 401)" if status == 401
+                       else "HTTP %d on %s" % (status, path.split("?")[0]))
+            else:
+                on_err("No response — check the server URL (%s)" % errstr)
+
+        reply.finished.connect(finished)
+
+    def abort_all(self):
+        for r in list(self._pending):
+            try:
+                r.abort()
+            except RuntimeError:
+                pass
+        self._pending.clear()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  GeoPackage template (same tables as Traccar_QField's template)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _memory_uri(geom, schema, crs="EPSG:4326"):
+    return geom + "?crs=" + crs + "".join("&field=%s:%s" % f for f in schema)
+
+
+def create_template_gpkg(path, crs_authid="EPSG:4326"):
+    """Create traccar_points + traccar_tracks in one GeoPackage. Returns (points, tracks, errors)."""
+    out, errors = [], []
+    for geom, schema, table, action in (
+            ("Point", POINT_SCHEMA, "traccar_points", _GPKG_NEW),
+            ("LineStringZM", TRACK_SCHEMA, "traccar_tracks", _GPKG_LAYER)):
+        tmp = QgsVectorLayer(_memory_uri(geom, schema, crs_authid), table, "memory")
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.layerName = table
+        opts.fileEncoding = "UTF-8"
+        opts.actionOnExistingFile = action
+        res = QgsVectorFileWriter.writeAsVectorFormatV3(
+            tmp, path, QgsProject.instance().transformContext(), opts)
+        if res[0] != _VFW_OK:
+            errors.append("%s: %s" % (table, res[1]))
+            out.append(None)
+            continue
+        lyr = QgsVectorLayer("%s|layername=%s" % (path, table), table, "ogr")
+        out.append(lyr if lyr.isValid() else None)
+        if not lyr.isValid():
+            errors.append("%s: could not open the new table" % table)
+    return out[0], out[1], errors
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Main window (non-modal pop-up)
+# ════════════════════════════════════════════════════════════════════════════
+
+class MainDialog(QDialog):
+    def __init__(self, plugin, parent):
+        super().__init__(parent)
+        self.p = plugin
+        self.setWindowTitle("Traccar Live")
+        self.setModal(False)
+        self.setMinimumWidth(460)
+        root = QVBoxLayout(self)
+
+        # ── Time window ───────────────────────────────────────────────────
+        tw = QGroupBox("Time window")
+        twl = QVBoxLayout(tw)
+        self.window_combo = QComboBox()
+        for label, minutes in WINDOW_CHOICES:
+            self.window_combo.addItem(label, minutes)
+        twl.addWidget(self.window_combo)
+
+        self.custom_w = QWidget()
+        cl = QHBoxLayout(self.custom_w)
+        cl.setContentsMargins(0, 0, 0, 0)
+        self.from_edit = QDateTimeEdit()
+        self.to_edit   = QDateTimeEdit()
+        for ed in (self.from_edit, self.to_edit):
+            ed.setCalendarPopup(True)
+            ed.setDisplayFormat("yyyy-MM-dd HH:mm")
+        cl.addWidget(QLabel("From"))
+        cl.addWidget(self.from_edit, 1)
+        cl.addWidget(QLabel("To"))
+        cl.addWidget(self.to_edit, 1)
+        twl.addWidget(self.custom_w)
+
+        self.feature_w = QWidget()
+        fl = QGridLayout(self.feature_w)
+        fl.setContentsMargins(0, 0, 0, 0)
+        self.feature_combo = QComboBox()
+        self.feature_reload = QToolButton()
+        self.feature_reload.setText("↻")
+        self.feature_reload.setToolTip("Re-read the features")
+        self.span_combo = QComboBox()
+        self.span_combo.addItems(["Its start → its end", "Its start + duration", "Its end − duration"])
+        self.duration_spin = QSpinBox()
+        self.duration_spin.setRange(1, 14400)
+        self.duration_spin.setSingleStep(15)
+        self.duration_spin.setSuffix(" min")
+        fl.addWidget(self.feature_combo, 0, 0, 1, 2)
+        fl.addWidget(self.feature_reload, 0, 2)
+        fl.addWidget(self.span_combo, 1, 0)
+        fl.addWidget(self.duration_spin, 1, 1, 1, 2)
+        twl.addWidget(self.feature_w)
+
+        self.show_btn = QPushButton("Show this window")
+        twl.addWidget(self.show_btn)
+        self.status_lbl = QLabel()
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setStyleSheet("color:#555;")
+        twl.addWidget(self.status_lbl)
+        root.addWidget(tw)
+
+        # ── Live / refresh / clear ────────────────────────────────────────
+        row = QHBoxLayout()
+        self.live_btn = QPushButton("▶  Live")
+        self.live_btn.setCheckable(True)
+        self.live_btn.setToolTip("Keep the window up to date in the background "
+                                 "(also on the toolbar)")
+        self.refresh_btn = QPushButton("↻  Refresh")
+        self.refresh_btn.setToolTip("Load the window once")
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setToolTip("Stop Live and remove the overlay from the map")
+        row.addWidget(self.live_btn, 2)
+        row.addWidget(self.refresh_btn, 1)
+        row.addWidget(self.clear_btn, 1)
+        root.addLayout(row)
+
+        # ── What to show ──────────────────────────────────────────────────
+        show = QHBoxLayout()
+        show.addWidget(QLabel("Show:"))
+        self.chk_markers  = QCheckBox("Markers")
+        self.chk_labels   = QCheckBox("Labels")
+        self.chk_tracks   = QCheckBox("Tracks")
+        self.chk_accuracy = QCheckBox("Accuracy")
+        for c in (self.chk_markers, self.chk_labels, self.chk_tracks, self.chk_accuracy):
+            show.addWidget(c)
+        show.addStretch()
+        root.addLayout(show)
+
+        # ── Devices ───────────────────────────────────────────────────────
+        head = QHBoxLayout()
+        self.devices_lbl = QLabel("Devices")
+        self.devices_lbl.setStyleSheet("font-weight:bold;")
+        self.updated_lbl = QLabel()
+        self.updated_lbl.setStyleSheet("color:#777;")
+        self.zoom_all_btn = QToolButton()
+        self.zoom_all_btn.setText("Zoom to all")
+        head.addWidget(self.devices_lbl)
+        head.addStretch()
+        head.addWidget(self.updated_lbl)
+        head.addWidget(self.zoom_all_btn)
+        root.addLayout(head)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Device", "Fixes", "Time span", "Speed", "Battery"])
+        self.table.setEditTriggers(_NO_EDIT)
+        self.table.setSelectionBehavior(_SEL_ROWS)
+        self.table.verticalHeader().setVisible(False)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, _HV_STRETCH)
+        for c in range(1, 5):
+            hh.setSectionResizeMode(c, _HV_CONTENTS)
+        self.table.setToolTip("Double-click a device to centre the map on it")
+        self.table.setMinimumHeight(140)
+        root.addWidget(self.table, 1)
+
+        # ── Save ──────────────────────────────────────────────────────────
+        save = QHBoxLayout()
+        self.save_pos_btn = QPushButton("📍  Save positions")
+        self.save_trk_btn = QPushButton("〰  Save tracks")
+        save.addWidget(self.save_pos_btn)
+        save.addWidget(self.save_trk_btn)
+        root.addLayout(save)
+        self.saves_to_lbl = QLabel()
+        self.saves_to_lbl.setWordWrap(True)
+        self.saves_to_lbl.setTextFormat(_e(Qt, "TextFormat", "RichText"))
+        root.addWidget(self.saves_to_lbl)
+
+        # ── Footer ────────────────────────────────────────────────────────
+        foot = QHBoxLayout()
+        self.settings_btn = QPushButton("Settings…")
+        self.help_btn = QPushButton("Help")
+        close_btn = QPushButton("Close")
+        foot.addWidget(self.settings_btn)
+        foot.addWidget(self.help_btn)
+        foot.addStretch()
+        foot.addWidget(close_btn)
+        root.addLayout(foot)
+
+        # ── Wiring ────────────────────────────────────────────────────────
+        self.window_combo.activated.connect(self._window_chosen)
+        self.show_btn.clicked.connect(self._show_clicked)
+        self.feature_reload.clicked.connect(self.reload_features)
+        self.feature_combo.activated.connect(self._feature_chosen)
+        self.span_combo.activated.connect(lambda i: self.p.set_cfg("feature_span", i))
+        self.duration_spin.valueChanged.connect(lambda v: self.p.set_cfg("feature_duration", v))
+        self.live_btn.toggled.connect(self.p.set_live)
+        self.refresh_btn.clicked.connect(self.p.load_window)
+        self.clear_btn.clicked.connect(self.p.clear)
+        self.chk_markers.toggled.connect(lambda on: self.p.set_show("show_markers", on))
+        self.chk_labels.toggled.connect(lambda on: self.p.set_show("show_labels", on))
+        self.chk_tracks.toggled.connect(lambda on: self.p.set_show("show_tracks", on))
+        self.chk_accuracy.toggled.connect(lambda on: self.p.set_show("show_accuracy", on))
+        self.table.cellDoubleClicked.connect(self._zoom_row)
+        self.zoom_all_btn.clicked.connect(self.p.zoom_to_all)
+        self.save_pos_btn.clicked.connect(self.p.save_positions)
+        self.save_trk_btn.clicked.connect(self.p.save_tracks)
+        self.saves_to_lbl.linkActivated.connect(lambda _l: self.p.open_settings(1))
+        self.settings_btn.clicked.connect(lambda: self.p.open_settings(0))
+        self.help_btn.clicked.connect(self.p.show_help)
+        close_btn.clicked.connect(self.close)
+
+        self._rows = []
+
+    # ── State → widgets ───────────────────────────────────────────────────
+    def load_state(self):
+        c = self.p.cfg
+        idx = self.window_combo.findData(c["window_minutes"])
+        self.window_combo.setCurrentIndex(idx if idx >= 0 else 2)
+        now = QDateTime.currentDateTime()
+        f = QDateTime.fromString(c["custom_from"], "yyyy-MM-dd HH:mm")
+        t = QDateTime.fromString(c["custom_to"], "yyyy-MM-dd HH:mm")
+        self.from_edit.setDateTime(f if f.isValid() else QDateTime(now.date(), QTime(0, 0)))
+        self.to_edit.setDateTime(t if t.isValid() else now)
+        self.span_combo.setCurrentIndex(c["feature_span"])
+        self.duration_spin.blockSignals(True)
+        self.duration_spin.setValue(c["feature_duration"])
+        self.duration_spin.blockSignals(False)
+        for chk, key in ((self.chk_markers, "show_markers"), (self.chk_labels, "show_labels"),
+                         (self.chk_tracks, "show_tracks"), (self.chk_accuracy, "show_accuracy")):
+            chk.blockSignals(True)
+            chk.setChecked(bool(c[key]))
+            chk.blockSignals(False)
+        if c["window_minutes"] == -2:
+            self.reload_features()
+        self._sync_mode()
+        self.refresh()
+
+    def _sync_mode(self):
+        m = self.window_combo.currentData()
+        self.custom_w.setVisible(m == -1)
+        self.feature_w.setVisible(m == -2)
+        self.show_btn.setVisible(m is not None and m < 0)
+        self.duration_spin.setVisible(self.span_combo.currentIndex() > 0)
+
+    def refresh(self):
+        """Update everything that reflects the plugin's live state."""
+        self.live_btn.blockSignals(True)
+        self.live_btn.setChecked(self.p.live)
+        self.live_btn.setText("⏹  Stop live" if self.p.live else "▶  Live")
+        self.live_btn.blockSignals(False)
+        self.refresh_btn.setEnabled(not self.p.loading)
+        self.clear_btn.setEnabled(self.p.win is not None or self.p.live)
+        self.status_lbl.setText(self.p.window_summary())
+        self.updated_lbl.setText(("updated " + self.p.last_update) if self.p.last_update else "")
+        self.duration_spin.setVisible(self.span_combo.currentIndex() > 0)
+
+        rows = self.p.device_rows
+        self._rows = rows
+        self.devices_lbl.setText("Devices  (%d)" % len(rows))
+        self.table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            vals = [row["name"], row["fixes"], row["span"], row["speed"], row["battery"]]
+            for col, v in enumerate(vals):
+                item = QTableWidgetItem(str(v))
+                if col == 0:
+                    item.setForeground(QColor(row["color"] if row["fresh"] else "#9E9E9E"))
+                    item.setToolTip(row["tip"])
+                self.table.setItem(r, col, item)
+        self.saves_to_lbl.setText(self.p.saves_to_html())
+
+    # ── Handlers ──────────────────────────────────────────────────────────
+    def _window_chosen(self, _i):
+        m = self.window_combo.currentData()
+        self.p.set_cfg("window_minutes", m)
+        if m == -2:
+            self.reload_features()
+        self._sync_mode()
+        if m > 0:
+            self.p.reload_window()
         else:
-            sym = QgsLineSymbol.createSimple({"color":      color.name(),
-                                              "line_width": "0.6"})
-        categories.append(QgsRendererCategory(name, sym, name, True))
+            self.p.status_msg = "Set the window above, then click Show this window."
+            self.refresh()
 
-    lyr.setRenderer(QgsCategorizedSymbolRenderer("name", categories))
-    lyr.triggerRepaint()
-    return True
+    def _show_clicked(self):
+        if self.window_combo.currentData() == -1:
+            self.p.set_cfg("custom_from", self.from_edit.dateTime().toString("yyyy-MM-dd HH:mm"))
+            self.p.set_cfg("custom_to", self.to_edit.dateTime().toString("yyyy-MM-dd HH:mm"))
+        self.p.reload_window()
 
+    def reload_features(self):
+        self.feature_combo.clear()
+        feats = self.p.event_features()
+        if not feats:
+            self.feature_combo.addItem("— set up the layer in Settings → Advanced —", -1)
+            return
+        for f in feats:
+            self.feature_combo.addItem(f["label"], f["fid"])
+        idx = self.feature_combo.findData(self.p.cfg["event_feature_fid"])
+        self.feature_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.p.set_cfg("event_feature_fid", self.feature_combo.currentData())
 
-# ── HTTP helper ──────────────────────────────────────────────────────────────
+    def _feature_chosen(self, _i):
+        self.p.set_cfg("event_feature_fid", self.feature_combo.currentData())
 
-def _api_get(base_url, username, password, path):
-    url   = base_url.rstrip("/") + path
-    token = base64.b64encode(f"{username}:{password}".encode()).decode()
-    req   = urllib.request.Request(
-        url, headers={"Authorization": f"Basic {token}", "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    def _zoom_row(self, r, _c):
+        if 0 <= r < len(self._rows) and self._rows[r]["pos"] is not None:
+            self.p.zoom_to(self._rows[r]["pos"])
 
-
-# ── GeoPackage helpers ───────────────────────────────────────────────────────
-
-def _gpkg_write_layer(path, geom_uri, fields, layer_slug, action):
-    """
-    Write an empty schema layer to a GeoPackage.
-    action = _GPKG_NEW   → create / overwrite whole file
-    action = _GPKG_LAYER → add / overwrite just this table in an existing file
-    Returns QgsVectorLayer or None.
-    """
-    flds = QgsFields()
-    for f in fields:
-        flds.append(QgsField(f.name(), f.type()))
-
-    tmp = QgsVectorLayer(geom_uri, "tmp", "memory")
-    tmp.dataProvider().addAttributes(flds)
-    tmp.updateFields()
-
-    opts                    = QgsVectorFileWriter.SaveVectorOptions()
-    opts.driverName         = "GPKG"
-    opts.layerName          = layer_slug
-    opts.fileEncoding       = "UTF-8"
-    opts.actionOnExistingFile = action
-
-    err, msg, _, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
-        tmp, path, QgsProject.instance().transformContext(), opts)
-    if err != _VFW_OK:
-        return None, msg
-
-    lyr = QgsVectorLayer(f"{path}|layername={layer_slug}", layer_slug, "ogr")
-    return (lyr if lyr.isValid() else None), ""
+    def closeEvent(self, ev):
+        QSettings().setValue(SETTINGS_NS + "/main_geometry", self.saveGeometry())
+        super().closeEvent(ev)
 
 
-def _hr():
-    line = QFrame()
-    line.setFrameShape(QFrame.HLine)
-    line.setFrameShadow(QFrame.Sunken)
-    return line
-
-
-# ── Settings dialog ──────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  Settings (tabs: Connection, Layers, Tag, Advanced)
+# ════════════════════════════════════════════════════════════════════════════
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent,
-                 server_url, username, password, interval_min,
-                 live_layer_id,
-                 append_pts,  pt_layer_id,
-                 append_lines, ln_layer_id,
-                 fetch_history=False,
-                 cull_by_count=False, cull_max_per_device=500,
-                 cull_by_age=False, cull_age_minutes=1440,
-                 last_fetch=""):
+    def __init__(self, plugin, parent, tab=0):
         super().__init__(parent)
+        self.p = plugin
+        c = plugin.cfg
         self.setWindowTitle("Traccar Live – Settings")
-        self.setMinimumWidth(490)
-        layout = QVBoxLayout(self)
+        self.setMinimumWidth(480)
+        root = QVBoxLayout(self)
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
 
-        # ── Last-fetch status (top of dialog) ────────────────────────────────
-        if last_fetch:
-            status_box = QLabel(f"Last fetched:  {last_fetch}")
-            status_box.setStyleSheet(
-                "background:#E3F2FD; color:#1565C0; padding:6px 10px;"
-                "border-radius:4px; font-style:italic;")
-            layout.addWidget(status_box)
-
-        # ── Connection ───────────────────────────────────────────────────────
-        conn = QGroupBox("Connection")
-        form = QFormLayout(conn)
-
-        self.url_edit = QLineEdit(server_url)
-        self.url_edit.setPlaceholderText("https://server.traccar.org")
-        form.addRow("Server URL:", self.url_edit)
-
-        self.user_edit = QLineEdit(username)
-        self.user_edit.setPlaceholderText("you@example.com")
-        form.addRow("Username / Email:", self.user_edit)
-
-        self.pass_edit = QLineEdit(password)
+        # ── Connection ────────────────────────────────────────────────────
+        t = QWidget()
+        f = QFormLayout(t)
+        self.url_edit = QLineEdit(c["server_url"])
+        self.url_edit.setPlaceholderText(DEFAULT_URL)
+        self.user_edit = QLineEdit(c["username"])
+        self.pass_edit = QLineEdit(c["password"])
         self.pass_edit.setEchoMode(_ECHO_PWD)
-        form.addRow("Password:", self.pass_edit)
+        f.addRow("Server URL:", self.url_edit)
+        f.addRow("Email / username:", self.user_edit)
+        f.addRow("Password:", self.pass_edit)
+        test = QPushButton("Test connection")
+        self.test_lbl = QLabel()
+        self.test_lbl.setWordWrap(True)
+        f.addRow(test)
+        f.addRow(self.test_lbl)
+        hint = QLabel("Use the address you open in a browser for Traccar. "
+                      "The password is stored in your QGIS user settings.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666;")
+        f.addRow(hint)
+        test.clicked.connect(self._test)
+        self.tabs.addTab(t, "Connection")
 
-        layout.addWidget(conn)
+        # ── Layers ────────────────────────────────────────────────────────
+        t = QWidget()
+        v = QVBoxLayout(t)
 
-        # ── Refresh ──────────────────────────────────────────────────────────
-        ref      = QGroupBox("Auto-Refresh")
-        ref_form = QFormLayout(ref)
+        g = QGroupBox("📍  Positions")
+        gf = QFormLayout(g)
+        self.pt_combo = QgsMapLayerComboBox()
+        self.pt_combo.setFilters(_LF_POINT)
+        self.pt_combo.setAllowEmptyLayer(True)
+        self.pt_combo.setShowCrs(True)
+        self.pt_name = QgsFieldComboBox()
+        self.pt_name.setFilters(_FF_STRING)
+        self.pt_name.setAllowEmptyFieldName(True)
+        self.pt_latest = QRadioButton("Save the latest fix per device")
+        self.pt_every  = QRadioButton("Save every fix in the time window")
+        self._pt_group = QButtonGroup(self)
+        self._pt_group.addButton(self.pt_latest)
+        self._pt_group.addButton(self.pt_every)
+        gf.addRow("Layer:", self.pt_combo)
+        gf.addRow("Device name into:", self.pt_name)
+        gf.addRow(self.pt_latest)
+        gf.addRow(self.pt_every)
+        v.addWidget(g)
+
+        g = QGroupBox("〰  Tracks")
+        gf = QFormLayout(g)
+        self.ln_combo = QgsMapLayerComboBox()
+        self.ln_combo.setFilters(_LF_LINE)
+        self.ln_combo.setAllowEmptyLayer(True)
+        self.ln_combo.setShowCrs(True)
+        self.ln_name = QgsFieldComboBox()
+        self.ln_name.setFilters(_FF_STRING)
+        self.ln_name.setAllowEmptyFieldName(True)
+        self.ln_add  = QRadioButton("Add a new track for each device on every save")
+        self.ln_keep = QRadioButton("Keep only the most recent track per device")
+        self._ln_group = QButtonGroup(self)
+        self._ln_group.addButton(self.ln_add)
+        self._ln_group.addButton(self.ln_keep)
+        gf.addRow("Layer:", self.ln_combo)
+        gf.addRow("Device name into:", self.ln_name)
+        gf.addRow(self.ln_add)
+        gf.addRow(self.ln_keep)
+        v.addWidget(g)
+
+        gp = QPushButton("New GeoPackage…  (creates both layers)")
+        gp.clicked.connect(self._new_gpkg)
+        v.addWidget(gp)
+        hint = QLabel("The name always goes into a field called 'name' if the layer has one; "
+                      "pick another text field (e.g. 'title') to fill that too. "
+                      "Other fields are filled when the layer has them: device_id, fix_time, "
+                      "fix_local, speed_kmh, course, altitude_m, accuracy_m, battery, address, "
+                      "motion, fetched_at (positions); start_time, last_update, start_local, "
+                      "last_local, from_time, to_time, n_points, saved_at (tracks).")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666;")
+        v.addWidget(hint)
+        v.addStretch()
+        self.tabs.addTab(t, "Layers")
+
+        self._set_layer(self.pt_combo, c["points_layer_id"])
+        self._set_layer(self.ln_combo, c["tracks_layer_id"])
+        self.pt_name.setLayer(self.pt_combo.currentLayer())
+        self.ln_name.setLayer(self.ln_combo.currentLayer())
+        self.pt_name.setField(c["points_name_field"])
+        self.ln_name.setField(c["tracks_name_field"])
+        (self.pt_every if c["points_mode"] == 1 else self.pt_latest).setChecked(True)
+        (self.ln_keep if c["tracks_mode"] == 1 else self.ln_add).setChecked(True)
+        self.pt_combo.layerChanged.connect(self.pt_name.setLayer)
+        self.ln_combo.layerChanged.connect(self.ln_name.setLayer)
+
+        # ── Tag ───────────────────────────────────────────────────────────
+        t = QWidget()
+        f = QFormLayout(t)
+        self.tag_chk = QCheckBox("Tag saved points and tracks")
+        self.tag_chk.setChecked(bool(c["tag_enabled"]))
+        self.tag_text = QLineEdit(c["tag_text"])
+        self.tag_text.setPlaceholderText("e.g. FIRE-2026-001")
+        self.tag_field = QComboBox()
+        self.tag_field.setEditable(True)
+        self.tag_feat = QCheckBox("With 'From feature', use the feature's display value instead")
+        self.tag_feat.setChecked(bool(c["tag_from_feature"]))
+        f.addRow(self.tag_chk)
+        f.addRow("Tag text:", self.tag_text)
+        f.addRow("Write into field:", self.tag_field)
+        f.addRow(self.tag_feat)
+        self._fill_tag_fields()
+        self.pt_combo.layerChanged.connect(lambda _l: self._fill_tag_fields())
+        self.ln_combo.layerChanged.connect(lambda _l: self._fill_tag_fields())
+        self.tabs.addTab(t, "Tag")
+
+        # ── Advanced ──────────────────────────────────────────────────────
+        t = QWidget()
+        v = QVBoxLayout(t)
+        g = QGroupBox("Live")
+        gf = QFormLayout(g)
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(1, 60)
-        self.interval_spin.setValue(interval_min)
-        self.interval_spin.setSuffix(" min")
-        ref_form.addRow("Interval:", self.interval_spin)
+        self.interval_spin.setRange(5, 3600)
+        self.interval_spin.setSuffix(" s")
+        self.interval_spin.setValue(int(c["live_interval_s"]))
+        self.stale_spin = QSpinBox()
+        self.stale_spin.setRange(1, 1440)
+        self.stale_spin.setSuffix(" min")
+        self.stale_spin.setValue(int(c["stale_minutes"]))
+        gf.addRow("Refresh every:", self.interval_spin)
+        gf.addRow("Grey when last fix is older than:", self.stale_spin)
+        v.addWidget(g)
 
-        self.history_chk = QCheckBox(
-            "Fetch full track history between refreshes")
-        self.history_chk.setChecked(fetch_history)
-        self.history_chk.setToolTip(
-            "When enabled, each fetch pulls every GPS fix recorded since the\n"
-            "previous fetch using /api/positions?deviceId=X&from=…&to=…\n"
-            "All intermediate points are added to the point layer (B) and as\n"
-            "vertices to the track line (C).  One API call per device per fetch.\n"
-            "Disable to fetch only the current position per device.")
-        ref_form.addRow("", self.history_chk)
-        layout.addWidget(ref)
+        g = QGroupBox("Time window 'From feature'")
+        gf = QFormLayout(g)
+        self.ev_combo = QgsMapLayerComboBox()
+        self.ev_combo.setFilters(_LF_VECTOR)
+        self.ev_combo.setAllowEmptyLayer(True)
+        self.ev_disp  = QgsFieldComboBox()
+        self.ev_start = QgsFieldComboBox()
+        self.ev_end   = QgsFieldComboBox()
+        for fc in (self.ev_disp, self.ev_start, self.ev_end):
+            fc.setAllowEmptyFieldName(True)
+        gf.addRow("Layer (e.g. incidents):", self.ev_combo)
+        gf.addRow("Name shown in the list:", self.ev_disp)
+        gf.addRow("Start time field:", self.ev_start)
+        gf.addRow("End time field (optional):", self.ev_end)
+        v.addWidget(g)
+        v.addStretch()
+        self.tabs.addTab(t, "Advanced")
 
-        # ── On each fetch ─────────────────────────────────────────────────────
-        fetch        = QGroupBox("On Each Fetch")
-        fetch_layout = QVBoxLayout(fetch)
-
-        # A ───────────────────────────────────────────────────────────────────
-        self.keep_live_chk = QCheckBox(
-            "A  Keep live layer updated  (latest fix per device, replaced every fetch)")
-        self.keep_live_chk.setChecked(live_layer_id != "")
-        fetch_layout.addWidget(self.keep_live_chk)
-
-        # Sub-widget: radio buttons + layer combo, indented under the checkbox
-        a_sub = QWidget()
-        a_sub.setEnabled(live_layer_id != "")
-        a_sub_layout = QVBoxLayout(a_sub)
-        a_sub_layout.setContentsMargins(24, 0, 0, 0)
-        a_sub_layout.setSpacing(4)
-
-        self.a_temp_radio  = QRadioButton(
-            "Temporary in-memory layer  (not saved when QGIS closes)")
-        self.a_layer_radio = QRadioButton("Use existing layer:")
-        a_layer_row        = QHBoxLayout()
-        self.live_combo    = QgsMapLayerComboBox()
-        self.live_combo.setFilters(_PT_LYR)
-        self.live_combo.setAdditionalItems(["— none  (A disabled) —"])
-        self.live_combo.setShowCrs(True)
-        a_layer_row.addWidget(self.a_layer_radio)
-        a_layer_row.addWidget(self.live_combo, 1)
-
-        a_sub_layout.addWidget(self.a_temp_radio)
-        a_sub_layout.addLayout(a_layer_row)
-        fetch_layout.addWidget(a_sub)
-
-        # Initialise radio state
-        if live_layer_id == "<<temp>>" or live_layer_id == "":
-            self.a_temp_radio.setChecked(True)
-            self.live_combo.setEnabled(False)
-        else:
-            self.a_layer_radio.setChecked(True)
-            lyr_a = QgsProject.instance().mapLayer(live_layer_id)
-            if lyr_a:
-                self.live_combo.setLayer(lyr_a)
-
-        # Wire signals
-        self.keep_live_chk.toggled.connect(a_sub.setEnabled)
-        self.a_layer_radio.toggled.connect(self.live_combo.setEnabled)
-
-        fetch_layout.addWidget(_hr())
-
-        # B ───────────────────────────────────────────────────────────────────
-        self.pts_chk = QCheckBox(
-            "B  Append to point layer  (cumulative position history)")
-        self.pts_chk.setChecked(append_pts)
-        fetch_layout.addWidget(self.pts_chk)
-
-        pts_row = QHBoxLayout()
-        self.pts_combo = QgsMapLayerComboBox()
-        self.pts_combo.setFilters(_PT_LYR)
-        self.pts_combo.setAdditionalItems(["— none  (B disabled) —"])
-        self.pts_combo.setShowCrs(True)
-        if pt_layer_id:
-            lyr = QgsProject.instance().mapLayer(pt_layer_id)
-            if lyr:
-                self.pts_combo.setLayer(lyr)
-        pts_row.addWidget(self.pts_combo, 1)
-        fetch_layout.addLayout(pts_row)
-
-        fetch_layout.addWidget(_hr())
-
-        # C ───────────────────────────────────────────────────────────────────
-        self.lns_chk = QCheckBox(
-            "C  Append vertices to line layer  (one track-line per device)")
-        self.lns_chk.setChecked(append_lines)
-        fetch_layout.addWidget(self.lns_chk)
-
-        lns_row = QHBoxLayout()
-        self.lns_combo = QgsMapLayerComboBox()
-        self.lns_combo.setFilters(_LN_LYR)
-        self.lns_combo.setAdditionalItems(["— none  (C disabled) —"])
-        self.lns_combo.setShowCrs(True)
-        if ln_layer_id:
-            lyr = QgsProject.instance().mapLayer(ln_layer_id)
-            if lyr:
-                self.lns_combo.setLayer(lyr)
-        lns_row.addWidget(self.lns_combo, 1)
-        fetch_layout.addLayout(lns_row)
-
-        fetch_layout.addWidget(_hr())
-
-        # Single combined GeoPackage button ───────────────────────────────────
-        gpkg_row = QHBoxLayout()
-        gpkg_lbl = QLabel("A + B + C:")
-        gpkg_lbl.setFixedWidth(70)
-        gpkg_row.addWidget(gpkg_lbl)
-        new_gpkg_btn = QPushButton("New GeoPackage…  (creates all three layers in one file)")
-        new_gpkg_btn.clicked.connect(self._new_combined_gpkg)
-        gpkg_row.addWidget(new_gpkg_btn, 1)
-        fetch_layout.addLayout(gpkg_row)
-
-        layout.addWidget(fetch)
-
-        # ── Layer B housekeeping (culling) ──────────────────────────────────────
-        cull        = QGroupBox("Layer B Housekeeping  (point history)")
-        cull_layout = QVBoxLayout(cull)
-
-        # Cull by count (per device)
-        count_row = QHBoxLayout()
-        self.cull_count_chk = QCheckBox("Cull by count — keep at most")
-        self.cull_count_chk.setChecked(cull_by_count)
-        count_row.addWidget(self.cull_count_chk)
-        self.cull_max_spin = QSpinBox()
-        self.cull_max_spin.setRange(1, 100000)
-        self.cull_max_spin.setSingleStep(50)
-        self.cull_max_spin.setValue(cull_max_per_device)
-        self.cull_max_spin.setEnabled(cull_by_count)
-        count_row.addWidget(self.cull_max_spin)
-        count_row.addWidget(QLabel("point(s) per device"))
-        count_row.addStretch()
-        cull_layout.addLayout(count_row)
-        self.cull_count_chk.toggled.connect(self.cull_max_spin.setEnabled)
-
-        # Cull by age
-        age_row = QHBoxLayout()
-        self.cull_age_chk = QCheckBox("Cull by age — remove points older than")
-        self.cull_age_chk.setChecked(cull_by_age)
-        age_row.addWidget(self.cull_age_chk)
-        self.cull_age_combo = QComboBox()
-        for label, _minutes in TIMEFRAME_OPTIONS[1:]:   # skip "— custom date range —"
-            self.cull_age_combo.addItem(label, _minutes)
-        # Restore saved selection (default to first real entry if not found)
-        idx = self.cull_age_combo.findData(cull_age_minutes)
-        self.cull_age_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.cull_age_combo.setEnabled(cull_by_age)
-        age_row.addWidget(self.cull_age_combo, 1)
-        cull_layout.addLayout(age_row)
-        self.cull_age_chk.toggled.connect(self.cull_age_combo.setEnabled)
-
-        cull_note = QLabel(
-            "Applies after each automatic Live fetch (not after manual Fetch Logs).\n"
-            "Both options can be enabled together.")
-        cull_note.setWordWrap(True)
-        cull_note.setStyleSheet("color:#555; font-style:italic;")
-        cull_layout.addWidget(cull_note)
-
-        layout.addWidget(cull)
-
-        # ── Test / OK / Cancel ────────────────────────────────────────────────
-        test_btn = QPushButton("Test Connection")
-        test_btn.clicked.connect(self._test)
-        layout.addWidget(test_btn)
+        self._set_layer(self.ev_combo, c["event_layer_id"])
+        for fc in (self.ev_disp, self.ev_start, self.ev_end):
+            fc.setLayer(self.ev_combo.currentLayer())
+            self.ev_combo.layerChanged.connect(fc.setLayer)
+        self.ev_disp.setField(c["event_display_field"])
+        self.ev_start.setField(c["event_start_field"])
+        self.ev_end.setField(c["event_end_field"])
 
         buttons = QDialogButtonBox(_BTN_OK | _BTN_CANCEL)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        root.addWidget(buttons)
+        self.tabs.setCurrentIndex(tab)
 
-    def values(self):
-        # A: live layer ID
-        if not self.keep_live_chk.isChecked():
-            live_layer_id = ""
-        elif self.a_temp_radio.isChecked():
-            live_layer_id = "<<temp>>"
-        else:
-            live_lyr = self.live_combo.currentLayer()
-            live_layer_id = live_lyr.id() if live_lyr else "<<temp>>"
+    @staticmethod
+    def _set_layer(combo, layer_id):
+        lyr = QgsProject.instance().mapLayer(layer_id) if layer_id else None
+        combo.setLayer(lyr)
 
-        pt_lyr = self.pts_combo.currentLayer()
-        ln_lyr = self.lns_combo.currentLayer()
-        return (
-            self.url_edit.text().rstrip("/"),
-            self.user_edit.text().strip(),
-            self.pass_edit.text(),
-            self.interval_spin.value(),
-            live_layer_id,
-            self.pts_chk.isChecked(),
-            pt_lyr.id() if pt_lyr else "",
-            self.lns_chk.isChecked(),
-            ln_lyr.id() if ln_lyr else "",
-            self.history_chk.isChecked(),
-            self.cull_count_chk.isChecked(),
-            self.cull_max_spin.value(),
-            self.cull_age_chk.isChecked(),
-            self.cull_age_combo.currentData(),
-        )
+    def _fill_tag_fields(self):
+        current = self.tag_field.currentText() or self.p.cfg["tag_field"]
+        names = []
+        for combo in (self.pt_combo, self.ln_combo):
+            lyr = combo.currentLayer()
+            if lyr is not None:
+                for n in lyr.fields().names():
+                    if n not in names:
+                        names.append(n)
+        self.tag_field.clear()
+        self.tag_field.addItems(names)
+        self.tag_field.setCurrentText(current)
 
     def _test(self):
-        url, user, pwd, *_ = self.values()
-        try:
-            devices = _api_get(url, user, pwd, "/api/devices")
-            QMessageBox.information(self, "Connection OK",
-                f"Connected — {len(devices)} device(s) visible to this account.")
-        except urllib.error.HTTPError as exc:
-            QMessageBox.warning(self, "HTTP Error", f"{exc.code} {exc.reason}")
-        except Exception as exc:
-            QMessageBox.warning(self, "Connection Failed", str(exc))
+        self.test_lbl.setText("Testing…")
+        cfg = dict(self.p.cfg)
+        cfg.update(server_url=self.url_edit.text().strip().rstrip("/"),
+                   username=self.user_edit.text().strip(), password=self.pass_edit.text())
+        api = _Api(cfg)
+        self._test_api = api      # keep alive until the reply arrives
+        api.get("/api/devices",
+                lambda d: self.test_lbl.setText(
+                    "<span style='color:#2E7D32'>✓ Connected — %d device(s)</span>" % len(d)),
+                lambda m: self.test_lbl.setText("<span style='color:#B71C1C'>✕ %s</span>" % m))
 
-    def _new_combined_gpkg(self):
-        """Create one GeoPackage with live (A), history (B) and track (C) layers."""
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Create Traccar GeoPackage", "", "GeoPackage (*.gpkg)")
+    def _new_gpkg(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Create Traccar GeoPackage", "",
+                                              "GeoPackage (*.gpkg)")
         if not path:
             return
         if not path.lower().endswith(".gpkg"):
             path += ".gpkg"
-
-        errors = []
-
-        # A ── live layer (creates the file) ──────────────────────────────────
-        live_lyr, err = _gpkg_write_layer(
-            path, "Point?crs=EPSG:4326",
-            _fields_with_incident_ref(POINT_FIELDS),
-            "traccar_live", _GPKG_NEW)
-        if live_lyr:
-            live_lyr.setName("Traccar Live")
-            QgsProject.instance().addMapLayer(live_lyr)
-            self.live_combo.setLayer(live_lyr)
-            self.a_layer_radio.setChecked(True)
-            self.keep_live_chk.setChecked(True)
-        else:
-            errors.append(f"traccar_live: {err}")
-
-        # B ── point history layer ─────────────────────────────────────────────
-        pt_lyr, err = _gpkg_write_layer(
-            path, "Point?crs=EPSG:4326",
-            _fields_with_incident_ref(list(POINT_FIELDS) + [POINT_HISTORY_EXTRA]),
-            "traccar_points", _GPKG_LAYER)
-        if pt_lyr:
-            pt_lyr.setName("Traccar Points")
-            QgsProject.instance().addMapLayer(pt_lyr)
-            self.pts_combo.setLayer(pt_lyr)
-            self.pts_chk.setChecked(True)
-        else:
-            errors.append(f"traccar_points: {err}")
-
-        # C ── track line layer ────────────────────────────────────────────────
-        # LineStringZM: Z = altitude (m), M = Unix epoch seconds (UTC).
-        # M enables QGIS temporal controller animation along the track.
-        ln_lyr, err = _gpkg_write_layer(
-            path, "LineStringZM?crs=EPSG:4326",
-            _fields_with_incident_ref(LINE_FIELDS),
-            "traccar_tracks", _GPKG_LAYER)
-        if ln_lyr:
-            ln_lyr.setName("Traccar Tracks")
-            QgsProject.instance().addMapLayer(ln_lyr)
-            self.lns_combo.setLayer(ln_lyr)
-            self.lns_chk.setChecked(True)
-        else:
-            errors.append(f"traccar_tracks: {err}")
-
+        pts, trk, errors = create_template_gpkg(path)
+        for lyr, name, combo in ((pts, "Traccar positions", self.pt_combo),
+                                 (trk, "Traccar tracks", self.ln_combo)):
+            if lyr is not None:
+                lyr.setName(name)
+                QgsProject.instance().addMapLayer(lyr)
+                combo.setLayer(lyr)
         if errors:
-            QMessageBox.warning(self, "GeoPackage Error", "\n".join(errors))
-        else:
-            QMessageBox.information(self, "GeoPackage Created",
-                f"Three layers created in one file:\n\n"
-                f"  • traccar_live    (A — live positions, replaced each fetch)\n"
-                f"  • traccar_points  (B — position history, appended each fetch)\n"
-                f"  • traccar_tracks  (C — device track lines)\n\n{path}")
+            QMessageBox.warning(self, "GeoPackage", "\n".join(errors))
+
+    def values(self):
+        pt = self.pt_combo.currentLayer()
+        ln = self.ln_combo.currentLayer()
+        ev = self.ev_combo.currentLayer()
+        return {
+            "server_url":  self.url_edit.text().strip().rstrip("/") or DEFAULT_URL,
+            "username":    self.user_edit.text().strip(),
+            "password":    self.pass_edit.text(),
+            "points_layer_id":   pt.id() if pt else "",
+            "points_name_field": self.pt_name.currentField() if pt else "",
+            "points_mode":       1 if self.pt_every.isChecked() else 0,
+            "tracks_layer_id":   ln.id() if ln else "",
+            "tracks_name_field": self.ln_name.currentField() if ln else "",
+            "tracks_mode":       1 if self.ln_keep.isChecked() else 0,
+            "tag_enabled":       self.tag_chk.isChecked(),
+            "tag_text":          self.tag_text.text().strip(),
+            "tag_field":         self.tag_field.currentText().strip(),
+            "tag_from_feature":  self.tag_feat.isChecked(),
+            "live_interval_s":   self.interval_spin.value(),
+            "stale_minutes":     self.stale_spin.value(),
+            "event_layer_id":      ev.id() if ev else "",
+            "event_display_field": self.ev_disp.currentField() if ev else "",
+            "event_start_field":   self.ev_start.currentField() if ev else "",
+            "event_end_field":     self.ev_end.currentField() if ev else "",
+        }
 
 
-# ── Fetch-logs dialog ────────────────────────────────────────────────────────
-
-class FetchLogsDialog(QDialog):
-    """
-    Pull historical GPS positions from a user-defined time window.
-    Works for all devices (online or offline).
-    Writes to the point layer (B) and/or track line layer (C) already
-    configured in Settings, using the same pipeline as the live fetch.
-
-    Tab 1 – Fetch:    time range, device selector, output-layer checkboxes.
-    Tab 2 – Log:      read-only summary of every fetch made this session
-                      (both auto-timer fetches and manual fetches from here).
-    """
-
-    def __init__(self, parent, plugin):
-        super().__init__(parent)
-        self.setWindowTitle("Traccar – Fetch Historical Logs")
-        self.setMinimumWidth(520)
-        self.setMinimumHeight(480)
-        self._plugin  = plugin
-        self._devices = []
-
-        root = QVBoxLayout(self)
-
-        # ── Tab widget ────────────────────────────────────────────────────
-        self._tabs = QTabWidget()
-        root.addWidget(self._tabs)
-
-        # ── Tab 1: Fetch form ─────────────────────────────────────────────
-        tab1        = QFrame()
-        tab1_layout = QVBoxLayout(tab1)
-        self._tabs.addTab(tab1, "Fetch")
-
-        # Time range
-        rng      = QGroupBox("Time range  (your local time)")
-        rng_form = QFormLayout(rng)
-
-        self.quick_range_combo = QComboBox()
-        for label, minutes in TIMEFRAME_OPTIONS:
-            self.quick_range_combo.addItem(label, minutes)
-        self.quick_range_combo.currentIndexChanged.connect(self._on_quick_range_changed)
-        rng_form.addRow("Quick range:", self.quick_range_combo)
-
-        self.from_dt = QDateTimeEdit()
-        self.from_dt.setDisplayFormat("yyyy-MM-dd  HH:mm")
-        self.from_dt.setCalendarPopup(True)
-        self.from_dt.setDateTime(QDateTime.currentDateTime().addDays(-1))
-        rng_form.addRow("From:", self.from_dt)
-
-        self.to_dt = QDateTimeEdit()
-        self.to_dt.setDisplayFormat("yyyy-MM-dd  HH:mm")
-        self.to_dt.setCalendarPopup(True)
-        self.to_dt.setDateTime(QDateTime.currentDateTime())
-        rng_form.addRow("To:", self.to_dt)
-
-        tab1_layout.addWidget(rng)
-
-        # Devices
-        dev        = QGroupBox("Devices")
-        dev_layout = QVBoxLayout(dev)
-
-        self.all_chk = QCheckBox("All devices  (including offline)")
-        self.all_chk.setChecked(True)
-        dev_layout.addWidget(self.all_chk)
-
-        self.dev_combo = QComboBox()
-        self.dev_combo.setEnabled(False)
-        self.all_chk.toggled.connect(
-            lambda on: self.dev_combo.setEnabled(not on))
-        dev_layout.addWidget(self.dev_combo)
-
-        tab1_layout.addWidget(dev)
-
-        # Output layers
-        out        = QGroupBox("Write to")
-        out_layout = QVBoxLayout(out)
-
-        pt_lyr  = QgsProject.instance().mapLayer(plugin.pt_layer_id)
-        ln_lyr  = QgsProject.instance().mapLayer(plugin.ln_layer_id)
-        pt_name = f"  →  {pt_lyr.name()}" if pt_lyr else \
-                  "  (not configured — set in Settings)"
-        ln_name = f"  →  {ln_lyr.name()}" if ln_lyr else \
-                  "  (not configured — set in Settings)"
-
-        self.pts_chk = QCheckBox(f"B  Point layer{pt_name}")
-        self.pts_chk.setChecked(bool(pt_lyr))
-        self.pts_chk.setEnabled(bool(pt_lyr))
-        out_layout.addWidget(self.pts_chk)
-
-        self.lns_chk = QCheckBox(f"C  Track line layer{ln_name}")
-        self.lns_chk.setChecked(bool(ln_lyr))
-        self.lns_chk.setEnabled(bool(ln_lyr))
-        out_layout.addWidget(self.lns_chk)
-
-        tab1_layout.addWidget(out)
-
-        # Point layer limit
-        limit       = QGroupBox("Point Layer Limit")
-        limit_row   = QHBoxLayout(limit)
-        self.limit_chk = QCheckBox("Limit point layer (B) to the most recent")
-        self.limit_chk.setChecked(plugin.fetch_limit_pts)
-        limit_row.addWidget(self.limit_chk)
-        self.limit_spin = QSpinBox()
-        self.limit_spin.setRange(1, 100000)
-        self.limit_spin.setSingleStep(50)
-        self.limit_spin.setValue(plugin.fetch_max_points)
-        self.limit_spin.setEnabled(plugin.fetch_limit_pts)
-        limit_row.addWidget(self.limit_spin)
-        limit_row.addWidget(QLabel("point(s) per device"))
-        limit_row.addStretch()
-        self.limit_chk.toggled.connect(self.limit_spin.setEnabled)
-        tab1_layout.addWidget(limit)
-
-        # Status label
-        self.status_lbl = QLabel("Loading devices…")
-        self.status_lbl.setWordWrap(True)
-        self.status_lbl.setStyleSheet("color:#555; font-style:italic;")
-        tab1_layout.addWidget(self.status_lbl)
-
-        tab1_layout.addStretch()
-
-        # ── Tab 2: Fetch log ──────────────────────────────────────────────
-        tab2        = QFrame()
-        tab2_layout = QVBoxLayout(tab2)
-        self._tabs.addTab(tab2, "Fetch Log")
-
-        log_lbl = QLabel(
-            "Summary of every fetch this session  "
-            "(auto-timer + manual).  Most recent first.")
-        log_lbl.setWordWrap(True)
-        tab2_layout.addWidget(log_lbl)
-
-        self._log_view = QTextEdit()
-        self._log_view.setReadOnly(True)
-        self._log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        self._log_view.setFontFamily("Courier New")
-        tab2_layout.addWidget(self._log_view)
-
-        # ── Buttons (shared, below tabs) ──────────────────────────────────
-        btn_row        = QHBoxLayout()
-        self.fetch_btn = QPushButton("Fetch")
-        self.fetch_btn.setEnabled(False)
-        self.fetch_btn.clicked.connect(self._do_fetch)
-        btn_row.addWidget(self.fetch_btn)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(close_btn)
-        root.addLayout(btn_row)
-
-        # Switch Fetch button visibility by tab
-        self._tabs.currentChanged.connect(self._on_tab_changed)
-
-        self._refresh_log()
-        self._load_devices()
-
-    # ── Quick range ───────────────────────────────────────────────────────
-
-    def _on_quick_range_changed(self, idx):
-        """index 0 ('— custom date range —') leaves From/To editable;
-        any other entry disables them — _do_fetch() computes the range."""
-        custom = (idx == 0)
-        self.from_dt.setEnabled(custom)
-        self.to_dt.setEnabled(custom)
-
-    # ── Tab change ────────────────────────────────────────────────────────
-
-    def _on_tab_changed(self, idx):
-        # Refresh log whenever user switches to tab 2
-        if idx == 1:
-            self._refresh_log()
-        self.fetch_btn.setVisible(idx == 0)
-
-    # ── Load device list ──────────────────────────────────────────────────
-
-    def _load_devices(self):
-        try:
-            self._devices = _api_get(
-                self._plugin.server_url, self._plugin.username,
-                self._plugin.password, "/api/devices")
-            self.dev_combo.clear()
-            for d in self._devices:
-                label = (f"{d.get('name', d['id'])}"
-                         f"  [{d.get('status', '?')}]")
-                self.dev_combo.addItem(label, d["id"])
-            n = len(self._devices)
-            self.status_lbl.setText(
-                f"{n} device(s) found — set the time range and click Fetch.")
-            self.status_lbl.setStyleSheet("")
-            self.fetch_btn.setEnabled(True)
-        except Exception as exc:
-            self.status_lbl.setText(f"Could not load devices: {exc}")
-            self.status_lbl.setStyleSheet("color:red;")
-
-    # ── Fetch log refresh ─────────────────────────────────────────────────
-
-    def _refresh_log(self):
-        entries = self._plugin.fetch_log
-        if not entries:
-            self._log_view.setPlainText(
-                "(No fetches yet this session — start Live or Fetch manually.)")
-            return
-
-        lines = []
-        # Most recent first
-        for e in reversed(entries):
-            hist_tag = " [history]" if e.get("hist") else ""
-            src_tag  = " [manual]"  if e.get("manual") else " [auto]"
-            lines.append(
-                f"── {e['ts']}{src_tag}{hist_tag}  "
-                f"{e['n_devs']} device(s), "
-                f"{e['n_online']} online, "
-                f"{e['n_pts']} position(s)")
-            for dr in e.get("devs", []):
-                status_icon = "●" if dr["status"] == "online" else "○"
-                lines.append(
-                    f"   {status_icon} {dr['name']:<20} "
-                    f"status={dr['status']:<8} "
-                    f"pts={dr['pts']:<5} "
-                    f"loc={dr['loc']}  "
-                    f"fix={dr['fix']}")
-            lines.append("")
-
-        self._log_view.setPlainText("\n".join(lines))
-
-    # ── Fetch ─────────────────────────────────────────────────────────────
-
-    def _do_fetch(self):
-        # Quick range (last X minutes/hours) takes precedence over the date fields
-        qr_minutes = self.quick_range_combo.currentData()
-        if qr_minutes:
-            now_utc  = QDateTime.currentDateTimeUtc()
-            from_utc = now_utc.addSecs(-qr_minutes * 60)
-            to_utc   = now_utc
-        else:
-            # Validate time range
-            from_utc = self.from_dt.dateTime().toUTC()
-            to_utc   = self.to_dt.dateTime().toUTC()
-            if from_utc >= to_utc:
-                self.status_lbl.setText("'From' must be earlier than 'To'.")
-                return
-
-        # Traccar expects ISO 8601 UTC
-        from_iso = from_utc.toString("yyyy-MM-ddTHH:mm:ss") + "Z"
-        to_iso   = to_utc.toString("yyyy-MM-ddTHH:mm:ss")   + "Z"
-
-        if not self.pts_chk.isChecked() and not self.lns_chk.isChecked():
-            self.status_lbl.setText("Select at least one output layer.")
-            return
-
-        dev_ids = ([d["id"] for d in self._devices] if self.all_chk.isChecked()
-                   else [self.dev_combo.currentData()])
-        if not dev_ids:
-            self.status_lbl.setText("No devices available.")
-            return
-
-        self.fetch_btn.setEnabled(False)
-        device_info = {d["id"]: {"name":   d.get("name",   str(d["id"])),
-                                  "status": d.get("status", "")}
-                       for d in self._devices}
-
-        from_enc = _quote(from_iso)
-        to_enc   = _quote(to_iso)
-        all_proc: list = []
-        errors:   list = []
-        pts_by_dev: dict = {}
-
-        for i, dev_id in enumerate(dev_ids):
-            name = device_info[dev_id]["name"]
-            self.status_lbl.setText(
-                f"Fetching {i + 1}/{len(dev_ids)}: {name}…")
-            QApplication.processEvents()   # keep UI responsive between calls
-
-            path = (f"/api/positions?deviceId={dev_id}"
-                    f"&from={from_enc}&to={to_enc}")
-            try:
-                raw  = _api_get(self._plugin.server_url,
-                                self._plugin.username,
-                                self._plugin.password, path)
-                info = device_info[dev_id]
-                batch = []
-                for pos in raw:
-                    lat = pos.get("latitude")
-                    lon = pos.get("longitude")
-                    if lat is None or lon is None:
-                        continue
-                    attrs = pos.get("attributes", {})
-                    rec = {
-                        "lon":       lon,      "lat":      lat,
-                        "device_id": dev_id,   "name":     info["name"],
-                        "status":    info["status"],
-                        "speed_kmh": round((pos.get("speed") or 0.0) * 1.852, 1),
-                        "course":    pos.get("course")   or 0.0,
-                        "altitude":  pos.get("altitude") or 0.0,
-                        "fix_time":  pos.get("fixTime",  ""),
-                        "battery":   attrs.get("batteryLevel"),
-                        "address":   pos.get("address")  or "",
-                        "motion":    str(attrs.get("motion", "")),
-                    }
-                    batch.append(rec)
-                all_proc.extend(batch)
-                pts_by_dev[dev_id] = batch
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
-                pts_by_dev[dev_id] = []
-
-        if not all_proc:
-            msg = "No positions found in this time range."
-            if errors:
-                msg += "\n\nErrors:\n" + "\n".join(errors)
-            self.status_lbl.setText(msg)
-            self.status_lbl.setStyleSheet("color:orange;")
-            self.fetch_btn.setEnabled(True)
-            return
-
-        # Persist the Point Layer Limit controls for next time
-        self._plugin.fetch_limit_pts  = self.limit_chk.isChecked()
-        self._plugin.fetch_max_points = self.limit_spin.value()
-        self._plugin._save_settings()
-
-        # Write via the plugin's existing layer pipelines
-        written = []
-        if self.pts_chk.isChecked():
-            pts_for_b = all_proc
-            if self.limit_chk.isChecked():
-                max_pts = self.limit_spin.value()
-                by_dev: dict = {}
-                for p in all_proc:
-                    by_dev.setdefault(p["device_id"], []).append(p)
-                pts_for_b = []
-                for arr in by_dev.values():
-                    arr.sort(key=lambda x: x["fix_time"], reverse=True)
-                    pts_for_b.extend(arr[:max_pts])
-            self._plugin._append_to_point_layer(pts_for_b)
-            extra = f" of {len(all_proc)}" if len(pts_for_b) != len(all_proc) else ""
-            written.append(f"{len(pts_for_b)} point(s){extra}")
-        if self.lns_chk.isChecked():
-            self._plugin._append_to_line_layer(all_proc)
-            n_devs = len({p["device_id"] for p in all_proc})
-            written.append(f"{n_devs} track(s) updated")
-
-        msg = "✓  Done — " + ",  ".join(written) + "."
-        if errors:
-            msg += f"\n⚠  {len(errors)} device(s) had errors: " + \
-                   ";  ".join(errors)
-        self.status_lbl.setText(msg)
-        self.status_lbl.setStyleSheet("color:green;" if not errors
-                                      else "color:orange;")
-        self.fetch_btn.setEnabled(True)
-
-        # ── Add entry to the session log ──────────────────────────────────
-        ts      = datetime.now().strftime("%H:%M:%S")
-        dev_rows = []
-        for dev_id, info in device_info.items():
-            pts  = pts_by_dev.get(dev_id, [])
-            last = pts[-1] if pts else None
-            dev_rows.append({
-                "name":   info["name"],
-                "status": info["status"],
-                "pts":    len(pts),
-                "loc":    (f"{last['lat']:.5f}, {last['lon']:.5f}"
-                           if last else "—"),
-                "fix":    (last["fix_time"][:19].replace("T", " ")
-                           if last and last.get("fix_time") else "—"),
-            })
-        self._plugin.fetch_log.append({
-            "ts":       ts,
-            "manual":   True,
-            "hist":     False,
-            "n_devs":   len(device_info),
-            "n_online": sum(1 for v in device_info.values()
-                            if v["status"] == "online"),
-            "n_pts":    len(all_proc),
-            "devs":     dev_rows,
-        })
-        self._refresh_log()
+HELP_HTML = """
+<h3>Getting started</h3>
+<ol>
+<li><b>Settings… → Connection</b>: enter your Traccar server and account, click <i>Test connection</i>.</li>
+<li>Choose a <b>time window</b> and click <b>▶ Live</b> (or <b>↻ Refresh</b> to load it once).</li>
+<li>To keep what you see, pick layers in <b>Settings… → Layers</b> (or click <i>New GeoPackage…</i>)
+and use the <b>Save</b> buttons.</li>
+</ol>
+<h3>Time window</h3>
+<p>One window controls everything: the tracks on the map are the fixes inside it, and the Save
+buttons save exactly that.</p>
+<ul>
+<li><b>Last 15 minutes … Last 3 months</b> — follows the current time.</li>
+<li><b>Custom dates</b> — From / To in local time, then <i>Show this window</i>.</li>
+<li><b>From feature</b> — the start/end of a feature such as an incident (set the layer up once in
+Settings → Advanced).</li>
+</ul>
+<p>Each device row shows how many fixes it has in the window and their time span.</p>
+<h3>Live, Refresh and Clear</h3>
+<p><b>▶ Live</b> refreshes in the background and keeps a “Last …” window moving. You can close this
+window — Live keeps running; the <b>▶ Live</b> toolbar button starts and stops it. A window that ends
+in the past cannot change, so Live pauses for it and the markers show each device's last fix in it.
+<b>↻ Refresh</b> loads the window once; <b>Clear</b> stops Live and removes the overlay.</p>
+<h3>On the map</h3>
+<p>The overlay is two temporary layers in the <i>Traccar (live)</i> group: markers and tracks, each
+device in its own colour (grey when its last fix is older than the limit in Settings → Advanced).
+They are never written to file and QGIS won't ask to save them. Switch Markers, Labels, Tracks and
+Accuracy circles on or off here or in the Layers panel; use Identify on them as on any layer.
+Double-click a device in the list to centre the map on it.</p>
+<h3>Saving</h3>
+<p><b>📍 Save positions</b> adds a point per device — its latest fix, or every fix in the window.<br>
+<b>〰 Save tracks</b> adds one line per device for the window (Z = altitude, M = time), or replaces
+that device's earlier track if <i>Keep only the most recent</i> is chosen.<br>
+Fields are filled by name; fields your layer doesn't have are skipped. The device name can also
+go into any text field (e.g. <i>title</i>). If the layer is already being edited, the features are
+added to that edit session for you to save.</p>
+<h3>Times</h3>
+<p>Times here are local, including summer time. Date/time fields are stored in UTC (QGIS shows them
+as UTC); the optional text fields <i>fix_local</i>, <i>start_local</i> and <i>last_local</i> hold the
+local time. For a local date/time in labels use <code>datetime_from_epoch(epoch("fix_time"))</code>.</p>
+<h3>Tag</h3>
+<p>Settings → Tag stamps a text such as FIRE-2026-001 onto everything you save. With
+<i>From feature</i>, the feature's display value can be used instead.</p>
+<p>Same layers and fields as the QField plugin <i>Traccar_QField</i>, so one GeoPackage works in both.</p>
+"""
 
 
-# ── Main plugin class ─────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+#  Plugin
+# ════════════════════════════════════════════════════════════════════════════
 
 class TraccarLive:
 
     def __init__(self, iface):
-        self.iface           = iface
-        self.timer           = QTimer()
-        self.timer.timeout.connect(self.fetch_and_update)
-        self._actions        = []
-        self.last_fetch_info = ""      # shown at top of settings dialog
-        self.fetch_log: list = []     # entries shown on Fetch Log tab
+        self.iface   = iface
+        self.cfg     = {}
         self._load_settings()
+        self.api     = _Api(self.cfg)
+        self.timer   = QTimer()
+        self.timer.timeout.connect(self.poll_live)
+        self._actions = []
+        self.dlg      = None
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+        # Runtime state
+        self.live         = False
+        self.loading      = False
+        self.load_started = 0.0
+        self.devices      = {}      # dev_id → {name, status}
+        self.win          = None    # see _compute_window()
+        self.tracks       = {}      # dev_id → [positions in window], oldest first
+        self.latest       = {}      # dev_id → latest position
+        self.marker_pos   = {}      # dev_id → position drawn as the marker
+        self.device_rows  = []
+        self.last_update  = ""
+        self.status_msg   = ""
+        self.last_error   = ""
+        self._mk_id = ""            # overlay layer ids
+        self._tk_id = ""
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────
     def initGui(self):
-        def _add(label, slot, checkable=False, tip=""):
-            act = QAction(label, self.iface.mainWindow())
-            act.setToolTip(tip)
-            if checkable:
-                act.setCheckable(True)
-            act.triggered.connect(slot)
-            self.iface.addPluginToMenu(MENU_LABEL, act)
+        mw = self.iface.mainWindow()
+        self.act_open = QAction("Traccar Live", mw)
+        self.act_open.setToolTip("Traccar Live — time window, devices and saving")
+        self.act_open.triggered.connect(self.open_main)
+        self.act_live = QAction("▶ Live", mw)
+        self.act_live.setCheckable(True)
+        self.act_live.setToolTip("Traccar Live: start / stop live updates")
+        self.act_live.toggled.connect(self.set_live)
+        self.act_settings = QAction("Settings…", mw)
+        self.act_settings.triggered.connect(lambda: self.open_settings(0))
+        self.act_help = QAction("Help", mw)
+        self.act_help.triggered.connect(self.show_help)
+        for act in (self.act_open, self.act_live):
             self.iface.addToolBarIcon(act)
+        for act in (self.act_open, self.act_live, self.act_settings, self.act_help):
+            self.iface.addPluginToMenu(MENU_LABEL, act)
             self._actions.append(act)
-            return act
-
-        _add("⚙ Traccar Settings…", self.open_settings,
-             tip="Configure server, credentials and layer options")
-        self._act_live = _add("▶ Traccar Live", self._toggle_live, checkable=True,
-             tip="Start / stop automatic position updates")
-        _add("↻ Fetch Now", self.fetch_and_update,
-             tip="Fetch positions immediately (one-off)")
-        _add("📅 Fetch Logs…", self.open_fetch_logs,
-             tip="Pull historical GPS positions for any time range / device")
+        QgsProject.instance().readProject.connect(self._on_project_changed)
+        QgsProject.instance().cleared.connect(self._on_project_changed)
+        self._remove_stale_overlays()
 
     def unload(self):
         self.timer.stop()
+        self.api.abort_all()
+        for sig in (QgsProject.instance().readProject, QgsProject.instance().cleared):
+            try:
+                sig.disconnect(self._on_project_changed)
+            except (TypeError, RuntimeError):
+                pass
+        self._remove_overlays()
+        if self.dlg is not None:
+            self.dlg.close()
+            self.dlg.deleteLater()
+            self.dlg = None
         for act in self._actions:
             self.iface.removePluginMenu(MENU_LABEL, act)
             self.iface.removeToolBarIcon(act)
+        self._actions = []
 
-    # ── Settings ──────────────────────────────────────────────────────────────
-
+    # ── Settings ──────────────────────────────────────────────────────────
     def _load_settings(self):
         s = QSettings()
-        self.server_url     = s.value(f"{SETTINGS_NS}/server_url",     DEFAULT_URL)
-        self.username       = s.value(f"{SETTINGS_NS}/username",        "")
-        self.password       = s.value(f"{SETTINGS_NS}/password",        "")
-        self.interval_min   = int(s.value(f"{SETTINGS_NS}/interval_min", 3))
-        # live_layer_id: "" = off, "<<temp>>" = auto memory layer, else real layer id
-        # Backward-compat: if old keep_live was True and no live_layer_id saved, use temp
-        _old_keep = s.value(f"{SETTINGS_NS}/keep_live", None)
-        self.live_layer_id  = s.value(f"{SETTINGS_NS}/live_layer_id",
-                                      "<<temp>>" if _old_keep == "true" or _old_keep is True
-                                      else "")
-        self.append_pts     = s.value(f"{SETTINGS_NS}/append_pts",     False, type=bool)
-        self.pt_layer_id    = s.value(f"{SETTINGS_NS}/pt_layer_id",    "")
-        self.append_lines   = s.value(f"{SETTINGS_NS}/append_lines",   False, type=bool)
-        self.ln_layer_id    = s.value(f"{SETTINGS_NS}/ln_layer_id",    "")
-        self.fetch_history  = s.value(f"{SETTINGS_NS}/fetch_history",  False, type=bool)
-        self.last_fetch_iso = s.value(f"{SETTINGS_NS}/last_fetch_iso", "")   # internal
+        for key, default in DEFAULTS.items():
+            v = s.value("%s/%s" % (SETTINGS_NS, key), default, type=type(default))
+            self.cfg[key] = v
+        if not self.cfg["v2_migrated"]:
+            self._migrate_v1(s)
 
-        # ── Layer B housekeeping (culling) ───────────────────────────────────
-        self.cull_by_count       = s.value(f"{SETTINGS_NS}/cull_by_count",       False, type=bool)
-        self.cull_max_per_device = int(s.value(f"{SETTINGS_NS}/cull_max_per_device", 500))
-        self.cull_by_age         = s.value(f"{SETTINGS_NS}/cull_by_age",         False, type=bool)
-        self.cull_age_minutes    = int(s.value(f"{SETTINGS_NS}/cull_age_minutes", 1440))
-
-        # ── Fetch Logs: per-device point-count limit ─────────────────────────
-        self.fetch_limit_pts  = s.value(f"{SETTINGS_NS}/fetch_limit_pts",  True, type=bool)
-        self.fetch_max_points = int(s.value(f"{SETTINGS_NS}/fetch_max_points", 150))
+    def _migrate_v1(self, s):
+        """v0.1 layers A / B / C → positions / tracks layers (once)."""
+        def old(key, default, typ=str):
+            return s.value("%s/%s" % (SETTINGS_NS, key), default, type=typ)
+        live_id = old("live_layer_id", "")
+        if old("append_pts", False, bool) and old("pt_layer_id", ""):
+            self.cfg["points_layer_id"] = old("pt_layer_id", "")
+        elif live_id not in ("", "<<temp>>"):
+            self.cfg["points_layer_id"] = live_id
+        if old("append_lines", False, bool) and old("ln_layer_id", ""):
+            self.cfg["tracks_layer_id"] = old("ln_layer_id", "")
+        interval = old("interval_min", 0, int)
+        if interval:
+            self.cfg["live_interval_s"] = max(5, min(3600, interval * 60))
+        self.cfg["v2_migrated"] = True
+        self._save_settings()
 
     def _save_settings(self):
         s = QSettings()
-        s.setValue(f"{SETTINGS_NS}/server_url",     self.server_url)
-        s.setValue(f"{SETTINGS_NS}/username",       self.username)
-        s.setValue(f"{SETTINGS_NS}/password",       self.password)
-        s.setValue(f"{SETTINGS_NS}/interval_min",   self.interval_min)
-        s.setValue(f"{SETTINGS_NS}/live_layer_id",  self.live_layer_id)
-        s.setValue(f"{SETTINGS_NS}/append_pts",     self.append_pts)
-        s.setValue(f"{SETTINGS_NS}/pt_layer_id",    self.pt_layer_id)
-        s.setValue(f"{SETTINGS_NS}/append_lines",   self.append_lines)
-        s.setValue(f"{SETTINGS_NS}/ln_layer_id",    self.ln_layer_id)
-        s.setValue(f"{SETTINGS_NS}/fetch_history",  self.fetch_history)
-        s.setValue(f"{SETTINGS_NS}/last_fetch_iso", self.last_fetch_iso)
+        for key in DEFAULTS:
+            s.setValue("%s/%s" % (SETTINGS_NS, key), self.cfg[key])
 
-        s.setValue(f"{SETTINGS_NS}/cull_by_count",       self.cull_by_count)
-        s.setValue(f"{SETTINGS_NS}/cull_max_per_device", self.cull_max_per_device)
-        s.setValue(f"{SETTINGS_NS}/cull_by_age",         self.cull_by_age)
-        s.setValue(f"{SETTINGS_NS}/cull_age_minutes",    self.cull_age_minutes)
+    def set_cfg(self, key, value):
+        if value is None:
+            return
+        self.cfg[key] = value
+        QSettings().setValue("%s/%s" % (SETTINGS_NS, key), value)
 
-        s.setValue(f"{SETTINGS_NS}/fetch_limit_pts",  self.fetch_limit_pts)
-        s.setValue(f"{SETTINGS_NS}/fetch_max_points", self.fetch_max_points)
+    # ── Windows ───────────────────────────────────────────────────────────
+    def open_main(self):
+        if self.dlg is None:
+            self.dlg = MainDialog(self, self.iface.mainWindow())
+            geo = QSettings().value(SETTINGS_NS + "/main_geometry")
+            if geo:
+                self.dlg.restoreGeometry(geo)
+        self.dlg.load_state()
+        self.dlg.show()
+        self.dlg.raise_()
+        self.dlg.activateWindow()
 
-    def open_settings(self):
-        dlg = SettingsDialog(
-            self.iface.mainWindow(),
-            self.server_url, self.username, self.password, self.interval_min,
-            self.live_layer_id,
-            self.append_pts,  self.pt_layer_id,
-            self.append_lines, self.ln_layer_id,
-            self.fetch_history,
-            self.cull_by_count, self.cull_max_per_device,
-            self.cull_by_age, self.cull_age_minutes,
-            last_fetch=self.last_fetch_info,
-        )
+    def open_settings(self, tab=0):
+        dlg = SettingsDialog(self, self.iface.mainWindow(), tab)
         if dlg.exec() == _DLG_OK:
-            (self.server_url, self.username, self.password, self.interval_min,
-             self.live_layer_id,
-             self.append_pts,  self.pt_layer_id,
-             self.append_lines, self.ln_layer_id,
-             self.fetch_history,
-             self.cull_by_count, self.cull_max_per_device,
-             self.cull_by_age, self.cull_age_minutes) = dlg.values()
+            vals = dlg.values()
+            interval_changed = vals["live_interval_s"] != self.cfg["live_interval_s"]
+            for k, v in vals.items():
+                self.cfg[k] = v
             self._save_settings()
-            if self.timer.isActive():
-                self.timer.start(self.interval_min * 60_000)
+            if interval_changed and self.timer.isActive():
+                self.timer.start(int(self.cfg["live_interval_s"]) * 1000)
+            self._rebuild()
+            if self.dlg is not None and self.dlg.isVisible():
+                self.dlg.load_state()
 
-    def open_fetch_logs(self):
-        dlg = FetchLogsDialog(self.iface.mainWindow(), self)
-        dlg.exec()
+    def show_help(self):
+        d = QDialog(self.iface.mainWindow())
+        d.setWindowTitle("Traccar Live – Help")
+        d.resize(560, 640)
+        lay = QVBoxLayout(d)
+        tb = QTextBrowser()
+        tb.setHtml(HELP_HTML)
+        lay.addWidget(tb)
+        bb = QDialogButtonBox(_BTN_OK)
+        bb.accepted.connect(d.accept)
+        lay.addWidget(bb)
+        d.exec()
 
-    # ── Live toggle ───────────────────────────────────────────────────────────
+    def _ui(self):
+        if self.dlg is not None and self.dlg.isVisible():
+            self.dlg.refresh()
+        tip = "Traccar Live: " + ("on" if self.live else "off")
+        if self.last_update:
+            tip += " — updated %s, %d device(s)" % (self.last_update, len(self.devices))
+        if self.last_error:
+            tip += "\n⚠ " + self.last_error
+        if hasattr(self, "act_live"):
+            self.act_live.setToolTip(tip)
 
-    def _toggle_live(self, checked):
-        if checked:
-            self.fetch_and_update()
-            self.timer.start(self.interval_min * 60_000)
-            self._act_live.setText("⏹ Traccar Live (on)")
+    # ── Messages (unobtrusive) ────────────────────────────────────────────
+    def _log(self, msg, level=_MSG_INFO):
+        QgsMessageLog.logMessage(msg, "Traccar Live", level)
+
+    def _bar(self, msg, level=_MSG_INFO, duration=5):
+        self.iface.messageBar().pushMessage("Traccar Live", msg, level=level, duration=duration)
+        self._log(msg, level)
+
+    def _error(self, msg):
+        """Report once per error streak; always logged."""
+        if msg != self.last_error:
+            self._bar(msg, _MSG_WARN, 8)
+        else:
+            self._log(msg, _MSG_WARN)
+        self.last_error = msg
+        self._ui()
+
+    # ── Live ──────────────────────────────────────────────────────────────
+    def set_live(self, on):
+        on = bool(on)
+        if on and not self.cfg["username"]:
+            self._bar("Set up the connection first (Settings…)", _MSG_WARN)
+            on = False
+            self.open_settings(0)
+        self.live = on
+        self.act_live.blockSignals(True)
+        self.act_live.setChecked(on)
+        self.act_live.setText("⏹ Live" if on else "▶ Live")
+        self.act_live.blockSignals(False)
+        if on:
+            self.timer.start(int(self.cfg["live_interval_s"]) * 1000)
+            self.load_window()
         else:
             self.timer.stop()
-            self._act_live.setText("▶ Traccar Live")
+        self._ui()
 
-    # ── Fetch ─────────────────────────────────────────────────────────────────
+    def clear(self):
+        if self.live:
+            self.set_live(False)
+        self.api.abort_all()
+        self.loading = False
+        self.win = None
+        self.tracks, self.latest, self.marker_pos = {}, {}, {}
+        self.status_msg = ""
+        self._remove_overlays()
+        self._rebuild()
 
-    def fetch_and_update(self):
-        if not self.username:
-            self._warn("No credentials set — open Traccar Settings first.")
+    def reload_window(self):
+        self.win = None
+        self.tracks, self.latest, self.marker_pos = {}, {}, {}
+        self.load_window()
+
+    # ── Time window ───────────────────────────────────────────────────────
+    def _compute_window(self):
+        """{frm, to, end, moving, trim, tag} or {error}.
+        moving — window includes now (Live adds fixes); trim — 'Last N' minutes;
+        end — fixed future end of a moving custom/feature window (None = open)."""
+        m = int(self.cfg["window_minutes"])
+        now = datetime.now(timezone.utc)
+        if m > 0:
+            return {"frm": now - timedelta(minutes=m), "to": now, "end": None,
+                    "moving": True, "trim": m, "tag": ""}
+        tag = ""
+        if m == -1:
+            frm = _parse_local(self.cfg["custom_from"])
+            to  = _parse_local(self.cfg["custom_to"])
+            if not frm or not to:
+                return {"error": "Set From and To, then click Show this window."}
+        else:
+            f = self._selected_event_feature()
+            if f is None:
+                return {"error": "Choose a feature (set the layer up in Settings → Advanced)."}
+            dur = timedelta(minutes=int(self.cfg["feature_duration"]))
+            span = int(self.cfg["feature_span"])
+            if span == 2:
+                if f["end"] is None:
+                    return {"error": "That feature has no end time."}
+                to, frm = f["end"], f["end"] - dur
+            else:
+                if f["start"] is None:
+                    return {"error": "That feature has no start time."}
+                frm = f["start"]
+                to = frm + dur if span == 1 else f["end"]      # None = ongoing
+            if self.cfg["tag_from_feature"] and f["disp"]:
+                tag = f["disp"]
+        if to is not None and frm >= to:
+            return {"error": "'From' must be before 'To'."}
+        moving = to is None or to > now
+        return {"frm": frm, "to": now if moving else to, "end": to if (moving and to) else None,
+                "moving": moving, "trim": 0, "tag": tag}
+
+    def window_summary(self):
+        if self.status_msg:
+            return self.status_msg
+        w = self.win
+        if w is None:
+            return "Click ▶ Live to follow devices, or ↻ Refresh to load this window once."
+        big = "\n⚠ Long window — loading and drawing may be slow." \
+            if (w["to"] - w["frm"]) > timedelta(days=7) else ""
+        span = _span_text(w["frm"], w["to"])
+        if w["moving"]:
+            return span + (" (still running)" if not w["trim"] else "") + "  ·  " + \
+                ("updating live" if self.live else "Live is off") + big
+        return span + "  ·  past window" + (" — Live paused" if self.live else "") + big
+
+    # ── Event features ("From feature") ───────────────────────────────────
+    def event_features(self):
+        lyr = QgsProject.instance().mapLayer(self.cfg["event_layer_id"]) \
+            if self.cfg["event_layer_id"] else None
+        if lyr is None or not isinstance(lyr, QgsVectorLayer):
+            return []
+        names = lyr.fields().names()
+        out = []
+        for feat in lyr.getFeatures():
+            def val(field):
+                return feat[field] if field and field in names else None
+            disp  = val(self.cfg["event_display_field"])
+            disp  = "" if _is_null(disp) else str(disp)
+            start = _attr_to_utc(val(self.cfg["event_start_field"]))
+            end   = _attr_to_utc(val(self.cfg["event_end_field"]))
+            label = disp or "#%d" % feat.id()
+            if start:
+                label += "  (%s – %s)" % (_fmt_local(start), _fmt_local(end) if end else "ongoing")
+            out.append({"fid": feat.id(), "disp": disp, "start": start, "end": end, "label": label})
+        out.sort(key=lambda r: (r["start"] is not None, r["start"] or datetime.min.replace(tzinfo=timezone.utc),
+                                r["fid"]), reverse=True)
+        return out
+
+    def _selected_event_feature(self):
+        for f in self.event_features():
+            if f["fid"] == int(self.cfg["event_feature_fid"]):
+                return f
+        return None
+
+    # ── Loading (map only — never writes to layers) ───────────────────────
+    def load_window(self):
+        if self.loading and time.time() - self.load_started < 90:
+            return
+        if not self.cfg["username"]:
+            self.status_msg = "Set up the connection first (Settings… → Connection)."
+            self._ui()
+            return
+        w = self._compute_window()
+        if "error" in w:
+            self.status_msg = w["error"]
+            self._ui()
+            return
+        self.loading, self.load_started = True, time.time()
+        self.status_msg = "Loading…"
+        self._ui()
+
+        def fail(msg):
+            self.loading = False
+            self.status_msg = ""
+            self._error(msg)
+
+        def got_devices(devs):
+            self.devices = {d["id"]: {"name": d.get("name") or str(d["id"]),
+                                      "status": d.get("status") or ""} for d in devs}
+
+            def got_latest(positions):
+                latest = {}
+                for p in positions:
+                    if self._prep(p):
+                        latest[p["deviceId"]] = p
+                ids = list(self.devices)
+                by_dev = {}
+                state = {"pending": len(ids), "failed": 0}
+
+                def finish():
+                    self.loading = False
+                    self.status_msg = ""
+                    self.win, self.tracks, self.latest = w, by_dev, latest
+                    self.last_update = datetime.now().strftime("%H:%M:%S")
+                    if state["failed"]:
+                        self._error("%d device(s) could not be loaded" % state["failed"])
+                    else:
+                        self.last_error = ""
+                    self._rebuild()
+
+                def one_done():
+                    state["pending"] -= 1
+                    if state["pending"] <= 0:
+                        finish()
+
+                if not ids:
+                    finish()
+                    return
+                q_from, q_to = _quote(_iso(w["frm"])), _quote(_iso(w["to"]))
+                for dev_id in ids:
+                    def ok(hist, dev_id=dev_id):
+                        valid = [p for p in hist if self._prep(p)]
+                        valid.sort(key=lambda p: p["_t"])
+                        if valid:
+                            by_dev[dev_id] = valid
+                        one_done()
+
+                    def bad(_msg):
+                        state["failed"] += 1
+                        one_done()
+                    self.api.get("/api/positions?deviceId=%s&from=%s&to=%s" % (dev_id, q_from, q_to),
+                                 ok, bad)
+
+            self.api.get("/api/positions", got_latest, fail)
+
+        self.api.get("/api/devices", got_devices, fail)
+
+    def poll_live(self):
+        """Add each device's new fix to its track and move a 'Last …' window on."""
+        if self.loading:
+            return
+        if self.win is None:
+            self.load_window()
+            return
+        if not self.win["moving"]:
             return
 
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        def fail(msg):
+            self._error(msg)
 
-        try:
-            devices_raw = _api_get(self.server_url, self.username,
-                                   self.password, "/api/devices")
-        except urllib.error.HTTPError as exc:
-            self._warn(f"HTTP {exc.code}: {exc.reason}"); return
-        except Exception as exc:
-            self._warn(str(exc)); return
+        def got_devices(devs):
+            self.devices = {d["id"]: {"name": d.get("name") or str(d["id"]),
+                                      "status": d.get("status") or ""} for d in devs}
 
-        device_info = {
-            d["id"]: {"name": d.get("name", ""), "status": d.get("status", "")}
-            for d in devices_raw
-        }
+            def got_latest(positions):
+                w = self.win
+                if w is None:
+                    return
+                now = datetime.now(timezone.utc)
+                end = w["end"]
+                frm = now - timedelta(minutes=w["trim"]) if w["trim"] else w["frm"]
+                tracks = dict(self.tracks)
+                latest = {}
+                for p in positions:
+                    if not self._prep(p):
+                        continue
+                    latest[p["deviceId"]] = p
+                    t = p["_t"]
+                    if t < frm or (end is not None and t > end):
+                        continue
+                    arr = tracks.get(p["deviceId"], [])
+                    if not arr or arr[-1]["_t"] < t:
+                        tracks[p["deviceId"]] = arr + [p]
+                if w["trim"]:
+                    tracks = {k: [p for p in v if p["_t"] >= frm] for k, v in tracks.items()}
+                    tracks = {k: v for k, v in tracks.items() if v}
+                to = min(now, end) if end is not None else now
+                self.win = dict(w, frm=frm, to=to, moving=(end is None or now < end))
+                self.tracks, self.latest = tracks, latest
+                self.last_update = now.astimezone().strftime("%H:%M:%S")
+                self.last_error = ""
+                self._rebuild()
 
-        # ── Always fetch last-known positions for the live layer (A) ─────────
-        # /api/positions (no range) returns Traccar's stored last-known fix for
-        # every device — online OR offline — so layer A always shows all devices.
-        try:
-            live_raw = _api_get(self.server_url, self.username,
-                                self.password, "/api/positions")
-        except urllib.error.HTTPError as exc:
-            self._warn(f"HTTP {exc.code}: {exc.reason}"); return
-        except Exception as exc:
-            self._warn(str(exc)); return
+            self.api.get("/api/positions", got_latest, fail)
 
-        # ── Collect positions for B + C (history range or reuse live_raw) ─────
-        if self.fetch_history and self.last_fetch_iso:
-            # Pull every fix per device since the last fetch
-            positions_raw = []
-            from_enc = _quote(self.last_fetch_iso)
-            to_enc   = _quote(now_iso)
-            errors   = []
-            for dev_id in device_info:
-                path = (f"/api/positions?deviceId={dev_id}"
-                        f"&from={from_enc}&to={to_enc}")
-                try:
-                    positions_raw.extend(
-                        _api_get(self.server_url, self.username, self.password, path))
-                except Exception as exc:
-                    errors.append(str(exc))
-            if errors and not positions_raw:
-                self._warn("History fetch failed: " + errors[0]); return
-            if not positions_raw:
-                positions_raw = live_raw   # fallback if nothing in range
+        self.api.get("/api/devices", got_devices, fail)
+
+    @staticmethod
+    def _prep(p):
+        """Validate a Traccar position and cache its parsed fix time as p['_t']."""
+        if not isinstance(p, dict) or p.get("latitude") is None or p.get("longitude") is None:
+            return False
+        if "_t" not in p:
+            p["_t"] = _parse_utc(p.get("fixTime"))
+        return p["_t"] is not None
+
+    def _fresh(self, t):
+        return t is not None and \
+            (datetime.now(timezone.utc) - t) < timedelta(minutes=int(self.cfg["stale_minutes"]))
+
+    def _name(self, dev_id):
+        return self.devices.get(dev_id, {}).get("name") or str(dev_id)
+
+    # ── Rebuild overlay + device list from the loaded data ────────────────
+    def _rebuild(self):
+        w = self.win
+        if w is not None and w["moving"]:
+            mp = dict(self.latest)
         else:
-            positions_raw = live_raw       # reuse — no second API call needed
+            mp = {k: v[-1] for k, v in self.tracks.items() if v}
+        self.marker_pos = mp
 
-        # ── Helper: parse a raw Traccar position dict ─────────────────────────
-        def _parse(pos):
-            lat = pos.get("latitude"); lon = pos.get("longitude")
-            if lat is None or lon is None:
-                return None
-            dev_id = pos.get("deviceId", -1)
-            info   = device_info.get(dev_id, {})
-            attrs  = pos.get("attributes", {})
-            return {
-                "lon":       lon,        "lat":      lat,
-                "device_id": dev_id,     "name":     info.get("name", str(dev_id)),
-                "status":    info.get("status", ""),
-                "speed_kmh": round((pos.get("speed") or 0.0) * 1.852, 1),
-                "course":    pos.get("course")   or 0.0,
-                "altitude":  pos.get("altitude") or 0.0,
-                "fix_time":  pos.get("fixTime",  ""),
-                "battery":   attrs.get("batteryLevel"),
-                "address":   pos.get("address")  or "",
-                "motion":    str(attrs.get("motion", "")),
-            }
-
-        # live_processed: one entry per device (last-known, incl. offline)
-        live_processed = [r for r in (_parse(p) for p in live_raw) if r]
-        # processed: all positions for B + C
-        processed      = [r for r in (_parse(p) for p in positions_raw) if r]
-
-        # Live layer (A) — fed from live_processed, so offline devices always shown
-        if self.live_layer_id:
-            self._update_live_layer(live_processed)
-
-        if self.append_pts and self.pt_layer_id and processed:
-            self._append_to_point_layer(processed)
-            if self.cull_by_count or self.cull_by_age:
-                self._cull_point_layer()
-
-        if self.append_lines and self.ln_layer_id and processed:
-            self._append_to_line_layer(processed)
-
-        # Save timestamp for next history fetch
-        self.last_fetch_iso = now_iso
-        self._save_settings()
-
-        # Status shown at top of Settings dialog
-        active = (["A"] if self.live_layer_id  else []) + \
-                 (["B"] if self.append_pts    else []) + \
-                 (["C"] if self.append_lines  else [])
-        mode   = "  [" + " + ".join(active) + "]" if active else ""
-        hist   = "  (history)" if self.fetch_history else ""
-        n_devs = len({p["device_id"] for p in processed})
-        n_pts  = len(processed)
-        ts     = datetime.now().strftime("%H:%M:%S")
-        extra  = f"  ({n_pts} pts)" if n_pts > n_devs else ""
-        self.last_fetch_info = f"{ts}  —  {n_devs} device(s){extra}{hist}{mode}"
-
-        # Build a fetch-log entry (visible on Tab 2 of Fetch Logs dialog)
-        pts_by_dev: dict = {}
-        for p in processed:
-            pts_by_dev.setdefault(p["device_id"], []).append(p)
-        dev_rows = []
-        for dev_id, info in device_info.items():
-            pts   = pts_by_dev.get(dev_id, [])
-            last  = pts[-1] if pts else None
-            loc   = (f"{last['lat']:.5f}, {last['lon']:.5f}"
-                     if last else "—")
-            fix   = (last["fix_time"][:19].replace("T", " ")
-                     if last and last.get("fix_time") else "—")
-            dev_rows.append({
-                "name":   info["name"],
-                "status": info["status"],
-                "pts":    len(pts),
-                "loc":    loc,
-                "fix":    fix,
+        rows = []
+        for dev_id, info in self.devices.items():
+            tr  = self.tracks.get(dev_id, [])
+            pos = mp.get(dev_id)
+            attrs = (pos or {}).get("attributes") or {}
+            bat = attrs.get("batteryLevel")
+            rows.append({
+                "name":    info["name"],
+                "fixes":   len(tr) if tr else "—",
+                "span":    (_span_text(tr[0]["_t"], tr[-1]["_t"]) if len(tr) > 1
+                            else _fmt_local(tr[0]["_t"]) if tr else "no fixes in window"),
+                "speed":   ("%d km/h" % round((pos.get("speed") or 0) * 1.852)) if pos else "",
+                "battery": ("%g%%" % float(bat)) if isinstance(bat, (int, float)) else "",
+                "pos":     pos,
+                "fresh":   self._fresh(pos["_t"]) if pos else False,
+                "color":   _device_color(info["name"]),
+                "tip":     ("Last fix %s ago" % _age_text(pos["_t"])) if pos else "No position",
             })
-        self.fetch_log.append({
-            "ts":       ts,
-            "hist":     bool(self.fetch_history),
-            "n_devs":   len(device_info),
-            "n_online": sum(1 for v in device_info.values()
-                            if v["status"] == "online"),
-            "n_pts":    n_pts,
-            "devs":     dev_rows,
-        })
+        rows.sort(key=lambda r: r["name"].lower())
+        self.device_rows = rows
 
-        QgsMessageLog.logMessage(
-            f"[{ts}] {n_pts} position(s) for {n_devs} device(s){hist}{mode}",
-            "Traccar Live", _MSG_INFO)
+        if w is not None:
+            self._update_overlays()
+        self._ui()
 
-    # ── A: live layer ─────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    #  Overlay layers (temporary, never saved)
+    # ════════════════════════════════════════════════════════════════════════
 
-    def _get_or_create_temp_live_layer(self):
-        """Return (or auto-create) the legacy in-memory live layer."""
-        for lyr in QgsProject.instance().mapLayers().values():
-            if lyr.name() == LIVE_LAYER_NAME and isinstance(lyr, QgsVectorLayer):
-                return lyr
-        lyr = QgsVectorLayer("Point?crs=EPSG:4326", LIVE_LAYER_NAME, "memory")
-        dp  = lyr.dataProvider()
-        dp.addAttributes(POINT_FIELDS)
-        lyr.updateFields()
-        lyr.setCustomProperty("labeling",           "pal")
-        lyr.setCustomProperty("labeling/enabled",   True)
-        lyr.setCustomProperty("labeling/fieldName", "name")
-        lyr.setCustomProperty("labeling/placement", "2")
-        QgsProject.instance().addMapLayer(lyr)
+    def _overlay(self, which):
+        lid = self._mk_id if which == "markers" else self._tk_id
+        lyr = QgsProject.instance().mapLayer(lid) if lid else None
+        if lyr is not None:
+            return lyr
+        if which == "markers":
+            uri = _memory_uri("Point", [
+                ("device_id", "integer"), ("name", "string(80)"), ("fix_time", "datetime"),
+                ("fix_local", "string(40)"), ("speed_kmh", "double"), ("battery", "double"),
+                ("accuracy_m", "double"), ("fresh", "integer"), ("color", "string(9)")])
+            lyr = QgsVectorLayer(uri, "Traccar markers", "memory")
+        else:
+            uri = _memory_uri("LineStringZM", [
+                ("device_id", "integer"), ("name", "string(80)"), ("fixes", "integer"),
+                ("start_local", "string(40)"), ("last_local", "string(40)"),
+                ("fresh", "integer"), ("color", "string(9)")])
+            lyr = QgsVectorLayer(uri, "Traccar tracks", "memory")
+        lyr.setCustomProperty(OVERLAY_PROP, 1)
+        lyr.setCustomProperty("skipMemoryLayersCheck", 1)   # no "save scratch layers?" prompt
+        root  = QgsProject.instance().layerTreeRoot()
+        group = root.findGroup(GROUP_NAME) or root.insertGroup(0, GROUP_NAME)
+        QgsProject.instance().addMapLayer(lyr, False)
+        if which == "markers":
+            group.insertLayer(0, lyr)
+            self._mk_id = lyr.id()
+            self._style_markers(lyr)
+        else:
+            group.addLayer(lyr)
+            self._tk_id = lyr.id()
+            self._style_tracks(lyr)
+        self._apply_visibility()
         return lyr
 
-    def _update_live_layer(self, processed):
-        if self.live_layer_id == "<<temp>>":
-            lyr = self._get_or_create_temp_live_layer()
-        else:
-            lyr = QgsProject.instance().mapLayer(self.live_layer_id)
-            if not lyr or not lyr.isValid():
-                self._warn("Live layer (A) not found in project — check Settings.")
-                return
+    def _style_markers(self, lyr):
+        color_expr = QgsProperty.fromExpression("if(\"fresh\" = 1, \"color\", '#9E9E9E')")
+        sym = QgsMarkerSymbol.createSimple({"name": "circle", "size": "3.4",
+                                            "outline_color": "#ffffff", "outline_width": "0.6"})
+        sym.symbolLayer(0).setDataDefinedProperty(_sl_prop("FillColor"), color_expr)
+        if self.cfg["show_accuracy"]:
+            acc = QgsSimpleMarkerSymbolLayer()
+            acc.setColor(QColor(21, 101, 192, 35))
+            acc.setStrokeColor(QColor(21, 101, 192, 150))
+            acc.setStrokeWidth(0.2)
+            acc.setSizeUnit(_RENDER_M)          # metres on the ground, any map CRS
+            acc.setDataDefinedProperty(_sl_prop("Size"),
+                                       QgsProperty.fromExpression('2 * coalesce("accuracy_m", 0)'))
+            sym.insertSymbolLayer(0, acc)
+        lyr.setRenderer(QgsSingleSymbolRenderer(sym))
 
-        dp = lyr.dataProvider()
-        dp.truncate()
-        feats = []
-        for p in processed:
-            f = QgsFeature(lyr.fields())
-            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(p["lon"], p["lat"])))
-            for field in lyr.fields():
-                fn = field.name()
-                if fn == "fetched_at":
-                    f[fn] = QDateTime.currentDateTimeUtc()
-                elif fn == "fix_time" and "fix_time" in p:
-                    f[fn] = _to_qdt(p["fix_time"])
-                elif fn in _PT_FIELD_MAP and _PT_FIELD_MAP[fn] in p:
-                    f[fn] = p[_PT_FIELD_MAP[fn]]
-            feats.append(f)
-        dp.addFeatures(feats)
+        pal = QgsPalLayerSettings()
+        pal.fieldName = "name"
+        fmt = QgsTextFormat()
+        fmt.setSize(9)
+        buf = QgsTextBufferSettings()
+        buf.setEnabled(True)
+        buf.setSize(0.8)
+        buf.setColor(QColor("white"))
+        fmt.setBuffer(buf)
+        pal.setFormat(fmt)
+        pal.dist = 1.2
+        lyr.setLabeling(QgsVectorLayerSimpleLabeling(pal))
+        lyr.setLabelsEnabled(bool(self.cfg["show_labels"]))
         lyr.triggerRepaint()
-        lyr.updateExtents()
-        _sync_categorized_renderer(lyr, {p["name"] for p in processed})
 
-    # ── B: point history ──────────────────────────────────────────────────────
-
-    def _append_to_point_layer(self, processed):
-        lyr = QgsProject.instance().mapLayer(self.pt_layer_id)
-        if not lyr or not lyr.isValid():
-            self._warn("Point history layer not found — check Settings.")
-            return
-        ts    = QDateTime.currentDateTimeUtc()
-        feats = []
-        for p in processed:
-            f = QgsFeature(lyr.fields())
-            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(p["lon"], p["lat"])))
-            for field in lyr.fields():
-                fn = field.name()
-                if fn == "fetched_at":
-                    f[fn] = ts
-                elif fn == "fix_time" and "fix_time" in p:
-                    f[fn] = _to_qdt(p["fix_time"])
-                elif fn in _PT_FIELD_MAP and _PT_FIELD_MAP[fn] in p:
-                    f[fn] = p[_PT_FIELD_MAP[fn]]
-            feats.append(f)
-        ok, _ = lyr.dataProvider().addFeatures(feats)
-        if ok:
-            lyr.triggerRepaint()
-            _sync_categorized_renderer(lyr, {p["name"] for p in processed})
-        else:
-            self._warn("Failed to write to point history layer.")
-
-    def _cull_point_layer(self):
-        """
-        Remove old points from the point history layer (B), per the
-        Layer B Housekeeping settings (cull_by_count / cull_by_age).
-        Both can be active at once. Only called after periodic Live
-        fetches — never from the Fetch Logs dialog.
-        """
-        if not (self.cull_by_count or self.cull_by_age):
-            return
-        lyr = QgsProject.instance().mapLayer(self.pt_layer_id)
-        if not lyr or not lyr.isValid():
-            return
-        if lyr.fields().indexFromName("fix_time") < 0:
-            return   # nothing to cull/sort on
-
-        records = []   # (fid, device_id, fix_time_iso_str)
-        for f in lyr.getFeatures():
-            ft = f["fix_time"]
-            if ft is None or ft == NULL:
-                ft_str = ""
-            elif hasattr(ft, "toString"):   # QDateTime
-                ft_str = ft.toString("yyyy-MM-ddTHH:mm:ss")
-            else:
-                ft_str = str(ft)[:19]
-            records.append((f.id(), f["device_id"], ft_str))
-        if not records:
-            return
-
-        remove_ids: set = set()
-
-        # ── Determine each device's newest record — always protected from
-        # ── age-based culling, so every device retains at least one point.
-        newest_fid_by_dev: dict = {}
-        newest_ft_by_dev:  dict = {}
-        for fid, dev_id, ft in records:
-            if dev_id not in newest_ft_by_dev or ft > newest_ft_by_dev[dev_id]:
-                newest_ft_by_dev[dev_id]  = ft
-                newest_fid_by_dev[dev_id] = fid
-        protected_fids = set(newest_fid_by_dev.values())
-
-        # ── Cull by age ───────────────────────────────────────────────────
-        if self.cull_by_age and self.cull_age_minutes > 0:
-            cutoff_iso = (datetime.now(timezone.utc) -
-                          timedelta(minutes=self.cull_age_minutes)
-                          ).strftime("%Y-%m-%dT%H:%M:%SZ")
-            for fid, dev_id, ft in records:
-                if ft and ft < cutoff_iso and fid not in protected_fids:
-                    remove_ids.add(fid)
-
-        # ── Cull by count (per device, newest kept first) ──────────────────
-        if self.cull_by_count:
-            by_dev: dict = {}
-            for rec in records:
-                if rec[0] in remove_ids:
-                    continue   # already marked for removal by age cull
-                by_dev.setdefault(rec[1], []).append(rec)
-            for arr in by_dev.values():
-                arr.sort(key=lambda r: r[2], reverse=True)   # newest first
-                if len(arr) > self.cull_max_per_device:
-                    for fid, _dev, _ft in arr[self.cull_max_per_device:]:
-                        remove_ids.add(fid)
-
-        if not remove_ids:
-            return
-
-        ok = lyr.dataProvider().deleteFeatures(list(remove_ids))
-        if ok:
-            lyr.triggerRepaint()
-        else:
-            self._warn("Layer B cull: failed to delete features.")
-
-    # ── C: line tracks ────────────────────────────────────────────────────────
-
-    def _append_to_line_layer(self, processed):
-        """
-        Each device has one line feature.  All positions in `processed` are
-        appended as vertices in fix_time order — supports both single-position
-        (normal mode) and multiple-positions-per-device (history mode).
-        New devices get a starter feature that grows from the second fetch on.
-        """
-        lyr = QgsProject.instance().mapLayer(self.ln_layer_id)
-        if not lyr or not lyr.isValid():
-            self._warn("Line track layer not found — check Settings.")
-            return
-
-        # Group by device and sort each group by GPS fix time
-        by_device: dict[int, list] = {}
-        for p in processed:
-            by_device.setdefault(p["device_id"], []).append(p)
-        for pts in by_device.values():
-            pts.sort(key=lambda x: x["fix_time"])
-
-        geom_changes: dict = {}
-        attr_changes: dict = {}
-        new_features: list = []
-        lu_idx = lyr.fields().indexFromName("last_update")
-
-        for dev_id, pts in by_device.items():
-            existing = list(lyr.getFeatures(f'"device_id" = {dev_id}'))
-
-            if existing:
-                feat     = existing[0]
-                geom     = feat.geometry()
-                # Read existing vertices as QgsPoint — preserves Z and M from
-                # previous writes. Old 2D features get z=0, m=0 automatically.
-                verts    = [QgsPoint(v.x(), v.y(), v.z(), v.m())
-                            for v in geom.vertices()]
-                orig_len = len(verts)
-                for p in pts:
-                    epoch  = _epoch_from_fix_time(p["fix_time"])
-                    new_pt = QgsPoint(p["lon"], p["lat"],
-                                      p.get("altitude", 0.0), epoch)
-                    # Compare XY only — don't duplicate stationary heartbeats
-                    if not verts or (verts[-1].x() != new_pt.x()
-                                     or verts[-1].y() != new_pt.y()):
-                        verts.append(new_pt)
-                if len(verts) > orig_len:
-                    geom_changes[feat.id()] = QgsGeometry.fromPolyline(verts)
-                    if lu_idx >= 0:
-                        attr_changes[feat.id()] = {lu_idx: _to_qdt(pts[-1]["fix_time"])}
-            else:
-                # New device — build full line from all positions in this batch
-                verts = []
-                for p in pts:
-                    epoch  = _epoch_from_fix_time(p["fix_time"])
-                    new_pt = QgsPoint(p["lon"], p["lat"],
-                                      p.get("altitude", 0.0), epoch)
-                    if not verts or (verts[-1].x() != new_pt.x()
-                                     or verts[-1].y() != new_pt.y()):
-                        verts.append(new_pt)
-                if len(verts) == 1:
-                    verts.append(verts[0])   # degenerate until second fetch
-                f = QgsFeature(lyr.fields())
-                f.setGeometry(QgsGeometry.fromPolyline(verts))
-                for field in lyr.fields():
-                    fn = field.name()
-                    if   fn == "device_id":   f[fn] = dev_id
-                    elif fn == "name":        f[fn] = pts[0]["name"]
-                    elif fn == "start_time":  f[fn] = _to_qdt(pts[0]["fix_time"])
-                    elif fn == "last_update": f[fn] = _to_qdt(pts[-1]["fix_time"])
-                new_features.append(f)
-
-        dp = lyr.dataProvider()
-        if geom_changes:  dp.changeGeometryValues(geom_changes)
-        if attr_changes:  dp.changeAttributeValues(attr_changes)
-        if new_features:  dp.addFeatures(new_features)
+    @staticmethod
+    def _style_tracks(lyr):
+        sym = QgsLineSymbol.createSimple({"line_width": "0.7", "capstyle": "round",
+                                          "joinstyle": "round"})
+        sym.symbolLayer(0).setDataDefinedProperty(
+            _sl_prop("StrokeColor"), QgsProperty.fromExpression("if(\"fresh\" = 1, \"color\", '#9E9E9E')"))
+        sym.setOpacity(0.85)
+        lyr.setRenderer(QgsSingleSymbolRenderer(sym))
         lyr.triggerRepaint()
-        lyr.updateExtents()
-        _sync_categorized_renderer(lyr, {p["name"] for p in processed})
 
-    # ── Utility ───────────────────────────────────────────────────────────────
+    def _apply_visibility(self):
+        root = QgsProject.instance().layerTreeRoot()
+        for lid, key in ((self._mk_id, "show_markers"), (self._tk_id, "show_tracks")):
+            node = root.findLayer(lid) if lid else None
+            if node is not None:
+                node.setItemVisibilityChecked(bool(self.cfg[key]))
 
-    def _warn(self, msg):
-        self.iface.messageBar().pushMessage(
-            "Traccar Live", msg, level=_MSG_CRIT, duration=8)
-        QgsMessageLog.logMessage(msg, "Traccar Live", _MSG_CRIT)
+    def set_show(self, key, on):
+        self.set_cfg(key, bool(on))
+        mk = QgsProject.instance().mapLayer(self._mk_id) if self._mk_id else None
+        if key == "show_labels" and mk is not None:
+            mk.setLabelsEnabled(bool(on))
+            mk.triggerRepaint()
+        elif key == "show_accuracy" and mk is not None:
+            self._style_markers(mk)
+        else:
+            self._apply_visibility()
+
+    def _update_overlays(self):
+        mk = self._overlay("markers")
+        feats = []
+        for dev_id, p in self.marker_pos.items():
+            f = QgsFeature(mk.fields())
+            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(p["longitude"], p["latitude"])))
+            attrs = p.get("attributes") or {}
+            name = self._name(dev_id)
+            f.setAttributes([dev_id, name, _qdt(p["_t"]), _local_text(p["_t"]),
+                             round((p.get("speed") or 0) * 1.852, 1), attrs.get("batteryLevel"),
+                             p.get("accuracy") or 0.0, 1 if self._fresh(p["_t"]) else 0,
+                             _device_color(name)])
+            feats.append(f)
+        mk.dataProvider().truncate()
+        mk.dataProvider().addFeatures(feats)
+        mk.updateExtents()
+        mk.triggerRepaint()
+
+        tk = self._overlay("tracks")
+        feats = []
+        for dev_id, pts in self.tracks.items():
+            if len(pts) < 2:
+                continue
+            line = QgsLineString([p["longitude"] for p in pts], [p["latitude"] for p in pts],
+                                 [float(p.get("altitude") or 0) for p in pts],
+                                 [p["_t"].timestamp() for p in pts])
+            name = self._name(dev_id)
+            f = QgsFeature(tk.fields())
+            f.setGeometry(QgsGeometry(line))
+            f.setAttributes([dev_id, name, len(pts), _local_text(pts[0]["_t"]),
+                             _local_text(pts[-1]["_t"]), 1 if self._fresh(pts[-1]["_t"]) else 0,
+                             _device_color(name)])
+            feats.append(f)
+        tk.dataProvider().truncate()
+        tk.dataProvider().addFeatures(feats)
+        tk.updateExtents()
+        tk.triggerRepaint()
+
+    def _remove_overlays(self):
+        prj = QgsProject.instance()
+        for lid in (self._mk_id, self._tk_id):
+            if lid and prj.mapLayer(lid) is not None:
+                prj.removeMapLayer(lid)
+        self._mk_id = self._tk_id = ""
+        root = prj.layerTreeRoot()
+        group = root.findGroup(GROUP_NAME)
+        if group is not None and not group.children():
+            root.removeChildNode(group)
+
+    def _remove_stale_overlays(self):
+        """Overlay layers saved into a project by mistake come back empty — drop them."""
+        prj = QgsProject.instance()
+        stale = [lid for lid, lyr in prj.mapLayers().items()
+                 if str(lyr.customProperty(OVERLAY_PROP, "")) in ("1", "true", "True")
+                 and lid not in (self._mk_id, self._tk_id)]
+        if stale:
+            prj.removeMapLayers(stale)
+        root = prj.layerTreeRoot()
+        group = root.findGroup(GROUP_NAME)
+        if group is not None and not group.children():
+            root.removeChildNode(group)
+
+    def _on_project_changed(self, *_args):
+        self._mk_id = self._tk_id = ""
+        self._remove_stale_overlays()
+        if self.win is not None:
+            self._update_overlays()
+
+    # ── Zoom ──────────────────────────────────────────────────────────────
+    def _to_canvas(self):
+        canvas = self.iface.mapCanvas()
+        return canvas, QgsCoordinateTransform(WGS84, canvas.mapSettings().destinationCrs(),
+                                              QgsProject.instance())
+
+    def zoom_to(self, pos):
+        canvas, tr = self._to_canvas()
+        canvas.setCenter(tr.transform(QgsPointXY(pos["longitude"], pos["latitude"])))
+        canvas.refresh()
+
+    def zoom_to_all(self):
+        pts = [p for v in self.tracks.values() for p in v] + list(self.marker_pos.values())
+        if not pts:
+            return
+        canvas, tr = self._to_canvas()
+        xs = [p["longitude"] for p in pts]
+        ys = [p["latitude"] for p in pts]
+        rect = tr.transformBoundingBox(QgsRectangle(min(xs), min(ys), max(xs), max(ys)))
+        if rect.width() == 0 and rect.height() == 0:
+            canvas.setCenter(rect.center())
+        else:
+            rect.scale(1.15)
+            canvas.setExtent(rect)
+        canvas.refresh()
+
+    # ════════════════════════════════════════════════════════════════════════
+    #  Save — writes exactly what the time window shows
+    # ════════════════════════════════════════════════════════════════════════
+
+    def saves_to_html(self):
+        prj = QgsProject.instance()
+        pt = prj.mapLayer(self.cfg["points_layer_id"]) if self.cfg["points_layer_id"] else None
+        ln = prj.mapLayer(self.cfg["tracks_layer_id"]) if self.cfg["tracks_layer_id"] else None
+        if pt is None and ln is None:
+            return "<a href='#'>⚠ No layers chosen to save to — set them up</a>"
+        parts = []
+        if pt is not None:
+            parts.append("Positions → <b>%s</b> (%s)" % (
+                pt.name(), "every fix" if self.cfg["points_mode"] == 1 else "latest fix"))
+        if ln is not None:
+            parts.append("Tracks → <b>%s</b> (%s)" % (
+                ln.name(), "keep most recent" if self.cfg["tracks_mode"] == 1 else "add new"))
+        return " · ".join(parts) + "  <a href='#'>change…</a>"
+
+    def _target(self, key, what):
+        lid = self.cfg[key]
+        lyr = QgsProject.instance().mapLayer(lid) if lid else None
+        if lyr is None:
+            self._bar("Choose a layer for %s first" % what, _MSG_WARN)
+            self.open_settings(1)
+            return None
+        if self.win is None:
+            self._bar("Nothing loaded yet — click ↻ Refresh or ▶ Live", _MSG_WARN)
+            return None
+        return lyr
+
+    def save_positions(self):
+        lyr = self._target("points_layer_id", "positions")
+        if lyr is None:
+            return
+        if self.cfg["points_mode"] == 1:
+            positions = [p for v in self.tracks.values() for p in v]
+        else:
+            positions = list(self.marker_pos.values())
+        if not positions:
+            self._bar("No positions to save", _MSG_WARN)
+            return
+        n, note = self._write_points(lyr, positions)
+        if n >= 0:
+            self._bar("Saved %d point(s) to %s%s" % (n, lyr.name(), note), _MSG_OK)
+
+    def save_tracks(self):
+        lyr = self._target("tracks_layer_id", "tracks")
+        if lyr is None:
+            return
+        by_dev = {k: v for k, v in self.tracks.items() if v}
+        if not by_dev:
+            self._bar("No fixes in this window to save", _MSG_WARN)
+            return
+        n, note = self._write_tracks(lyr, by_dev)
+        if n >= 0:
+            self._bar("Saved %d track(s) to %s%s" % (n, lyr.name(), note), _MSG_OK)
+
+    # ── Field helpers ─────────────────────────────────────────────────────
+    @staticmethod
+    def _field_kind(field):
+        tn = field.typeName().lower()
+        if "date" in tn or "time" in tn:
+            return "dt"
+        if field.isNumeric():
+            return "num"
+        return "text"
+
+    def _attrs(self, fields, vals, tag):
+        """{field index: value}, converted to each field's type; tag beats other values."""
+        tag_text = tag or self.cfg["tag_text"]
+        tag_field = self.cfg["tag_field"] if (self.cfg["tag_enabled"] and tag_text) else ""
+        out = {}
+        for i, field in enumerate(fields):
+            name = field.name()
+            if name == tag_field:
+                out[i] = tag_text
+                continue
+            if name not in vals or vals[name] is None:
+                continue
+            v, kind = vals[name], self._field_kind(field)
+            if isinstance(v, datetime):
+                v = _qdt(v) if kind == "dt" else _iso(v)
+            elif kind == "text" and not isinstance(v, str):
+                v = str(v)
+            elif kind == "num" and isinstance(v, str):
+                continue
+            out[i] = v
+        return out
+
+    @staticmethod
+    def _name_field(names, chosen):
+        if chosen and chosen in names:
+            return chosen
+        return "name" if "name" in names else ""
+
+    @staticmethod
+    def _commit(lyr, feats, delete_ids):
+        """Write in the layer's edit session; returns (count, note) or (-1, '')."""
+        was_editing = lyr.isEditable()
+        if not was_editing and not lyr.startEditing():
+            return -1, ""
+        if delete_ids:
+            lyr.deleteFeatures(delete_ids)
+        # Match the layer's geometry type: drop Z / M, single → multi, etc.
+        feats = QgsVectorLayerUtils.makeFeaturesCompatible(feats, lyr)
+        res = lyr.addFeatures(feats)
+        if not (res[0] if isinstance(res, tuple) else res):
+            if not was_editing:
+                lyr.rollBack()
+            return -1, ""
+        if not was_editing:
+            if not lyr.commitChanges():
+                errs = "; ".join(lyr.commitErrors())
+                lyr.rollBack()
+                QgsMessageLog.logMessage(errs, "Traccar Live", _MSG_WARN)
+                return -1, ""
+        lyr.triggerRepaint()
+        return len(feats), (" (added to the open edit session — save edits to keep them)"
+                            if was_editing else "")
+
+    def _write_points(self, lyr, positions):
+        fields = lyr.fields()
+        names  = fields.names()
+        name_field = self._name_field(names, self.cfg["points_name_field"])
+        tr     = QgsCoordinateTransform(WGS84, lyr.crs(), QgsProject.instance())
+        has_z  = QgsWkbTypes.hasZ(lyr.wkbType())
+        saved  = datetime.now(timezone.utc)
+        tag    = self.win["tag"] if self.win else ""
+        feats  = []
+        for p in positions:
+            dev_id = p.get("deviceId")
+            info   = self.devices.get(dev_id, {})
+            attrs  = p.get("attributes") or {}
+            vals = {
+                "device_id": dev_id, "name": self._name(dev_id), "status": info.get("status", ""),
+                "fix_time": p["_t"], "fix_local": _local_text(p["_t"]),
+                "speed_kmh": round((p.get("speed") or 0) * 1.852, 1),
+                "course": p.get("course") or 0.0, "altitude_m": p.get("altitude") or 0.0,
+                "accuracy_m": p.get("accuracy") or 0.0, "battery": attrs.get("batteryLevel"),
+                "address": p.get("address") or "", "motion": str(attrs.get("motion", "")),
+                "fetched_at": saved,
+            }
+            if name_field:
+                vals[name_field] = vals["name"]
+            xy = tr.transform(QgsPointXY(p["longitude"], p["latitude"]))
+            geom = QgsGeometry(QgsPoint(xy.x(), xy.y(), float(p.get("altitude") or 0))) if has_z \
+                else QgsGeometry.fromPointXY(xy)
+            feats.append(QgsVectorLayerUtils.createFeature(lyr, geom, self._attrs(fields, vals, tag)))
+        n, note = self._commit(lyr, feats, [])
+        if n < 0:
+            self._bar("Could not save to %s — see the log" % lyr.name(), _MSG_WARN)
+        return n, note
+
+    def _write_tracks(self, lyr, by_dev):
+        fields = lyr.fields()
+        names  = fields.names()
+        name_field = self._name_field(names, self.cfg["tracks_name_field"])
+        w      = self.win
+
+        # "Keep most recent": earlier tracks of the same device, by device_id or name
+        delete_ids = []
+        if int(self.cfg["tracks_mode"]) == 1:
+            match = "device_id" if "device_id" in names else name_field
+            if not match:
+                self._bar("Tracks layer has no device_id or name field — adding instead of replacing",
+                          _MSG_WARN)
+            else:
+                keys = {str(d) if match == "device_id" else self._name(d) for d in by_dev}
+                req = QgsFeatureRequest().setSubsetOfAttributes([match], fields)
+                for f in lyr.getFeatures(req):
+                    v = f[match]
+                    if not _is_null(v) and str(v) in keys:
+                        delete_ids.append(f.id())
+
+        tr    = QgsCoordinateTransform(WGS84, lyr.crs(), QgsProject.instance())
+        saved = datetime.now(timezone.utc)
+        feats = []
+        for dev_id, pts in by_dev.items():
+            xy = [tr.transform(QgsPointXY(p["longitude"], p["latitude"])) for p in pts]
+            zs = [float(p.get("altitude") or 0) for p in pts]
+            ms = [p["_t"].timestamp() for p in pts]
+            if len(xy) == 1:             # a line needs two vertices
+                xy, zs, ms = xy * 2, zs * 2, ms * 2
+            line = QgsLineString([q.x() for q in xy], [q.y() for q in xy], zs, ms)
+            vals = {
+                "device_id": dev_id, "name": self._name(dev_id),
+                "start_time": pts[0]["_t"], "last_update": pts[-1]["_t"],
+                "start_local": _local_text(pts[0]["_t"]), "last_local": _local_text(pts[-1]["_t"]),
+                "from_time": w["frm"], "to_time": w["to"], "n_points": len(pts), "saved_at": saved,
+            }
+            if name_field:
+                vals[name_field] = vals["name"]
+            feats.append(QgsVectorLayerUtils.createFeature(
+                lyr, QgsGeometry(line), self._attrs(fields, vals, w["tag"])))
+        n, note = self._commit(lyr, feats, delete_ids)
+        if n < 0:
+            self._bar("Could not save to %s — see the log" % lyr.name(), _MSG_WARN)
+        return n, note
