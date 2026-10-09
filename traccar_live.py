@@ -171,7 +171,6 @@ TRACK_SCHEMA = [
 
 DEFAULTS = {
     "server_url": DEFAULT_URL, "username": "",
-    "password": "",                 # legacy plain-text password: only read once, then moved (see _credentials)
     "authcfg": "",                  # id of the login in QGIS's Authentication Manager
     "window_minutes": 60, "custom_from": "", "custom_to": "",
     "event_layer_id": "", "event_display_field": "", "event_start_field": "",
@@ -291,7 +290,8 @@ def _age_text(dt):
 
 def _device_color(name):
     """Deterministic colour from the device name — same name, same colour."""
-    hue = int(hashlib.md5(str(name).encode()).hexdigest()[:4], 16) % 360
+    # MD5 only spreads names over the colour wheel — not used for security
+    hue = int(hashlib.md5(str(name).encode(), usedforsecurity=False).hexdigest()[:4], 16) % 360
     return QColor.fromHsv(hue, 190, 200).name()
 
 
@@ -811,7 +811,7 @@ class SettingsDialog(QDialog):
         self.user_edit = QLineEdit(c["username"])
         self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(_ECHO_PWD)
-        self._has_login = bool(c["authcfg"]) or bool(c["password"])
+        self._has_login = bool(c["authcfg"]) or bool(plugin._old_pw)
         if self._has_login:
             self.pass_edit.setPlaceholderText("saved — leave blank to keep it")
         f.addRow("Server URL:", self.url_edit)
@@ -1210,6 +1210,8 @@ class TraccarLive:
         for key, default in DEFAULTS.items():
             v = s.value("%s/%s" % (SETTINGS_NS, key), default, type=type(default))
             self.cfg[key] = v
+        # A plain-text password left by v0.1 / v0.2.0 — moved to the password manager on first use
+        self._old_pw = s.value(SETTINGS_NS + "/password", None, type=str) or None
         if not self.cfg["v2_migrated"]:
             self._migrate_v1(s)
 
@@ -1233,8 +1235,7 @@ class TraccarLive:
     def _save_settings(self):
         s = QSettings()
         for key in DEFAULTS:
-            if key != "password":               # never written back in plain text
-                s.setValue("%s/%s" % (SETTINGS_NS, key), self.cfg[key])
+            s.setValue("%s/%s" % (SETTINGS_NS, key), self.cfg[key])
 
     # ── Login (QGIS Authentication Manager) ───────────────────────────────
     def _credentials(self):
@@ -1246,8 +1247,8 @@ class TraccarLive:
         if stored:
             self._login = stored
             return stored
-        if self.cfg["password"]:
-            self.set_login(self.cfg["server_url"], self.cfg["username"], self.cfg["password"])
+        if self._old_pw:
+            self.set_login(self.cfg["server_url"], self.cfg["username"], self._old_pw)
             return self._login
         return None
 
@@ -1255,8 +1256,8 @@ class TraccarLive:
         """Save the login in QGIS's password manager. A blank password keeps the
         saved one. Returns True when it is stored there."""
         if not password:
-            old = load_login(self.cfg["authcfg"]) or ((self.cfg["username"], self.cfg["password"])
-                                                     if self.cfg["password"] else None)
+            old = load_login(self.cfg["authcfg"]) or ((self.cfg["username"], self._old_pw)
+                                                     if self._old_pw else None)
             password = old[1] if old else ""
         self.cfg["server_url"], self.cfg["username"] = url, username
         self._login = (username, password) if password else None
@@ -1265,7 +1266,7 @@ class TraccarLive:
         authcfg = store_login(self.cfg["authcfg"], url, username, password)
         if authcfg:
             self.cfg["authcfg"] = authcfg
-            self.cfg["password"] = ""
+            self._old_pw = None
             QSettings().remove(SETTINGS_NS + "/password")
         else:
             self._bar("The login could not be saved in QGIS's password manager — "
