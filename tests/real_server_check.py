@@ -1,7 +1,9 @@
 """
 Read-only check of Traccar Live against a real Traccar server.
 
-Uses the login saved by the plugin in a QGIS profile (never printed), only makes
+Uses the server and username saved by the plugin in a QGIS profile, and the password from
+the TRACCAR_PASSWORD environment variable (or, until the plugin has moved it into QGIS's
+password manager, the old plain-text one in that profile). Nothing is printed. Only makes
 GET requests (devices, positions), and saves into a throwaway GeoPackage that is
 deleted afterwards.
 
@@ -35,14 +37,17 @@ PKG = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 src = QSettings(os.environ["TRACCAR_QGIS_INI"], _INI)
 creds = {k: src.value("TraccarLive/" + k, "") for k in ("server_url", "username", "password")}
+creds["password"] = os.environ.get("TRACCAR_PASSWORD") or creds["password"]
 if not creds["username"] or not creds["password"]:
-    sys.exit("No saved Traccar login in that QGIS profile.")
+    sys.exit("No Traccar login: set TRACCAR_PASSWORD (the profile has no plain-text password).")
 minutes = int(sys.argv[1]) if len(sys.argv) > 1 else 1440
 
 start_app()
+from qgis.core import QgsApplication  # noqa: E402
+QgsApplication.authManager().setMasterPassword("check-master", True)   # temporary auth DB only
 mod = __import__(PKG + ".traccar_live", fromlist=["*"])
 plugin = mod.TraccarLive(get_iface())
-plugin.cfg.update(creds)
+plugin.set_login(creds["server_url"], creds["username"], creds["password"])
 plugin.cfg["window_minutes"] = minutes
 
 

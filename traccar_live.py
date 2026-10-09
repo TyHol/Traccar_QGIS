@@ -47,7 +47,7 @@ from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton, QToolTip,
 )
 from qgis.core import (
-    Qgis, QgsProject, QgsVectorLayer, QgsField, QgsFields, QgsFeature,
+    Qgis, QgsApplication, QgsAuthMethodConfig, QgsProject, QgsVectorLayer, QgsField, QgsFields, QgsFeature,
     QgsFeatureRequest, QgsGeometry, QgsPoint, QgsPointXY, QgsLineString,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRectangle,
     QgsVectorFileWriter, QgsVectorLayerUtils, QgsWkbTypes, QgsMessageLog,
@@ -170,7 +170,9 @@ TRACK_SCHEMA = [
 ]
 
 DEFAULTS = {
-    "server_url": DEFAULT_URL, "username": "", "password": "",
+    "server_url": DEFAULT_URL, "username": "",
+    "password": "",                 # legacy plain-text password: only read once, then moved (see _credentials)
+    "authcfg": "",                  # id of the login in QGIS's Authentication Manager
     "window_minutes": 60, "custom_from": "", "custom_to": "",
     "event_layer_id": "", "event_display_field": "", "event_start_field": "",
     "event_end_field": "", "event_feature_fid": -1, "feature_span": 0, "feature_duration": 120,
@@ -294,21 +296,75 @@ def _device_color(name):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Login storage — QGIS Authentication Manager (encrypted, behind QGIS's master
+#  password). The plugin's settings keep only the config id, never the password.
+# ════════════════════════════════════════════════════════════════════════════
+
+AUTH_NAME = "Traccar Live"
+
+
+def _auth_result(res, cfg):
+    """storeAuthenticationConfig / loadAuthenticationConfig return (ok, config) in
+    QGIS 3.44 / 4.x and a plain bool (config filled in place) in older builds."""
+    return res if isinstance(res, tuple) else (res, cfg)
+
+
+def load_login(authcfg):
+    """(username, password) stored under authcfg, or None."""
+    if not authcfg:
+        return None
+    cfg = QgsAuthMethodConfig()
+    ok, cfg = _auth_result(QgsApplication.authManager().loadAuthenticationConfig(authcfg, cfg, True), cfg)
+    if not ok or not cfg.id():
+        return None
+    return cfg.config("username"), cfg.config("password")
+
+
+def store_login(authcfg, url, username, password):
+    """Create or update the plugin's Basic login. Returns its id, or '' if QGIS
+    could not store it (e.g. the master password prompt was cancelled)."""
+    mgr = QgsApplication.authManager()
+    cfg = QgsAuthMethodConfig()
+    exists = False
+    if authcfg:
+        exists, cfg = _auth_result(mgr.loadAuthenticationConfig(authcfg, cfg, True), cfg)
+        exists = exists and bool(cfg.id())
+    if not exists:
+        cfg = QgsAuthMethodConfig("Basic")
+        cfg.setName(AUTH_NAME)
+    cfg.setMethod("Basic")
+    cfg.setUri(url)
+    cfg.setConfig("username", username)
+    cfg.setConfig("password", password)
+    cfg.setConfig("realm", "")
+    if exists:
+        return cfg.id() if mgr.updateAuthenticationConfig(cfg) else ""
+    ok, cfg = _auth_result(mgr.storeAuthenticationConfig(cfg), cfg)
+    return cfg.id() if ok else ""
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Asynchronous Traccar API client (QGIS network manager → proxy settings apply,
 #  QGIS never freezes). Accept: application/json stops Traccar sending a
 #  WWW-Authenticate challenge, so a wrong password never pops up a login box.
 # ════════════════════════════════════════════════════════════════════════════
 
 class _Api:
-    def __init__(self, cfg):
+    """creds() → (username, password) or None (no login saved)."""
+
+    def __init__(self, cfg, creds):
         self.cfg      = cfg
+        self.creds    = creds
         self._pending = set()
 
     def get(self, path, on_ok, on_err):
+        login = self.creds()
+        if not login:
+            on_err("No saved Traccar login — set it up in Settings… → Connection")
+            return
         url = self.cfg["server_url"].rstrip("/") + path
         req = QNetworkRequest(QUrl(url))
-        token = base64.b64encode(
-            ("%s:%s" % (self.cfg["username"], self.cfg["password"])).encode("utf-8")).decode()
+        token = base64.b64encode(("%s:%s" % login).encode("utf-8")).decode()
         req.setRawHeader(b"Authorization", ("Basic " + token).encode())
         req.setRawHeader(b"Accept", b"application/json")
         try:
@@ -753,8 +809,11 @@ class SettingsDialog(QDialog):
         self.url_edit = QLineEdit(c["server_url"])
         self.url_edit.setPlaceholderText(DEFAULT_URL)
         self.user_edit = QLineEdit(c["username"])
-        self.pass_edit = QLineEdit(c["password"])
+        self.pass_edit = QLineEdit()
         self.pass_edit.setEchoMode(_ECHO_PWD)
+        self._has_login = bool(c["authcfg"]) or bool(c["password"])
+        if self._has_login:
+            self.pass_edit.setPlaceholderText("saved — leave blank to keep it")
         f.addRow("Server URL:", self.url_edit)
         f.addRow("Email / username:", self.user_edit)
         f.addRow("Password:", self.pass_edit)
@@ -763,8 +822,9 @@ class SettingsDialog(QDialog):
         self.test_lbl.setWordWrap(True)
         f.addRow(test)
         f.addRow(self.test_lbl)
-        hint = QLabel("Use the address you open in a browser for Traccar. "
-                      "The password is stored in your QGIS user settings.")
+        hint = QLabel("Use the address you open in a browser for Traccar. Your login is kept in "
+                      "QGIS's password manager (Settings → Options → Authentication), protected "
+                      "by QGIS's master password — not in the plugin's settings.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#666;")
         f.addRow(hint)
@@ -947,9 +1007,14 @@ class SettingsDialog(QDialog):
     def _test(self):
         self.test_lbl.setText("Testing…")
         cfg = dict(self.p.cfg)
-        cfg.update(server_url=self.url_edit.text().strip().rstrip("/"),
-                   username=self.user_edit.text().strip(), password=self.pass_edit.text())
-        api = _Api(cfg)
+        cfg.update(server_url=self.url_edit.text().strip().rstrip("/"))
+        user, typed = self.user_edit.text().strip(), self.pass_edit.text()
+        if typed:
+            login = (user, typed)
+        else:                                   # blank: test with the saved password
+            saved = self.p._credentials()
+            login = (user, saved[1]) if saved else None
+        api = _Api(cfg, lambda: login)
         self._test_api = api      # keep alive until the reply arrives
         api.get("/api/devices",
                 lambda d: self.test_lbl.setText(
@@ -1065,7 +1130,8 @@ class TraccarLive:
         self.iface   = iface
         self.cfg     = {}
         self._load_settings()
-        self.api     = _Api(self.cfg)
+        self._login  = None         # (username, password) for this session, from the auth manager
+        self.api     = _Api(self.cfg, self._credentials)
         self.timer   = QTimer()
         self.timer.timeout.connect(self.poll_live)
         self._actions = []
@@ -1167,7 +1233,45 @@ class TraccarLive:
     def _save_settings(self):
         s = QSettings()
         for key in DEFAULTS:
-            s.setValue("%s/%s" % (SETTINGS_NS, key), self.cfg[key])
+            if key != "password":               # never written back in plain text
+                s.setValue("%s/%s" % (SETTINGS_NS, key), self.cfg[key])
+
+    # ── Login (QGIS Authentication Manager) ───────────────────────────────
+    def _credentials(self):
+        """(username, password) for requests, or None. A plain-text password left
+        by v0.1 / v0.2.0 is moved into the auth manager here, then deleted."""
+        if self._login is not None:
+            return self._login
+        stored = load_login(self.cfg["authcfg"])
+        if stored:
+            self._login = stored
+            return stored
+        if self.cfg["password"]:
+            self.set_login(self.cfg["server_url"], self.cfg["username"], self.cfg["password"])
+            return self._login
+        return None
+
+    def set_login(self, url, username, password):
+        """Save the login in QGIS's password manager. A blank password keeps the
+        saved one. Returns True when it is stored there."""
+        if not password:
+            old = load_login(self.cfg["authcfg"]) or ((self.cfg["username"], self.cfg["password"])
+                                                     if self.cfg["password"] else None)
+            password = old[1] if old else ""
+        self.cfg["server_url"], self.cfg["username"] = url, username
+        self._login = (username, password) if password else None
+        if not password:
+            return False
+        authcfg = store_login(self.cfg["authcfg"], url, username, password)
+        if authcfg:
+            self.cfg["authcfg"] = authcfg
+            self.cfg["password"] = ""
+            QSettings().remove(SETTINGS_NS + "/password")
+        else:
+            self._bar("The login could not be saved in QGIS's password manager — "
+                      "it will be asked for again next time QGIS starts.", _MSG_WARN)
+        self._save_settings()
+        return bool(authcfg)
 
     def set_cfg(self, key, value):
         if value is None:
@@ -1198,8 +1302,11 @@ class TraccarLive:
         if accepted:
             interval_changed = vals["live_interval_s"] != self.cfg["live_interval_s"]
             view_changed = vals["live_view"] != self.cfg["live_view"]
+            url, user, pwd = vals.pop("server_url"), vals.pop("username"), vals.pop("password")
             for k, v in vals.items():
                 self.cfg[k] = v
+            if pwd or url != self.cfg["server_url"] or user != self.cfg["username"]:
+                self.set_login(url, user, pwd)
             self._save_settings()
             if view_changed:
                 self._remove_overlays()

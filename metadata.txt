@@ -16,6 +16,6 @@ category=Web
 experimental=True
 hasProcessingProvider=no
 changelog=
-    0.2.1 - Packaging for the QGIS plugin repository: lowercase package folder (traccar_live), icon, licence (GPL-2.0-or-later).
+    0.2.1 - Traccar login kept in QGIS's password manager (moved there from the settings automatically). Packaging for the QGIS plugin repository: lowercase package folder (traccar_live), icon, licence (GPL-2.0-or-later).
     0.2.0 - One time window drives the map and saving; positions and tracks layers replace A/B/C; live view drawn on the map or as temporary layers; asynchronous network; reprojection to the layer CRS; QGIS 4 support.
     0.1.0 - First version.

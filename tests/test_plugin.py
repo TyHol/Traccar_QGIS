@@ -111,6 +111,8 @@ URL = "http://127.0.0.1:%d" % server.server_address[1]
 
 # ── Harness ──────────────────────────────────────────────────────────────────
 start_app()
+from qgis.core import QgsApplication  # noqa: E402
+QgsApplication.authManager().setMasterPassword("test-master", True)   # temporary auth DB of the test app
 IFACE = get_iface()
 RESULTS = []
 
@@ -147,7 +149,7 @@ def test(fn):
 mod = __import__(PKG + ".traccar_live", fromlist=["*"])
 plugin = __import__(PKG, fromlist=["classFactory"]).classFactory(IFACE)
 plugin.initGui()
-plugin.cfg.update(server_url=URL, username=USER, password="wrong")
+plugin.set_login(URL, USER, "wrong")
 
 
 def load(minutes=None):
@@ -177,7 +179,7 @@ def t01_wrong_password():
 
 @test
 def t02_load_last_3h():
-    plugin.cfg["password"] = PWD
+    plugin.set_login(URL, USER, PWD)
     ok = load(180)
     check("load finishes", ok)
     check("3 devices", len(plugin.devices) == 3, len(plugin.devices))
@@ -550,6 +552,39 @@ def t18_migration_from_v01():
           p2.cfg["points_layer_id"] == pts.id() and p2.cfg["tracks_layer_id"] == ""
           and p2.cfg["live_interval_s"] == 180, (p2.cfg["points_layer_id"], p2.cfg["tracks_layer_id"],
                                                  p2.cfg["live_interval_s"]))
+
+
+@test
+def t18b_password_store():
+    import glob
+    from qgis.core import QgsAuthMethodConfig
+    login = mod.load_login(plugin.cfg["authcfg"])
+    check("login kept in QGIS's password manager", login == (USER, PWD), login)
+    c = QgsAuthMethodConfig()
+    res = QgsApplication.authManager().loadAuthenticationConfig(plugin.cfg["authcfg"], c, True)
+    c = res[1] if isinstance(res, tuple) else c
+    check("stored as a QGIS 'Basic' login named Traccar Live", c.method() == "Basic" and c.name() == "Traccar Live",
+          (c.method(), c.name()))
+    plugin.set_login(URL, USER, "")
+    check("blank password keeps the saved one", mod.load_login(plugin.cfg["authcfg"]) == (USER, PWD))
+    s = QSettings()
+    s.setValue("TraccarLive/authcfg", "")
+    s.setValue("TraccarLive/password", PWD)                 # as left by v0.2.0
+    p3 = mod.TraccarLive(IFACE)
+    got = p3._credentials()
+    check("old plain-text password moved into the password manager",
+          got == (USER, PWD) and p3.cfg["authcfg"] and mod.load_login(p3.cfg["authcfg"]) == (USER, PWD)
+          and QSettings().value("TraccarLive/password", None) is None, (got, p3.cfg["authcfg"]))
+    d = mod.SettingsDialog(p3, IFACE.mainWindow(), 0)
+    check("Settings shows an empty password box ('saved — leave blank')",
+          d.pass_edit.text() == "" and "saved" in d.pass_edit.placeholderText())
+    d.deleteLater()
+    flush_deletes()
+    p3._save_settings()
+    QSettings().sync()
+    leaked = [f for f in glob.glob(os.path.join(TMP, "**", "*.ini"), recursive=True)
+              if PWD in open(f, encoding="utf-8", errors="ignore").read()]
+    check("no password in any settings file on disk", not leaked, leaked)
 
 
 @test
