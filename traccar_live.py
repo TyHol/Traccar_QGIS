@@ -9,8 +9,8 @@ works in both.
   Time window  — Last 15 min … 3 months, custom dates, or a feature's start/end.
                  The tracks shown are the fixes inside the window; the Save
                  buttons write exactly that.
-  Overlay      — two temporary layers in a "Traccar (live)" group (markers and
-                 tracks). Never written to file.
+  Overlay      — two temporary layers, "Temp Markers" and "Temp Tracks", in a
+                 "Traccar (live)" group. Never written to file.
   Live         — refreshes in the background; a "Last …" window keeps moving.
   Save         — positions layer (latest fix, or every fix in the window) and
                  tracks layer (add a new line per device, or keep only the most
@@ -866,8 +866,8 @@ class SettingsDialog(QDialog):
             path += ".gpkg"
         QSettings().setValue(SETTINGS_NS + "/last_gpkg_dir", os.path.dirname(path))
         pts, trk, errors = create_template_gpkg(path)
-        for lyr, name, combo in ((pts, "Traccar positions", self.pt_combo),
-                                 (trk, "Traccar tracks", self.ln_combo)):
+        for lyr, name, combo in ((pts, "Traccar Positions", self.pt_combo),
+                                 (trk, "Traccar Tracks", self.ln_combo)):
             if lyr is not None:
                 lyr.setName(name)
                 QgsProject.instance().addMapLayer(lyr)
@@ -926,7 +926,9 @@ window — Live keeps running; the <b>▶ Live</b> toolbar button starts and sto
 in the past cannot change, so Live pauses for it and the markers show each device's last fix in it.
 <b>↻ Refresh</b> loads the window once; <b>Clear</b> stops Live and removes the overlay.</p>
 <h3>On the map</h3>
-<p>The overlay is two temporary layers in the <i>Traccar (live)</i> group: markers and tracks, each
+<p>The live view is two temporary layers in the <i>Traccar (live)</i> group, <i>Temp Markers</i> and
+<i>Temp Tracks</i> — separate from the layers you save to (e.g. <i>Traccar Positions</i> and
+<i>Traccar Tracks</i>). Each
 device in its own colour (grey when its last fix is older than the limit in Settings → Advanced).
 They are never written to file and QGIS won't ask to save them. Switch Markers, Labels, Tracks and
 Accuracy circles on or off here or in the Layers panel; use Identify on them as on any layer.
@@ -1430,13 +1432,13 @@ class TraccarLive:
                 ("device_id", "integer"), ("name", "string(80)"), ("fix_time", "datetime"),
                 ("fix_local", "string(40)"), ("speed_kmh", "double"), ("battery", "double"),
                 ("accuracy_m", "double"), ("fresh", "integer"), ("color", "string(9)")])
-            lyr = QgsVectorLayer(uri, "Traccar markers", "memory")
+            lyr = QgsVectorLayer(uri, "Temp Markers", "memory")
         else:
             uri = _memory_uri("LineStringZM", [
                 ("device_id", "integer"), ("name", "string(80)"), ("fixes", "integer"),
                 ("start_local", "string(40)"), ("last_local", "string(40)"),
                 ("fresh", "integer"), ("color", "string(9)")])
-            lyr = QgsVectorLayer(uri, "Traccar tracks", "memory")
+            lyr = QgsVectorLayer(uri, "Temp Tracks", "memory")
         lyr.setCustomProperty(OVERLAY_PROP, 1)
         lyr.setCustomProperty("skipMemoryLayersCheck", 1)   # no "save scratch layers?" prompt
         root  = QgsProject.instance().layerTreeRoot()

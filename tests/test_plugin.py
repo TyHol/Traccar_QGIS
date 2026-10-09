@@ -189,6 +189,8 @@ def t03_overlay_layers():
     mk, tk = prj.mapLayer(plugin._mk_id), prj.mapLayer(plugin._tk_id)
     check("overlay layers exist in 'Traccar (live)' group",
           mk is not None and tk is not None and prj.layerTreeRoot().findGroup(mod.GROUP_NAME) is not None)
+    check("overlay layers named Temp Markers / Temp Tracks",
+          mk.name() == "Temp Markers" and tk.name() == "Temp Tracks", (mk.name(), tk.name()))
     check("overlay not saved / no scratch prompt",
           str(mk.customProperty("skipMemoryLayersCheck")) == "1" and mk.providerType() == "memory")
     check("markers: 2 features", mk.featureCount() == 2, mk.featureCount())

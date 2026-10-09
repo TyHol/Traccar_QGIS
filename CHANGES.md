@@ -17,7 +17,9 @@ Brings the QGIS plugin in line with the QField plugin (Traccar_QField v0.4).
   display value with *From feature*.
 
 ### Overlay
-- Markers and tracks are two temporary layers in a **Traccar (live)** group: per-device colours,
+- Markers and tracks are two temporary layers, **Temp Markers** and **Temp Tracks**, in a
+  **Traccar (live)** group (New GeoPackage names the saved layers *Traccar Positions* and
+  *Traccar Tracks*): per-device colours,
   grey when stale, labels, accuracy circles in metres; Identify works. Flagged so QGIS never asks
   to save them; stale copies saved into a project are removed on load.
 
