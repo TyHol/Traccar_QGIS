@@ -6,7 +6,7 @@ description=Follow Traccar devices on the map within a chosen time window, and s
 about=Shows Traccar GPS devices as temporary map layers (markers and tracks) for one time window — last N minutes, custom dates, or a feature's start/end — refreshed live in the background. Save positions (latest fix or every fix) and tracks (one line per device, Z = altitude, M = time) to your own layers. Same layer schema as the QField plugin Traccar_QField.
 version=0.2.0
 author=TyHol
-email=itonyholmes@gmail.com
+email=96470691+TyHol@users.noreply.github.com
 homepage=https://github.com/TyHol/Traccar_QGIS
 repository=https://github.com/TyHol/Traccar_QGIS
 tracker=https://github.com/TyHol/Traccar_QGIS/issues
