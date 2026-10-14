@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-Traccar Live – QGIS Plugin  v0.2
+Traccar Live – QGIS Plugin  v0.3
 
 Follows Traccar devices on the QGIS map within one chosen time window, and saves
 their positions and tracks to two project layers on demand. Mirrors the QField
@@ -18,26 +18,36 @@ works in both.
   Save         — positions layer (latest fix, or every fix in the window) and
                  tracks layer (add a new line per device, or keep only the most
                  recent).
+  Per device   — tick to show / hide on the map; save one device to a GPX,
+                 GeoPackage or CSV file, or to the layers; copy its location
+                 (lat/long, project / custom CRS, Irish / UK grid, what3words,
+                 WKT) or its track (WKT) to the clipboard.
+  Playback     — replay the tracks in the window: markers move along them.
 
-Unobtrusive by design: the main window is a non-modal pop-up that can be closed
-while Live runs (toolbar button ▶ Live starts/stops it), network requests are
+Unobtrusive by design: the main panel is a dock widget (docked, tabbed or
+floating) that can be closed while Live runs (toolbar button ▶ Live starts/stops it), network requests are
 asynchronous, and Live errors are reported once per error streak.
 
 Compatible with QGIS 3.28 LTR … 3.44 (Qt5 / PyQt5) and QGIS 4.x (Qt6 / PyQt6).
 """
 
+import csv
 import json
 import math
 import os
 import base64
+import bisect
 import hashlib
 import re
 import time
+from html import escape as _xml
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote as _quote
 
 from qgis.PyQt.QtCore import QTimer, QSettings, QDateTime, QDate, QTime, QUrl, Qt, QPointF
-from qgis.PyQt.QtGui import QColor, QIcon, QPainter, QPen, QBrush, QFont, QPolygonF, QPainterPath
+from qgis.PyQt.QtGui import (
+    QColor, QCursor, QIcon, QPainter, QPen, QBrush, QFont, QPolygonF, QPainterPath, QTransform,
+)
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
     QAction, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout,
@@ -45,11 +55,12 @@ from qgis.PyQt.QtWidgets import (
     QRadioButton, QButtonGroup, QPushButton, QDialogButtonBox, QTabWidget,
     QWidget, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton, QToolTip,
+    QMenu, QScrollArea, QFrame, QSlider,
 )
 from qgis.core import (
     Qgis, QgsApplication, QgsAuthMethodConfig, QgsProject, QgsVectorLayer, QgsFeature,
     QgsFeatureRequest, QgsGeometry, QgsPoint, QgsPointXY, QgsLineString,
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRectangle,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRectangle, QgsCsException,
     QgsVectorFileWriter, QgsVectorLayerUtils, QgsWkbTypes, QgsMessageLog,
     QgsNetworkAccessManager, QgsMapLayerProxyModel, QgsFieldProxyModel,
     QgsMarkerSymbol, QgsLineSymbol, QgsSimpleMarkerSymbolLayer, QgsSymbolLayer,
@@ -57,7 +68,9 @@ from qgis.core import (
     QgsPalLayerSettings, QgsTextFormat, QgsTextBufferSettings,
     QgsVectorLayerSimpleLabeling,
 )
-from qgis.gui import QgsMapLayerComboBox, QgsFieldComboBox, QgsMapCanvasItem
+from qgis.gui import (
+    QgsMapLayerComboBox, QgsFieldComboBox, QgsMapCanvasItem, QgsDockWidget, QgsProjectionSelectionWidget,
+)
 
 try:
     from qgis.core import NULL
@@ -119,6 +132,16 @@ _ANTIALIAS = _e(QPainter, "RenderHint", "Antialiasing")
 _CAP_ROUND = _e(Qt, "PenCapStyle", "RoundCap")
 _JOIN_ROUND = _e(Qt, "PenJoinStyle", "RoundJoin")
 _NO_BRUSH = _e(Qt, "BrushStyle", "NoBrush")
+_CHECKED = _e(Qt, "CheckState", "Checked")
+_UNCHECKED = _e(Qt, "CheckState", "Unchecked")
+_PARTIAL = _e(Qt, "CheckState", "PartiallyChecked")
+_ITEM_CHECKABLE = _e(Qt, "ItemFlag", "ItemIsUserCheckable")
+_CUSTOM_MENU = _e(Qt, "ContextMenuPolicy", "CustomContextMenu")
+_NO_FRAME = _e(QFrame, "Shape", "NoFrame")
+DOCK_AREAS = {"left": _e(Qt, "DockWidgetArea", "LeftDockWidgetArea"),
+              "right": _e(Qt, "DockWidgetArea", "RightDockWidgetArea"),
+              "top": _e(Qt, "DockWidgetArea", "TopDockWidgetArea"),
+              "bottom": _e(Qt, "DockWidgetArea", "BottomDockWidgetArea")}
 
 
 def _sl_prop(name):
@@ -145,6 +168,16 @@ OVERLAY_PROP = "traccar_overlay"
 WGS84 = QgsCoordinateReferenceSystem("EPSG:4326")
 
 # Time window choices: minutes > 0 = moving "Last …", -1 = custom dates, -2 = from feature
+# Location formats shown in the device list and offered by Copy location
+COORD_FORMATS = [("latlon", "Lat / Long"), ("project", "Project CRS"), ("custom", "Custom CRS"),
+                 ("ig", "Irish Grid"), ("uk", "UK Grid")]
+W3W_URL = "https://api.what3words.com/v3"
+W3W_KEY_SETTING = "TraccarLive/w3w_key"     # in QGIS's password manager (encrypted)
+_MENU_COL = 6                               # the ⋯ column of the device list
+# Playback speed: seconds of track per real second
+PLAY_SPEEDS = [("1×", 1), ("10×", 10), ("1 min / s", 60), ("5 min / s", 300),
+               ("15 min / s", 900), ("1 h / s", 3600)]
+
 WINDOW_CHOICES = [
     ("Last 15 minutes", 15), ("Last 30 minutes", 30), ("Last 1 hour", 60),
     ("Last 2 hours", 120), ("Last 3 hours", 180), ("Last 6 hours", 360),
@@ -181,6 +214,13 @@ DEFAULTS = {
     "tracks_layer_id": "", "tracks_name_field": "", "tracks_mode": 0,
     "tag_enabled": False, "tag_text": "", "tag_field": "", "tag_from_feature": False,
     "live_view": "canvas",          # "canvas" = drawn on the map, "layers" = Temp Markers / Temp Tracks
+    "hidden_devices": "",           # comma-separated Traccar device ids not shown (nor saved by the buttons)
+    "dock_area": "right", "dock_floating": False,
+    "coord_format": "latlon",       # Location column: one of COORD_FORMATS
+    "custom_crs": "EPSG:2157",      # "Custom CRS" location format
+    "latlon_style": "dd",           # lat / long as "dd" decimal degrees, "dm" deg + min, "dms" deg + min + sec
+    "latlon_hemi": "signs",         # "signs" (-6.31) or "letters" (6.31 W)
+    "play_speed": 60,               # playback: seconds of track per real second
     "v2_migrated": False,
 }
 
@@ -249,6 +289,21 @@ def _qdt(dt):
     return QDateTime.fromMSecsSinceEpoch(int(dt.timestamp() * 1000)).toUTC()
 
 
+def _speed_text(pos):
+    """Traccar speed (knots) → '12 km/h'; '' without a position."""
+    return ("%d km/h" % round((pos.get("speed") or 0) * 1.852)) if pos else ""
+
+
+def _battery_text(pos):
+    bat = ((pos or {}).get("attributes") or {}).get("batteryLevel")
+    return ("%g%%" % float(bat)) if isinstance(bat, (int, float)) else ""
+
+
+def _qdt_local(dt):
+    """aware datetime → QDateTime in local time (for date/time pickers)."""
+    return QDateTime.fromMSecsSinceEpoch(int(dt.timestamp() * 1000))
+
+
 def _fmt_local(dt):
     return dt.astimezone().strftime("%d %b %H:%M") if dt else "—"
 
@@ -286,6 +341,68 @@ def _age_text(dt):
     if s < 86400:
         return "%d h" % (s // 3600)
     return "%d d" % (s // 86400)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Grid references (same letters and layout as the QField plugin Conversion_tools)
+# ════════════════════════════════════════════════════════════════════════════
+
+_IG_LETTERS = "VWXYZQRSTULMNOPFGHJKABCDE"     # Irish Grid 100 km squares, rows from the south
+_OS_LETTERS = "ABCDEFGHJKLMNOPQRSTUVWXYZ"     # Ordnance Survey letters (no I)
+
+
+LATLON_STYLES = [("dd", "Decimal degrees  (53.365000)"),
+                 ("dm", "Degrees, minutes  (53° 21.900')"),
+                 ("dms", "Degrees, minutes, seconds  (53° 21' 54.00\")")]
+LATLON_HEMI = [("signs", "+ / −  (53.365000, -6.310000)"),
+               ("letters", "N / S / E / W  (53.365000 N, 6.310000 W)")]
+
+
+def _coord(value, hemispheres, style, letters):
+    """One latitude or longitude: decimal degrees ('dd'), degrees + minutes ('dm') or
+    + seconds ('dms'); with N/S/E/W (letters) or a minus sign for south / west."""
+    a = abs(value)
+    if style == "dm":
+        total = round(a * 60, 3)                          # rounded first: never shows 60.000'
+        deg = int(total // 60)
+        text = "%d° %06.3f'" % (deg, total - deg * 60)
+    elif style == "dms":
+        total = round(a * 3600, 2)
+        deg = int(total // 3600)
+        mins = int((total - deg * 3600) // 60)
+        text = "%d° %02d' %05.2f\"" % (deg, mins, total - deg * 3600 - mins * 60)
+    else:
+        text = "%.6f" % a
+    if letters:
+        return "%s %s" % (text, hemispheres[0] if value >= 0 else hemispheres[1])
+    nonzero = any(ch in "123456789" for ch in text)       # no "-0.000000"
+    return ("-" if value < 0 and nonzero else "") + text
+
+
+def format_latlon(lat, lon, style="dd", hemi="signs"):
+    """'lat, lon' — e.g. '53.365000, -6.310000', "53° 21.900' N, 6° 18.600' W",
+    '53° 21\' 54.00" N, 6° 18\' 36.00" W'."""
+    letters = hemi == "letters"
+    return "%s, %s" % (_coord(lat, "NS", style, letters), _coord(lon, "EW", style, letters))
+
+
+def irish_grid_ref(x, y):
+    """Irish Grid (EPSG:29903) easting / northing → 'H 54321 89797', or '' outside the grid."""
+    x, y = int(round(x)), int(round(y))
+    if not (0 <= x < 500000 and 0 <= y < 500000):
+        return ""
+    return "%s %05d %05d" % (_IG_LETTERS[(y // 100000) * 5 + x // 100000], x % 100000, y % 100000)
+
+
+def uk_grid_ref(x, y):
+    """British National Grid (EPSG:27700) easting / northing → 'NS 45140 72887', or '' outside."""
+    x, y = int(round(x)), int(round(y))
+    if not (0 <= x < 700000 and 0 <= y < 1300000):
+        return ""
+    e, n = x // 100000, y // 100000
+    first = (19 - n) - (19 - n) % 5 + (e + 10) // 5        # 500 km square
+    second = (19 - n) * 5 % 25 + e % 5                     # 100 km square within it
+    return "%s%s %05d %05d" % (_OS_LETTERS[first], _OS_LETTERS[second], x % 100000, y % 100000)
 
 
 def _device_color(name):
@@ -464,7 +581,7 @@ class _LiveItem(QgsMapCanvasItem):
     def __init__(self, canvas):
         super().__init__(canvas)
         self._canvas = canvas
-        self.tracks = []     # [(QColor, [QgsPointXY])]
+        self.tracks = []     # [(QColor, QPolygonF in map coordinates)]
         self.markers = []     # [{"pt", "acc_pt", "color", "label", "tip"}]
         self.show_markers = self.show_labels = self.show_tracks = True
         self.show_accuracy = False
@@ -474,6 +591,18 @@ class _LiveItem(QgsMapCanvasItem):
     def updatePosition(self):
         self.setRect(self._canvas.mapSettings().visibleExtent())
 
+    def _map_to_item(self, off):
+        """Map coordinates → item pixels as one affine transform (pan, zoom and rotation)."""
+        ext = self._canvas.extent()
+        c, d = ext.center(), (max(ext.width(), ext.height()) or 1.0)
+        p0 = self.toCanvasCoordinates(c) - off
+        px = self.toCanvasCoordinates(QgsPointXY(c.x() + d, c.y())) - off
+        py = self.toCanvasCoordinates(QgsPointXY(c.x(), c.y() + d)) - off
+        m11, m12 = (px.x() - p0.x()) / d, (px.y() - p0.y()) / d
+        m21, m22 = (py.x() - p0.x()) / d, (py.y() - p0.y()) / d
+        return QTransform(m11, m12, m21, m22,
+                          p0.x() - m11 * c.x() - m21 * c.y(), p0.y() - m12 * c.x() - m22 * c.y())
+
     def paint(self, painter, _option=None, _widget=None):
         off = self.pos()
 
@@ -481,15 +610,20 @@ class _LiveItem(QgsMapCanvasItem):
             return self.toCanvasCoordinates(pt) - off
 
         painter.setRenderHint(_ANTIALIAS, True)
-        if self.show_tracks:
-            for color, pts in self.tracks:
+        if self.show_tracks and self.tracks:
+            # Every vertex, drawn natively: the map → screen step is one transform, not a Python loop
+            painter.save()
+            painter.setTransform(self._map_to_item(off), True)
+            for color, poly in self.tracks:
                 pen = QPen(color)
                 pen.setWidthF(3.0)
+                pen.setCosmetic(True)          # 3 px whatever the transform's scale
                 pen.setCapStyle(_CAP_ROUND)
                 pen.setJoinStyle(_JOIN_ROUND)
                 painter.setPen(pen)
                 painter.setBrush(QBrush(_NO_BRUSH))
-                painter.drawPolyline(QPolygonF([px(p) for p in pts]))
+                painter.drawPolyline(poly)
+            painter.restore()
         if not self.show_markers:
             return
         font = QFont()
@@ -517,26 +651,18 @@ class _LiveItem(QgsMapCanvasItem):
                 painter.fillPath(path, QBrush(m["color"].darker(130)))
 
 
-def _decimate(items, max_n):
-    """At most max_n items, evenly spaced, always keeping the first and last."""
-    if len(items) <= max_n:
-        return items
-    step = (len(items) - 1) / float(max_n - 1)
-    return [items[int(round(i * step))] for i in range(max_n)]
-
-
 # ════════════════════════════════════════════════════════════════════════════
-#  Main window (non-modal pop-up)
+#  Main panel (dock widget: docked, tabbed or floating)
 # ════════════════════════════════════════════════════════════════════════════
 
-class MainDialog(QDialog):
+class MainDock(QgsDockWidget):
     def __init__(self, plugin, parent):
-        super().__init__(parent)
+        super().__init__("Traccar Live", parent)
         self.p = plugin
-        self.setWindowTitle("Traccar Live")
-        self.setModal(False)
-        self.setMinimumWidth(460)
-        root = QVBoxLayout(self)
+        self.setObjectName("TraccarLiveDock")
+        body = QWidget()
+        body.setMinimumWidth(320)
+        root = QVBoxLayout(body)
 
         # ── Time window ───────────────────────────────────────────────────
         tw = QGroupBox("Time window")
@@ -616,8 +742,10 @@ class MainDialog(QDialog):
 
         # ── Devices ───────────────────────────────────────────────────────
         head = QHBoxLayout()
-        self.devices_lbl = QLabel("Devices")
+        self.devices_lbl = QCheckBox("Devices")       # also select all / none
+        self.devices_lbl.setTristate(True)
         self.devices_lbl.setStyleSheet("font-weight:bold;")
+        self.devices_lbl.setToolTip("Show all devices — or, when all are shown, hide them all")
         self.updated_lbl = QLabel()
         self.updated_lbl.setStyleSheet("color:#777;")
         self.zoom_all_btn = QToolButton()
@@ -628,25 +756,79 @@ class MainDialog(QDialog):
         head.addWidget(self.zoom_all_btn)
         root.addLayout(head)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Device", "Fixes", "Time span", "Speed", "Battery"])
+        loc = QHBoxLayout()
+        loc.addWidget(QLabel("Location as:"))
+        self.coord_combo = QComboBox()
+        loc.addWidget(self.coord_combo, 1)
+        root.addLayout(loc)
+
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Device", "Location", "Fixes", "Time span", "Speed", "Battery", ""])
         self.table.setEditTriggers(_NO_EDIT)
         self.table.setSelectionBehavior(_SEL_ROWS)
         self.table.verticalHeader().setVisible(False)
+        self.table.setContextMenuPolicy(_CUSTOM_MENU)
         hh = self.table.horizontalHeader()
         hh.setSectionResizeMode(0, _HV_STRETCH)
-        for c in range(1, 5):
+        for c in range(1, 7):
             hh.setSectionResizeMode(c, _HV_CONTENTS)
-        self.table.setToolTip("Double-click a device to centre the map on it")
+        self.table.setToolTip("Tick a device to show it on the map, double-click to centre the map "
+                              "on it, ⋯ or right-click for more (save to file, show only this…)")
         self.table.setMinimumHeight(140)
         root.addWidget(self.table, 1)
+
+        # ── Playback ──────────────────────────────────────────────────────
+        pb = QGroupBox("Playback")
+        pl = QVBoxLayout(pb)
+        r1 = QHBoxLayout()
+        self.pb_start = QToolButton()
+        self.pb_start.setText("⏮")
+        self.pb_start.setToolTip("Go to the first fix in the window")
+        self.pb_play = QToolButton()
+        self.pb_play.setText("▶")
+        self.pb_play.setCheckable(True)
+        self.pb_play.setToolTip("Play / pause the tracks in the time window")
+        self.pb_stop = QToolButton()
+        self.pb_stop.setText("■")
+        self.pb_stop.setToolTip("Leave playback — back to the latest positions")
+        self.pb_slider = QSlider(_e(Qt, "Orientation", "Horizontal"))
+        self.pb_slider.setToolTip("Drag to move through the time window")
+        for w in (self.pb_start, self.pb_play, self.pb_stop):
+            r1.addWidget(w)
+        r1.addWidget(self.pb_slider, 1)
+        pl.addLayout(r1)
+        r_at = QHBoxLayout()
+        self.pb_time = QDateTimeEdit()
+        self.pb_time.setCalendarPopup(True)
+        self.pb_time.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+        self.pb_time.setToolTip("Go to a time (local) in the tracks")
+        self.pb_pan = QToolButton()
+        self.pb_pan.setText("⌖")
+        self.pb_pan.setToolTip("Pan to the selected device where it is shown — "
+                               "or to all devices shown when none is selected")
+        r_at.addWidget(QLabel("At:"))
+        r_at.addWidget(self.pb_time, 1)
+        r_at.addWidget(self.pb_pan)
+        pl.addLayout(r_at)
+        r2 = QHBoxLayout()
+        self.pb_lbl = QLabel()
+        self.pb_lbl.setStyleSheet("color:#555;")
+        self.pb_speed = QComboBox()
+        for label, speed in PLAY_SPEEDS:
+            self.pb_speed.addItem(label, speed)
+        r2.addWidget(self.pb_lbl, 1)
+        r2.addWidget(QLabel("Speed:"))
+        r2.addWidget(self.pb_speed)
+        pl.addLayout(r2)
+        root.addWidget(pb)
 
         # ── Save ──────────────────────────────────────────────────────────
         save = QHBoxLayout()
         self.save_pos_btn = QPushButton("📍  Save positions")
         self.save_trk_btn = QPushButton("〰  Save tracks")
-        save.addWidget(self.save_pos_btn)
-        save.addWidget(self.save_trk_btn)
+        for b in (self.save_pos_btn, self.save_trk_btn):
+            b.setToolTip("Save the devices shown (ticked) to the layer chosen in Settings → Layers")
+            save.addWidget(b)
         root.addLayout(save)
         self.saves_to_lbl = QLabel()
         self.saves_to_lbl.setWordWrap(True)
@@ -657,12 +839,16 @@ class MainDialog(QDialog):
         foot = QHBoxLayout()
         self.settings_btn = QPushButton("Settings…")
         self.help_btn = QPushButton("Help")
-        close_btn = QPushButton("Close")
         foot.addWidget(self.settings_btn)
         foot.addWidget(self.help_btn)
         foot.addStretch()
-        foot.addWidget(close_btn)
         root.addLayout(foot)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(_NO_FRAME)
+        scroll.setWidget(body)
+        self.setWidget(scroll)
 
         # ── Wiring ────────────────────────────────────────────────────────
         self.window_combo.activated.connect(self._window_chosen)
@@ -678,16 +864,34 @@ class MainDialog(QDialog):
         self.chk_labels.toggled.connect(lambda on: self.p.set_show("show_labels", on))
         self.chk_tracks.toggled.connect(lambda on: self.p.set_show("show_tracks", on))
         self.chk_accuracy.toggled.connect(lambda on: self.p.set_show("show_accuracy", on))
+        self.coord_combo.activated.connect(
+            lambda _i: self.p.set_coord_format(self.coord_combo.currentData()))
+        self.pb_start.clicked.connect(self._play_from_start)
+        self.pb_play.toggled.connect(self.p.play)
+        self.pb_stop.clicked.connect(self.p.stop_playback)
+        self.pb_slider.valueChanged.connect(self._slider_moved)
+        self.pb_time.dateTimeChanged.connect(self._time_typed)
+        self.pb_pan.clicked.connect(lambda: self.p.pan_to_shown(self._selected_id()))
+        self.pb_speed.activated.connect(lambda _i: self.p.set_cfg("play_speed", self.pb_speed.currentData()))
         self.table.cellDoubleClicked.connect(self._zoom_row)
+        self.table.cellClicked.connect(self._cell_clicked)
+        self.table.itemChanged.connect(self._item_changed)
+        self.table.customContextMenuRequested.connect(
+            lambda pos: self._device_menu(self.table.rowAt(pos.y())))
         self.zoom_all_btn.clicked.connect(self.p.zoom_to_all)
-        self.save_pos_btn.clicked.connect(self.p.save_positions)
-        self.save_trk_btn.clicked.connect(self.p.save_tracks)
+        self.devices_lbl.clicked.connect(
+            lambda: self.p.hide_all() if all(r["shown"] for r in self._rows) else self.p.show_all())
+        self.save_pos_btn.clicked.connect(lambda: self.p.save_positions())
+        self.save_trk_btn.clicked.connect(lambda: self.p.save_tracks())
         self.saves_to_lbl.linkActivated.connect(lambda _l: self.p.open_settings(1))
         self.settings_btn.clicked.connect(lambda: self.p.open_settings(0))
         self.help_btn.clicked.connect(self.p.show_help)
-        close_btn.clicked.connect(self.close)
+        self.visibilityChanged.connect(lambda vis: vis and self.refresh())
+        self.dockLocationChanged.connect(self._area_changed)
+        self.topLevelChanged.connect(lambda floating: self.p.set_cfg("dock_floating", bool(floating)))
 
         self._rows = []
+        self._play_shown = False
 
     # ── State → widgets ───────────────────────────────────────────────────
     def load_state(self):
@@ -710,6 +914,11 @@ class MainDialog(QDialog):
             chk.blockSignals(False)
         if c["window_minutes"] == -2:
             self.reload_features()
+        self.coord_combo.clear()
+        for key, _label in COORD_FORMATS:
+            self.coord_combo.addItem(self.p.coord_label(key), key)
+        self.coord_combo.setCurrentIndex(max(0, self.coord_combo.findData(c["coord_format"])))
+        self.pb_speed.setCurrentIndex(max(0, self.pb_speed.findData(c["play_speed"])))
         self._sync_mode()
         self.refresh()
 
@@ -734,17 +943,68 @@ class MainDialog(QDialog):
 
         rows = self.p.device_rows
         self._rows = rows
-        self.devices_lbl.setText("Devices  (%d)" % len(rows))
+        shown = sum(1 for row in rows if row["shown"])
+        self.devices_lbl.setText("Devices  (%d)" % len(rows) if shown == len(rows)
+                                 else "Devices  (%d of %d shown)" % (shown, len(rows)))
+        self.devices_lbl.blockSignals(True)
+        self.devices_lbl.setCheckState(_CHECKED if rows and shown == len(rows)
+                                       else _UNCHECKED if shown == 0 else _PARTIAL)
+        self.devices_lbl.setEnabled(bool(rows))
+        self.devices_lbl.blockSignals(False)
+        self.table.blockSignals(True)
         self.table.setRowCount(len(rows))
         for r, row in enumerate(rows):
-            vals = [row["name"], row["fixes"], row["span"], row["speed"], row["battery"]]
+            vals = [row["name"], row["location"], row["fixes"], row["span"], row["speed"], row["battery"], "⋯"]
             for col, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
                 if col == 0:
-                    item.setForeground(QColor(row["color"] if row["fresh"] else "#9E9E9E"))
+                    item.setFlags(item.flags() | _ITEM_CHECKABLE)
+                    item.setCheckState(_CHECKED if row["shown"] else _UNCHECKED)
+                    item.setForeground(QColor(row["color"] if row["fresh"] and row["shown"] else "#9E9E9E"))
                     item.setToolTip(row["tip"])
+                elif col == _MENU_COL:
+                    item.setToolTip("Save to file, show only this device…")
                 self.table.setItem(r, col, item)
+        self.table.blockSignals(False)
         self.saves_to_lbl.setText(self.p.saves_to_html())
+        self.refresh_playback()
+
+    def refresh_playback(self):
+        """Slider, buttons and time label (called on every playback frame)."""
+        p = self.p
+        rng = p.play_range()
+        total = int((rng[1] - rng[0]).total_seconds()) if rng else 0
+        for w in (self.pb_start, self.pb_play, self.pb_slider, self.pb_time):
+            w.setEnabled(rng is not None)
+        self.pb_pan.setEnabled(bool(p.devices))
+        self.pb_stop.setEnabled(p.play_t is not None)
+        self.pb_slider.blockSignals(True)
+        self.pb_slider.setRange(0, total)
+        self.pb_slider.setValue(int((p.play_t - rng[0]).total_seconds()) if rng and p.play_t else total)
+        self.pb_slider.blockSignals(False)
+        if rng and not self.pb_time.hasFocus():          # don't fight the user typing a time
+            self.pb_time.blockSignals(True)
+            self.pb_time.setDateTimeRange(_qdt_local(rng[0]), _qdt_local(rng[1]))
+            self.pb_time.setDateTime(_qdt_local(p.play_t or rng[1]))
+            self.pb_time.blockSignals(False)
+        if p.play_t is not None or self._play_shown:     # Location, Speed, Battery: as shown on the map
+            self._play_shown = p.play_t is not None
+            for r, row in enumerate(self._rows):
+                pos = p.shown_pos(row["id"])
+                for col, text in ((1, p.format_location(pos) if pos else ""),
+                                  (4, _speed_text(pos)), (5, _battery_text(pos))):
+                    item = self.table.item(r, col)
+                    if item is not None:
+                        item.setText(text)
+        self.pb_play.blockSignals(True)
+        self.pb_play.setChecked(p.playing)
+        self.pb_play.setText("⏸" if p.playing else "▶")
+        self.pb_play.blockSignals(False)
+        if p.play_t is not None:
+            self.pb_lbl.setText(p.play_t.astimezone().strftime("%d %b %H:%M:%S") +
+                                ("  — playing" if p.playing else "  — paused"))
+        else:
+            self.pb_lbl.setText("Replay the window: ▶ or drag" if rng else "No tracks to replay")
 
     # ── Handlers ──────────────────────────────────────────────────────────
     def _window_chosen(self, _i):
@@ -781,12 +1041,98 @@ class MainDialog(QDialog):
         self.p.set_cfg("event_feature_fid", self.feature_combo.currentData())
 
     def _zoom_row(self, r, _c):
-        if 0 <= r < len(self._rows) and self._rows[r]["pos"] is not None:
-            self.p.zoom_to(self._rows[r]["pos"])
+        if 0 <= r < len(self._rows):
+            self.p.pan_to_shown(self._rows[r]["id"])
 
-    def closeEvent(self, ev):
-        QSettings().setValue(SETTINGS_NS + "/main_geometry", self.saveGeometry())
-        super().closeEvent(ev)
+    def _selected_id(self):
+        r = self.table.currentRow()
+        sel = self.table.selectionModel()
+        if sel is not None and sel.hasSelection() and 0 <= r < len(self._rows):
+            return self._rows[r]["id"]
+        return None
+
+    def _time_typed(self, qdt):
+        self.p.set_play_time(datetime.fromtimestamp(qdt.toMSecsSinceEpoch() / 1000, timezone.utc))
+
+    def _play_from_start(self):
+        rng = self.p.play_range()
+        if rng:
+            self.p.set_play_time(rng[0])
+
+    def _slider_moved(self, value):
+        rng = self.p.play_range()
+        if rng:
+            self.p.set_play_time(rng[0] + timedelta(seconds=value))
+
+    def _cell_clicked(self, r, c):
+        if c == _MENU_COL:
+            self._device_menu(r)
+
+    def _item_changed(self, item):
+        r = item.row()
+        if item.column() == 0 and 0 <= r < len(self._rows):
+            dev_id, on = self._rows[r]["id"], item.checkState() == _CHECKED
+            # Later: the table is rebuilt, and this item replaced, while Qt still emits its signal
+            QTimer.singleShot(0, lambda: self.p.set_device_shown(dev_id, on))
+
+    def _device_menu(self, r):
+        if not 0 <= r < len(self._rows):
+            return
+        row = self._rows[r]
+        dev_id = row["id"]
+        menu = QMenu(self.table)
+        pos = self.p.shown_pos(dev_id)
+        menu.addSection(row["name"] + ("  (at %s)" % pos["_t"].astimezone().strftime("%H:%M:%S")
+                                       if pos is not None and self.p.play_t is not None else ""))
+        act = menu.addAction("Pan to device", lambda: self.p.pan_to_shown(dev_id))
+        act.setEnabled(pos is not None)
+        menu.addAction("Show only this device", lambda: self.p.show_only(dev_id))
+        menu.addAction("Show all devices", self.p.show_all)
+        menu.addSeparator()
+        self._copy_menus(menu, row)
+        menu.addSeparator()
+        menu.addAction("💾  Save to file (GPX, GeoPackage, CSV)…", lambda: self.p.save_device_file(dev_id))
+        menu.addAction("📍  Save positions of this device", lambda: self.p.save_positions(only=dev_id))
+        menu.addAction("〰  Save track of this device", lambda: self.p.save_tracks(only=dev_id))
+        menu.exec(QCursor.pos())
+        menu.deleteLater()
+
+    def _copy_menus(self, menu, row):
+        """'Copy location' (each format, what3words, WKT) and 'Copy track' submenus."""
+        p, dev_id = self.p, row["id"]
+        pos = p.shown_pos(dev_id)              # in playback: where it is at the playback time
+        sub = menu.addMenu("📋  Copy location" + ("  (playback time)" if p.play_t is not None else ""))
+        sub.setEnabled(pos is not None)
+        if pos is not None:
+            for key, _label in COORD_FORMATS:
+                text = p.format_location(pos, key)
+                act = sub.addAction("%s:  %s" % (p.coord_label(key), text or "outside this grid / CRS"),
+                                    lambda t=text, k=key: p.copy_text(t, p.coord_label(k)))
+                act.setEnabled(bool(text))
+            sub.addAction("what3words" if p.w3w_key() else "what3words…  (add an API key in Settings)",
+                          lambda: p.copy_w3w(pos))
+            sub.addSeparator()
+            for crs, name in ((WGS84, "WGS84"), (QgsProject.instance().crs(), p.coord_label("project"))):
+                sub.addAction("WKT point (%s)" % name,
+                              lambda c=crs, n=name: p.copy_text(p.location_wkt(pos, c), "WKT point, " + n))
+        n = len(p.tracks.get(dev_id, []))
+        sub = menu.addMenu("📋  Copy track  (%d fixes in the window)" % n)
+        sub.setEnabled(n > 0)
+        for crs, name in ((WGS84, "WGS84"), (QgsProject.instance().crs(), p.coord_label("project"))):
+            sub.addAction("WKT LineString (%s)" % name,
+                          lambda c=crs, nm=name: p.copy_text(p.track_wkt(dev_id, c), "WKT track, " + nm))
+        sub.addAction("One location per line (%s)" % p.coord_label(),
+                      lambda: p.copy_text(p.track_lines(dev_id), "track, " + p.coord_label()))
+
+    def _area_changed(self, area):
+        for name, value in DOCK_AREAS.items():
+            if value == area:
+                self.p.set_cfg("dock_area", name)
+
+    def save_geometry(self):
+        """Remember where the panel floats (a docked panel's place is kept by dock_area)."""
+        if self.isFloating():
+            QSettings().setValue(SETTINGS_NS + "/dock_geometry", self.saveGeometry())
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -954,6 +1300,36 @@ class SettingsDialog(QDialog):
         gv.addWidget(self.view_layers)
         v.addWidget(g)
 
+        g = QGroupBox("Location")
+        gf = QFormLayout(g)
+        self.crs_widget = QgsProjectionSelectionWidget()
+        self.crs_widget.setCrs(QgsCoordinateReferenceSystem(c["custom_crs"]))
+        self.w3w_edit = QLineEdit()
+        self.w3w_edit.setEchoMode(_ECHO_PWD)
+        if plugin.w3w_key():
+            self.w3w_edit.setPlaceholderText("saved — leave blank to keep it")
+        self.w3w_forget = QCheckBox("Forget the saved key")
+        self.w3w_forget.setVisible(bool(plugin.w3w_key()))
+        self.latlon_combo = QComboBox()
+        for key, label in LATLON_STYLES:
+            self.latlon_combo.addItem(label, key)
+        self.latlon_combo.setCurrentIndex(max(0, self.latlon_combo.findData(c["latlon_style"])))
+        self.hemi_combo = QComboBox()
+        for key, label in LATLON_HEMI:
+            self.hemi_combo.addItem(label, key)
+        self.hemi_combo.setCurrentIndex(max(0, self.hemi_combo.findData(c["latlon_hemi"])))
+        gf.addRow("Lat / Long as:", self.latlon_combo)
+        gf.addRow("Hemisphere:", self.hemi_combo)
+        gf.addRow("Custom CRS:", self.crs_widget)
+        gf.addRow("what3words API key:", self.w3w_edit)
+        gf.addRow(self.w3w_forget)
+        hint = QLabel("what3words needs an API plan that includes <i>convert-to-3wa</i>. "
+                      "The key is kept in QGIS's password manager.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666;")
+        gf.addRow(hint)
+        v.addWidget(g)
+
         g = QGroupBox("Time window 'From feature'")
         gf = QFormLayout(g)
         self.ev_combo = QgsMapLayerComboBox()
@@ -1061,6 +1437,11 @@ class SettingsDialog(QDialog):
             "tag_from_feature":  self.tag_feat.isChecked(),
             "live_interval_s":   self.interval_spin.value(),
             "live_view":         "layers" if self.view_layers.isChecked() else "canvas",
+            "custom_crs":        self.crs_widget.crs().authid() or self.p.cfg["custom_crs"],
+            "latlon_style":      self.latlon_combo.currentData(),
+            "latlon_hemi":       self.hemi_combo.currentData(),
+            "w3w_key":           self.w3w_edit.text().strip(),
+            "w3w_forget":        self.w3w_forget.isChecked(),
             "stale_minutes":     self.stale_spin.value(),
             "event_layer_id":      ev.id() if ev else "",
             "event_display_field": self.ev_disp.currentField() if ev else "",
@@ -1087,9 +1468,39 @@ buttons save exactly that.</p>
 Settings → Advanced).</li>
 </ul>
 <p>Each device row shows how many fixes it has in the window and their time span.</p>
+<h3>Devices</h3>
+<ul>
+<li><b>Tick / untick</b> a device to show or hide it on the map. Hidden devices are also left out of
+<i>Zoom to all</i> and the Save buttons, and stay hidden next time.</li>
+<li>The <b>Devices</b> tick box selects all / none: it shows every device, or hides them all when all are shown.</li>
+<li><b>Double-click</b> a device to centre the map on it.</li>
+<li><b>⋯</b> (or right-click) for: <i>Show only this device</i>, <i>Show all devices</i>,
+<b>Save to file</b> — GPX (a track of the fixes in the window, with times and altitude, plus a waypoint
+at the last fix), GeoPackage (the same two tables as below) or CSV (one row per fix) — and saving just
+this device to your positions / tracks layers.</li>
+<li><b>Copy location</b> (in the ⋯ menu) puts the device's position on the clipboard as Lat / Long,
+Project CRS, a Custom CRS, Irish Grid (<i>O 15904 34671</i>), UK Grid (<i>NS 45140 72887</i>),
+<b>what3words</b> or a WKT point. <b>Copy track</b> copies the fixes in the window as a WKT LineString,
+or one location per line.</li>
+<li><b>Location as</b> chooses the format of the <i>Location</i> column and the marker tooltips.
+Lat / long as decimal degrees, degrees + minutes or degrees + minutes + seconds (with N/S/E/W or +/−),
+the custom CRS and the what3words API key are set in Settings → Advanced → Location; what3words
+needs a plan that includes <i>convert-to-3wa</i>, and is only asked when you copy.</li>
+</ul>
+<h3>Playback</h3>
+<p>Replays the tracks in the time window. Click <b>▶</b> to play (pause with <b>⏸</b>), drag the slider to
+move through time, or type / pick a time in <b>At:</b> to go straight to it; <b>⏮</b> goes back to the
+first fix, and <b>Speed</b> runs from 1× (real time) to 1 hour per second. <b>⌖</b> pans to the selected
+device where it is at that moment (or to all devices shown when none is selected); double-click and
+<i>Pan to device</i> do the same, and <i>Copy location</i> in the ⋯ menu copies that position. The Location, Speed and Battery
+columns show each device as it was at the playback time. Between fixes the accuracy circle uses the
+larger of the two fixes' accuracy: the device was somewhere inside it. Each device's marker moves smoothly between its fixes and its track is drawn up to that
+moment, with the rest of the track faint underneath (drawn-on-map view). Only the devices ticked in the
+list are played. <b>■</b> leaves playback and shows the latest positions again; changing the time window
+or <i>Clear</i> does too. Live updates keep coming in during playback.</p>
 <h3>Live, Refresh and Clear</h3>
 <p><b>▶ Live</b> refreshes in the background and keeps a “Last …” window moving. You can close this
-window — Live keeps running; the <b>▶ Live</b> toolbar button starts and stops it. A window that ends
+panel — Live keeps running; the <b>▶ Live</b> toolbar button starts and stops it. A window that ends
 in the past cannot change, so Live pauses for it and the markers show each device's last fix in it.
 <b>↻ Refresh</b> loads the window once; <b>Clear</b> stops Live and removes the overlay.</p>
 <h3>On the map</h3>
@@ -1102,10 +1513,14 @@ they are separate from the layers you save to (e.g. <i>Traccar Positions</i> / <
 In both views each
 device has its own colour (grey when its last fix is older than the limit in Settings → Advanced),
 nothing is written to file, and QGIS won't ask to save anything. Switch Markers, Labels, Tracks and
-Accuracy circles on or off in the main window.
-Double-click a device in the list to centre the map on it.</p>
+Accuracy circles on or off in the panel.</p>
+<h3>The panel</h3>
+<p>The Traccar Live panel docks on the right of the map by default. Drag its title bar to dock it
+elsewhere or tab it with other panels, or click its float button to use it as a separate window; it
+opens where you left it. The <b>Traccar Live</b> toolbar button shows and hides it.</p>
 <h3>Saving</h3>
-<p><b>📍 Save positions</b> adds a point per device — its latest fix, or every fix in the window.<br>
+<p>The Save buttons save the devices shown (ticked) in the list.<br>
+<b>📍 Save positions</b> adds a point per device — its latest fix, or every fix in the window.<br>
 <b>〰 Save tracks</b> adds one line per device for the window (Z = altitude, M = time), or replaces
 that device's earlier track if <i>Keep only the most recent</i> is chosen.<br>
 Fields are filled by name; fields your layer doesn't have are skipped. The device name can also
@@ -1136,8 +1551,10 @@ class TraccarLive:
         self.api = _Api(self.cfg, self._credentials)
         self.timer = QTimer()
         self.timer.timeout.connect(self.poll_live)
+        self.play_timer = QTimer()
+        self.play_timer.timeout.connect(self._play_tick)
         self._actions = []
-        self.dlg = None
+        self.dock = None
 
         # Runtime state
         self.live = False
@@ -1155,15 +1572,23 @@ class TraccarLive:
         self._mk_id = ""            # Temp layer ids ("layers" live view)
         self._tk_id = ""
         self._item = None          # canvas item ("canvas" live view)
+        self._line_cache = {}      # dev_id → (fixes list, map CRS, [QPointF], QPolygonF) for drawing tracks
         self._tip_on = False
+        self._w3w = None           # what3words API key, read from the password manager when first needed
+        self.play_t = None         # playback time (aware UTC datetime), None = not in playback
+        self.playing = False
+        self._play_clock = 0.0
+        self._pb_src, self._pb_times = None, {}    # fix times (epoch s) per device, for bisect
+        self._w3w_reply = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
     def initGui(self):
         mw = self.iface.mainWindow()
         self.act_open = QAction(QIcon(os.path.join(os.path.dirname(__file__), "icon.png")),
                                 "Traccar Live", mw)
-        self.act_open.setToolTip("Traccar Live — time window, devices and saving")
-        self.act_open.triggered.connect(self.open_main)
+        self.act_open.setToolTip("Traccar Live — show / hide the panel (time window, devices, saving)")
+        self.act_open.setCheckable(True)
+        self.act_open.toggled.connect(self._toggle_panel)
         self.act_live = QAction("▶ Live", mw)
         self.act_live.setCheckable(True)
         self.act_live.setToolTip("Traccar Live: start / stop live updates")
@@ -1186,6 +1611,7 @@ class TraccarLive:
 
     def unload(self):
         self.timer.stop()
+        self.play_timer.stop()
         self.api.abort_all()
         canvas = self.iface.mapCanvas()
         for sig, slot in ((QgsProject.instance().readProject, self._on_project_changed),
@@ -1197,10 +1623,11 @@ class TraccarLive:
             except (TypeError, RuntimeError):
                 pass
         self._remove_overlays()
-        if self.dlg is not None:
-            self.dlg.close()
-            self.dlg.deleteLater()
-            self.dlg = None
+        if self.dock is not None:
+            self.dock.save_geometry()
+            self.iface.removeDockWidget(self.dock)
+            self.dock.deleteLater()
+            self.dock = None
         for act in self._actions:
             self.iface.removePluginMenu(MENU_LABEL, act)
             self.iface.removeToolBarIcon(act)
@@ -1285,15 +1712,32 @@ class TraccarLive:
 
     # ── Windows ───────────────────────────────────────────────────────────
     def open_main(self):
-        if self.dlg is None:
-            self.dlg = MainDialog(self, self.iface.mainWindow())
-            geo = QSettings().value(SETTINGS_NS + "/main_geometry")
-            if geo:
-                self.dlg.restoreGeometry(geo)
-        self.dlg.load_state()
-        self.dlg.show()
-        self.dlg.raise_()
-        self.dlg.activateWindow()
+        """Show the panel where it was last: docked (right by default), tabbed or floating."""
+        if self.dock is None:
+            self.dock = MainDock(self, self.iface.mainWindow())
+            self.iface.addDockWidget(DOCK_AREAS.get(self.cfg["dock_area"], DOCK_AREAS["right"]), self.dock)
+            if self.cfg["dock_floating"]:
+                self.dock.setFloating(True)
+                geo = QSettings().value(SETTINGS_NS + "/dock_geometry")
+                if geo:
+                    self.dock.restoreGeometry(geo)
+            self.dock.openedStateChanged.connect(self._panel_opened)
+            self.dock.closed.connect(self.dock.save_geometry)
+        self.dock.load_state()
+        self.dock.setUserVisible(True)
+        self.dock.raise_()
+
+    def _toggle_panel(self, on):
+        if on:
+            self.open_main()
+        elif self.dock is not None:
+            self.dock.save_geometry()
+            self.dock.setUserVisible(False)
+
+    def _panel_opened(self, opened):
+        self.act_open.blockSignals(True)
+        self.act_open.setChecked(bool(opened))
+        self.act_open.blockSignals(False)
 
     def open_settings(self, tab=0):
         dlg = SettingsDialog(self, self.iface.mainWindow(), tab)
@@ -1307,6 +1751,9 @@ class TraccarLive:
             interval_changed = vals["live_interval_s"] != self.cfg["live_interval_s"]
             view_changed = vals["live_view"] != self.cfg["live_view"]
             url, user, pwd = vals.pop("server_url"), vals.pop("username"), vals.pop("password")
+            w3w, forget = vals.pop("w3w_key"), vals.pop("w3w_forget")
+            if w3w or forget:
+                self.set_w3w_key("" if forget else w3w)
             for k, v in vals.items():
                 self.cfg[k] = v
             if pwd or url != self.cfg["server_url"] or user != self.cfg["username"]:
@@ -1317,8 +1764,8 @@ class TraccarLive:
             if interval_changed and self.timer.isActive():
                 self.timer.start(int(self.cfg["live_interval_s"]) * 1000)
             self._rebuild()
-            if self.dlg is not None and self.dlg.isVisible():
-                self.dlg.load_state()
+            if self.dock is not None and self.dock.isVisible():
+                self.dock.load_state()
 
     def show_help(self):
         d = QDialog(self.iface.mainWindow())
@@ -1335,8 +1782,8 @@ class TraccarLive:
         d.deleteLater()
 
     def _ui(self):
-        if self.dlg is not None and self.dlg.isVisible():
-            self.dlg.refresh()
+        if self.dock is not None and self.dock.isVisible():
+            self.dock.refresh()
         tip = "Traccar Live: " + ("on" if self.live else "off")
         if self.last_update:
             tip += " — updated %s, %d device(s)" % (self.last_update, len(self.devices))
@@ -1382,6 +1829,7 @@ class TraccarLive:
         self._ui()
 
     def clear(self):
+        self.stop_playback()
         if self.live:
             self.set_live(False)
         self.api.abort_all()
@@ -1393,6 +1841,7 @@ class TraccarLive:
         self._rebuild()
 
     def reload_window(self):
+        self.stop_playback()
         self.win = None
         self.tracks, self.latest, self.marker_pos = {}, {}, {}
         self.load_window()
@@ -1627,23 +2076,24 @@ class TraccarLive:
             mp = {k: v[-1] for k, v in self.tracks.items() if v}
         self.marker_pos = mp
 
-        rows = []
+        rows, hidden = [], self.hidden_ids()
         for dev_id, info in self.devices.items():
             tr = self.tracks.get(dev_id, [])
             pos = mp.get(dev_id)
-            attrs = (pos or {}).get("attributes") or {}
-            bat = attrs.get("batteryLevel")
             rows.append({
+                "id":      dev_id,
+                "shown":   dev_id not in hidden,
                 "name":    info["name"],
                 "fixes":   len(tr) if tr else "—",
                 "span":    (_span_text(tr[0]["_t"], tr[-1]["_t"]) if len(tr) > 1
                             else _fmt_local(tr[0]["_t"]) if tr else "no fixes in window"),
-                "speed":   ("%d km/h" % round((pos.get("speed") or 0) * 1.852)) if pos else "",
-                "battery": ("%g%%" % float(bat)) if isinstance(bat, (int, float)) else "",
+                "speed":   _speed_text(pos),
+                "battery": _battery_text(pos),
                 "pos":     pos,
                 "fresh":   self._fresh(pos["_t"]) if pos else False,
                 "color":   _device_color(info["name"]),
                 "tip":     ("Last fix %s ago" % _age_text(pos["_t"])) if pos else "No position",
+                "location": self.format_location(pos) if pos else "",
             })
         rows.sort(key=lambda r: r["name"].lower())
         self.device_rows = rows
@@ -1765,6 +2215,108 @@ class TraccarLive:
         else:
             self._update_canvas()
 
+    # ── Playback ──────────────────────────────────────────────────────────
+    def play_range(self):
+        """(first, last) fix time of the shown devices' tracks in the window, or None."""
+        shown = [v for v in self._shown(self.tracks).values() if v]
+        if not shown:
+            return None
+        return min(v[0]["_t"] for v in shown), max(v[-1]["_t"] for v in shown)
+
+    def set_play_time(self, t):
+        """Enter (or move) playback at time t, clamped to the tracks."""
+        rng = self.play_range()
+        if rng is None:
+            return
+        self.play_t = min(max(t, rng[0]), rng[1])
+        self._play_frame()
+
+    def play(self, on=True):
+        rng = self.play_range()
+        if on and rng is None:
+            self._bar("Nothing to play back — no fixes in this window", _MSG_WARN)
+            on = False
+        if on:
+            if self.play_t is None or self.play_t >= rng[1]:
+                self.play_t = rng[0]
+            self._play_clock = time.monotonic()
+            self.play_timer.start(100)
+        else:
+            self.play_timer.stop()
+        self.playing = on
+        self._play_frame()
+
+    def stop_playback(self):
+        """Leave playback: the map shows the latest positions again."""
+        self.play_timer.stop()
+        self.playing = False
+        if self.play_t is not None:
+            self.play_t = None
+            if self.win is not None:
+                self._update_overlays()
+        self._play_frame()
+
+    def _play_tick(self):
+        now = time.monotonic()
+        dt, self._play_clock = now - self._play_clock, now
+        rng = self.play_range()
+        if rng is None or self.play_t is None:
+            self.stop_playback()
+            return
+        t = self.play_t + timedelta(seconds=dt * float(self.cfg["play_speed"]))
+        if t >= rng[1]:                      # reached the end: pause there
+            t = rng[1]
+            self.play_timer.stop()
+            self.playing = False
+        self.play_t = t
+        self._play_frame()
+
+    def _play_frame(self):
+        if self.play_t is not None and self.win is not None:
+            self._update_overlays()
+        if self.dock is not None and self.dock.isVisible():
+            self.dock.refresh_playback()
+
+    def _play_times(self):
+        if self._pb_src is not self.tracks:      # tracks replaced by a load / Live update
+            self._pb_src = self.tracks
+            self._pb_times = {k: [p["_t"].timestamp() for p in v] for k, v in self.tracks.items()}
+        return self._pb_times
+
+    def _overlay_data(self):
+        """({dev_id: track fixes}, {dev_id: marker fix}) to draw for the shown devices.
+        In playback: each track up to the playback time, ending at a point interpolated
+        between the two fixes either side of it, which is also where the marker goes."""
+        tracks = self._shown(self.tracks)
+        if self.play_t is None:
+            return tracks, self._shown(self.marker_pos)
+        times, t = self._play_times(), self.play_t.timestamp()
+        out_tracks, out_markers = {}, {}
+        for dev_id, pts in tracks.items():
+            ts = times.get(dev_id) or []
+            i = bisect.bisect_right(ts, t)
+            if i == 0 or len(ts) != len(pts):    # not started yet
+                continue
+            done = pts[:i]
+            if i < len(pts) and t > ts[i - 1]:
+                a, b = pts[i - 1], pts[i]
+                f = (t - ts[i - 1]) / (ts[i] - ts[i - 1])
+
+                def mid(key):
+                    return float(a.get(key) or 0) + f * (float(b.get(key) or 0) - float(a.get(key) or 0))
+                # Accuracy: the larger of the two fixes' — "the device was somewhere in here",
+                # never more precise than either real fix (0 = unknown, as Traccar reports it)
+                acc = max(float(a.get("accuracy") or 0), float(b.get("accuracy") or 0))
+                done = done + [dict(a, latitude=mid("latitude"), longitude=mid("longitude"),
+                                    altitude=mid("altitude"), speed=mid("speed"), accuracy=acc, _t=self.play_t)]
+            out_tracks[dev_id] = done
+            out_markers[dev_id] = done[-1]
+        return out_tracks, out_markers
+
+    def _overlay_fresh(self, t):
+        """Colour (not grey) on the map: always in playback, where 'stale' means nothing."""
+        return self.play_t is not None or self._fresh(t)
+
     # ── Drawn on the map ──────────────────────────────────────────────────
     def _apply_item_flags(self):
         it = self._item
@@ -1776,11 +2328,16 @@ class TraccarLive:
     def _marker_tip(self, dev_id, p):
         attrs = p.get("attributes") or {}
         bat = attrs.get("batteryLevel")
-        tip = "%s\nFix %s ago  (%s)\n%d km/h" % (
-            self._name(dev_id), _age_text(p["_t"]), _fmt_local(p["_t"]),
-            round((p.get("speed") or 0) * 1.852))
+        if self.play_t is not None:
+            when = "Playback  %s" % p["_t"].astimezone().strftime("%d %b %H:%M:%S")
+        else:
+            when = "Fix %s ago  (%s)" % (_age_text(p["_t"]), _fmt_local(p["_t"]))
+        tip = "%s\n%s\n%d km/h" % (self._name(dev_id), when, round((p.get("speed") or 0) * 1.852))
         if isinstance(bat, (int, float)):
             tip += "  ·  battery %g%%" % float(bat)
+        loc = self.format_location(p)
+        if loc:
+            tip += "\n%s:  %s" % (self.coord_label(), loc)
         return tip
 
     def _update_canvas(self):
@@ -1792,15 +2349,47 @@ class TraccarLive:
         def T(lon, lat):
             return tr.transform(QgsPointXY(lon, lat))
 
+        dest = canvas.mapSettings().destinationCrs()
+        crs_key = dest.authid() or dest.toWkt()
+
+        def full_line(dev_id, pts):
+            """Every fix of the track in the map CRS ([QPointF]); reprojected once, until it changes."""
+            c = self._line_cache.get(dev_id)
+            if c is None or c[0] is not pts or c[1] != crs_key:
+                g = QgsGeometry(QgsLineString([p["longitude"] for p in pts], [p["latitude"] for p in pts]))
+                g.transform(tr)
+                poly = g.asQPolygonF()
+                # PyQt's items view the polygon's memory: keep the polygon alive alongside them
+                c = (pts, crs_key, list(poly), poly)
+                self._line_cache[dev_id] = c
+            return c[2]
+
+        trk, mk = self._overlay_data()
         tracks, markers = [], []
         try:
-            for dev_id, pts in self.tracks.items():
+            full = self._shown(self.tracks)
+            if self.play_t is not None:          # the whole track, faint, under the part played
+                for dev_id, pts in full.items():
+                    if len(pts) >= 2:
+                        col = QColor(_device_color(self._name(dev_id)))
+                        col.setAlpha(70)
+                        tracks.append((col, QPolygonF(full_line(dev_id, pts))))
+            for dev_id, pts in trk.items():
                 if len(pts) < 2:
                     continue
-                col = QColor(_device_color(self._name(dev_id)) if self._fresh(pts[-1]["_t"]) else "#9E9E9E")
+                # The fixes played so far are the start of the full track: draw exactly those
+                # vertices (never resampled, so the route can't change shape), plus the moving end.
+                allpts = full[dev_id]
+                n = len(pts)
+                moving = n > len(allpts) or pts[-1] is not allpts[n - 1]
+                verts = full_line(dev_id, allpts)[:n - 1 if moving else n]
+                if moving:
+                    q = T(pts[-1]["longitude"], pts[-1]["latitude"])
+                    verts = verts + [QPointF(q.x(), q.y())]
+                col = QColor(_device_color(self._name(dev_id)) if self._overlay_fresh(pts[-1]["_t"]) else "#9E9E9E")
                 col.setAlpha(215)
-                tracks.append((col, [T(p["longitude"], p["latitude"]) for p in _decimate(pts, 2000)]))
-            for dev_id, p in self.marker_pos.items():
+                tracks.append((col, QPolygonF(verts)))
+            for dev_id, p in mk.items():
                 acc = float(p.get("accuracy") or 0)
                 acc_pt = None
                 if acc > 0:      # a point `acc` metres east → circle radius in any map CRS
@@ -1809,7 +2398,7 @@ class TraccarLive:
                 name = self._name(dev_id)
                 markers.append({
                     "pt": T(p["longitude"], p["latitude"]), "acc_pt": acc_pt,
-                    "color": QColor(_device_color(name) if self._fresh(p["_t"]) else "#9E9E9E"),
+                    "color": QColor(_device_color(name) if self._overlay_fresh(p["_t"]) else "#9E9E9E"),
                     "label": name, "tip": self._marker_tip(dev_id, p)})
         except Exception as exc:          # e.g. a map CRS that can't take these points
             self._log("Could not draw the live view: %s" % exc, _MSG_WARN)
@@ -1850,16 +2439,17 @@ class TraccarLive:
 
     # ── As temporary layers ───────────────────────────────────────────────
     def _update_layers(self):
+        trk, mk_data = self._overlay_data()
         mk = self._overlay("markers")
         feats = []
-        for dev_id, p in self.marker_pos.items():
+        for dev_id, p in mk_data.items():
             f = QgsFeature(mk.fields())
             f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(p["longitude"], p["latitude"])))
             attrs = p.get("attributes") or {}
             name = self._name(dev_id)
             f.setAttributes([dev_id, name, _qdt(p["_t"]), _local_text(p["_t"]),
                              round((p.get("speed") or 0) * 1.852, 1), attrs.get("batteryLevel"),
-                             p.get("accuracy") or 0.0, 1 if self._fresh(p["_t"]) else 0,
+                             p.get("accuracy") or 0.0, 1 if self._overlay_fresh(p["_t"]) else 0,
                              _device_color(name)])
             feats.append(f)
         mk.dataProvider().truncate()
@@ -1869,7 +2459,7 @@ class TraccarLive:
 
         tk = self._overlay("tracks")
         feats = []
-        for dev_id, pts in self.tracks.items():
+        for dev_id, pts in trk.items():
             if len(pts) < 2:
                 continue
             line = QgsLineString([p["longitude"] for p in pts], [p["latitude"] for p in pts],
@@ -1879,7 +2469,7 @@ class TraccarLive:
             f = QgsFeature(tk.fields())
             f.setGeometry(QgsGeometry(line))
             f.setAttributes([dev_id, name, len(pts), _local_text(pts[0]["_t"]),
-                             _local_text(pts[-1]["_t"]), 1 if self._fresh(pts[-1]["_t"]) else 0,
+                             _local_text(pts[-1]["_t"]), 1 if self._overlay_fresh(pts[-1]["_t"]) else 0,
                              _device_color(name)])
             feats.append(f)
         tk.dataProvider().truncate()
@@ -1894,6 +2484,7 @@ class TraccarLive:
             except (RuntimeError, AttributeError):
                 pass
             self._item = None
+            self._line_cache = {}
             self.iface.mapCanvas().refresh()
         prj = QgsProject.instance()
         for lid in (self._mk_id, self._tk_id):
@@ -1935,8 +2526,40 @@ class TraccarLive:
         canvas.setCenter(tr.transform(QgsPointXY(pos["longitude"], pos["latitude"])))
         canvas.refresh()
 
+    def shown_pos(self, dev_id):
+        """Where the device is shown on the map: its playback position, or its marker fix."""
+        if self.play_t is not None:
+            return self._overlay_data()[1].get(dev_id)
+        return self.marker_pos.get(dev_id)
+
+    def pan_to_shown(self, dev_id=None):
+        """Pan to a device where it is shown (playback position included), or fit all shown devices."""
+        if dev_id is not None:
+            pos = self.shown_pos(dev_id)
+            if pos is None:
+                self._bar("%s isn't on the map at this time" % self._name(dev_id), _MSG_WARN, 3)
+            else:
+                self.zoom_to(pos)
+            return
+        pts = list(self._overlay_data()[1].values())
+        if len(pts) == 1:
+            self.zoom_to(pts[0])
+        elif pts:
+            canvas, tr = self._to_canvas()
+            rect = tr.transformBoundingBox(QgsRectangle(
+                min(p["longitude"] for p in pts), min(p["latitude"] for p in pts),
+                max(p["longitude"] for p in pts), max(p["latitude"] for p in pts)))
+            ext = canvas.extent()
+            if rect.width() < ext.width() * 0.9 and rect.height() < ext.height() * 0.9:
+                canvas.setCenter(rect.center())          # they fit: pan, keep the scale
+            else:
+                rect.scale(1.3)
+                canvas.setExtent(rect)
+            canvas.refresh()
+
     def zoom_to_all(self):
-        pts = [p for v in self.tracks.values() for p in v] + list(self.marker_pos.values())
+        pts = [p for v in self._shown(self.tracks).values() for p in v]
+        pts += list(self._shown(self.marker_pos).values())
         if not pts:
             return
         canvas, tr = self._to_canvas()
@@ -1949,6 +2572,278 @@ class TraccarLive:
             rect.scale(1.15)
             canvas.setExtent(rect)
         canvas.refresh()
+
+    # ── Per device: show / hide ───────────────────────────────────────────
+    def hidden_ids(self):
+        """Traccar ids of the devices unticked in the list (kept between sessions)."""
+        out = set()
+        for x in str(self.cfg["hidden_devices"]).split(","):
+            try:
+                out.add(int(x))
+            except ValueError:
+                pass
+        return out
+
+    def _set_hidden(self, ids):
+        self.set_cfg("hidden_devices", ",".join(str(i) for i in sorted(ids)))
+        self._rebuild()
+
+    def set_device_shown(self, dev_id, on):
+        hidden = self.hidden_ids()
+        if on:
+            hidden.discard(dev_id)
+        else:
+            hidden.add(dev_id)
+        self._set_hidden(hidden)
+
+    def show_only(self, dev_id):
+        self._set_hidden((self.hidden_ids() | set(self.devices)) - {dev_id})
+
+    def show_all(self):
+        self._set_hidden(set())
+
+    def hide_all(self):
+        self._set_hidden(self.hidden_ids() | set(self.devices))
+
+    def _shown(self, by_dev, only=None):
+        """by_dev ({dev_id: …}) limited to the devices shown — or to device `only`, shown or not."""
+        if only is not None:
+            return {k: v for k, v in by_dev.items() if k == only}
+        hidden = self.hidden_ids()
+        return {k: v for k, v in by_dev.items() if k not in hidden}
+
+    def _none_shown_hint(self, only):
+        if only is None and self.hidden_ids() & set(self.devices):
+            return " (hidden devices are not saved — tick them in the list)"
+        return ""
+
+    # ── Per device: location and clipboard ─────────────────────────────────
+    def set_coord_format(self, key):
+        self.set_cfg("coord_format", key)
+        self._rebuild()
+
+    def _format_crs(self, key):
+        if key == "project":
+            return QgsProject.instance().crs()
+        if key == "custom":
+            return QgsCoordinateReferenceSystem(self.cfg["custom_crs"])
+        return QgsCoordinateReferenceSystem({"ig": "EPSG:29903", "uk": "EPSG:27700"}.get(key, "EPSG:4326"))
+
+    def coord_label(self, key=None):
+        """'Lat / Long', 'Project CRS (EPSG:2157)', 'Irish Grid' … for format key (default: the chosen one)."""
+        key = key or self.cfg["coord_format"]
+        label = dict(COORD_FORMATS).get(key, key)
+        if key in ("project", "custom"):
+            authid = self._format_crs(key).authid()
+            label += " (%s)" % (authid or "not set")
+        return label
+
+    def _transform(self, p, crs):
+        """Position → QgsPointXY in crs, or None (invalid CRS / outside its area)."""
+        if not crs.isValid():
+            return None
+        try:
+            return QgsCoordinateTransform(WGS84, crs, QgsProject.instance()).transform(
+                QgsPointXY(p["longitude"], p["latitude"]))
+        except QgsCsException:
+            return None
+
+    def format_location(self, p, key=None):
+        """A position as text in a location format; '' when it can't be expressed in it."""
+        key = key or self.cfg["coord_format"]
+        if key == "latlon":
+            return format_latlon(p["latitude"], p["longitude"], self.cfg["latlon_style"], self.cfg["latlon_hemi"])
+        crs = self._format_crs(key)
+        xy = self._transform(p, crs)
+        if xy is None:
+            return ""
+        if key == "ig":
+            return irish_grid_ref(xy.x(), xy.y())
+        if key == "uk":
+            return uk_grid_ref(xy.x(), xy.y())
+        if crs.isGeographic():
+            return format_latlon(xy.y(), xy.x(), self.cfg["latlon_style"], self.cfg["latlon_hemi"])
+        return "%.1f, %.1f" % (xy.x(), xy.y())
+
+    def location_wkt(self, p, crs=WGS84):
+        xy = self._transform(p, crs)
+        return QgsGeometry.fromPointXY(xy).asWkt(7 if crs.isGeographic() else 2) if xy is not None else ""
+
+    def track_wkt(self, dev_id, crs=WGS84):
+        """The device's fixes in the window as a WKT LineString (a Point when there is only one)."""
+        pts = [self._transform(p, crs) for p in self.tracks.get(dev_id, [])]
+        if not pts or None in pts:
+            return ""
+        geom = QgsGeometry.fromPolylineXY(pts) if len(pts) > 1 else QgsGeometry.fromPointXY(pts[0])
+        return geom.asWkt(7 if crs.isGeographic() else 2)
+
+    def track_lines(self, dev_id):
+        """One line per fix in the window: local time, then the location in the chosen format."""
+        return "\n".join("%s\t%s" % (p["_t"].astimezone().strftime("%Y-%m-%d %H:%M:%S"), self.format_location(p))
+                         for p in self.tracks.get(dev_id, []))
+
+    def copy_text(self, text, what):
+        if not text:
+            self._bar("Nothing to copy (%s)" % what, _MSG_WARN)
+            return
+        QgsApplication.clipboard().setText(text)
+        short = text if len(text) <= 60 else text[:57] + "…"
+        self._bar("Copied %s:  %s" % (what, short.replace("\n", " ")), _MSG_OK, 3)
+
+    # ── what3words (key in QGIS's password manager; looked up only on request) ──
+    def w3w_key(self):
+        if self._w3w is None:
+            self._w3w = QgsApplication.authManager().authSetting(W3W_KEY_SETTING, "", True) or ""
+        return str(self._w3w)
+
+    def set_w3w_key(self, key):
+        mgr = QgsApplication.authManager()
+        if key:
+            if not mgr.storeAuthSetting(W3W_KEY_SETTING, key, True):
+                self._bar("The what3words key could not be saved in QGIS's password manager", _MSG_WARN)
+        else:
+            mgr.removeAuthSetting(W3W_KEY_SETTING)
+        self._w3w = key
+
+    def copy_w3w(self, p):
+        """Look up the what3words address of a position and copy it ('///word.word.word')."""
+        key = self.w3w_key()
+        if not key:
+            self._bar("Add your what3words API key in Settings → Advanced → Location", _MSG_WARN)
+            self.open_settings(3)
+            return
+        url = "%s/convert-to-3wa?coordinates=%.6f,%.6f&language=en" % (W3W_URL, p["latitude"], p["longitude"])
+        req = QNetworkRequest(QUrl(url))
+        req.setRawHeader(b"X-Api-Key", key.encode("utf-8"))      # header, not URL: kept out of logs
+        req.setRawHeader(b"Accept", b"application/json")
+        try:
+            req.setTransferTimeout(15000)
+        except AttributeError:     # pragma: no cover
+            pass
+        reply = QgsNetworkAccessManager.instance().get(req)
+        self._w3w_reply = reply
+
+        def finished():
+            self._w3w_reply = None
+            status = reply.attribute(_HTTP_STATUS)
+            data = bytes(reply.readAll())
+            errstr = reply.errorString()
+            reply.deleteLater()
+            try:
+                body = json.loads(data.decode("utf-8")) if data else {}
+            except ValueError:
+                body = {}
+            words = body.get("words") if isinstance(body, dict) else None
+            if words:
+                self.copy_text("///" + words, "what3words")
+                return
+            err = (body.get("error") or {}).get("message") if isinstance(body, dict) else None
+            self._bar("what3words: " + (err or ("HTTP %s" % status if status else errstr)), _MSG_WARN, 8)
+
+        reply.finished.connect(finished)
+
+    # ── Per device: save to file ──────────────────────────────────────────
+    EXPORT_FILTERS = {"gpx": "GPX (*.gpx)", "gpkg": "GeoPackage (*.gpkg)", "csv": "CSV (*.csv)"}
+
+    def save_device_file(self, dev_id):
+        """Ask for a file name, then export the device's fixes in the time window."""
+        if self.win is None:
+            self._bar("Nothing loaded yet — click ↻ Refresh or ▶ Live", _MSG_WARN)
+            return
+        name = self._name(dev_id)
+        s = QSettings()
+        folder = (s.value(SETTINGS_NS + "/last_export_dir", "", type=str)
+                  or QgsProject.instance().homePath() or os.path.expanduser("~"))
+        ext = s.value(SETTINGS_NS + "/last_export_ext", "gpx", type=str)
+        if ext not in self.EXPORT_FILTERS:
+            ext = "gpx"
+        base = re.sub(r"[^\w\-]+", "_", name).strip("_") or "device"
+        suggested = os.path.join(folder, "%s_%s.%s" % (base, self.win["to"].astimezone().strftime("%Y%m%d_%H%M"), ext))
+        path, chosen = QFileDialog.getSaveFileName(
+            self.iface.mainWindow(), "Save %s to file" % name, suggested,
+            ";;".join(self.EXPORT_FILTERS.values()), self.EXPORT_FILTERS[ext])
+        if not path:
+            return
+        given = os.path.splitext(path)[1].lower().lstrip(".")
+        if given in self.EXPORT_FILTERS:
+            ext = given
+        else:
+            ext = next((k for k, v in self.EXPORT_FILTERS.items() if v == chosen), ext)
+            path += "." + ext
+        s.setValue(SETTINGS_NS + "/last_export_dir", os.path.dirname(path))
+        s.setValue(SETTINGS_NS + "/last_export_ext", ext)
+        ok, msg = self.export_device(dev_id, path)
+        self._bar(msg, _MSG_OK if ok else _MSG_WARN)
+
+    def export_device(self, dev_id, path):
+        """Write one device's fixes in the time window to a .gpx, .gpkg or .csv file.
+        Returns (ok, message). With no fixes in the window, its last known fix is written."""
+        name = self._name(dev_id)
+        fixes = list(self.tracks.get(dev_id, []))
+        last = self.marker_pos.get(dev_id)
+        if self.win is None or (not fixes and last is None):
+            return False, "No fixes for %s in this window" % name
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            if ext == ".gpkg":
+                err = self._export_gpkg(dev_id, path, fixes or [last])
+                if err:
+                    return False, "Could not save %s: %s" % (os.path.basename(path), err)
+            elif ext == ".csv":
+                self._export_csv(dev_id, path, fixes or [last])
+            else:
+                self._export_gpx(dev_id, path, fixes, last)
+        except OSError as exc:
+            return False, "Could not write %s: %s" % (path, exc)
+        return True, "Saved %s — %d fix(es) — to %s" % (name, len(fixes or [last]), os.path.basename(path))
+
+    def _export_gpx(self, dev_id, path, fixes, last):
+        """GPX 1.1: a waypoint at the marker's fix, and a track of the fixes in the window."""
+        name = _xml(self._name(dev_id))
+
+        def pt(tag, p, extra=""):
+            return '<%s lat="%.7f" lon="%.7f"><ele>%.1f</ele><time>%s</time>%s</%s>' % (
+                tag, p["latitude"], p["longitude"], float(p.get("altitude") or 0), _iso(p["_t"]), extra, tag)
+
+        out = ['<?xml version="1.0" encoding="UTF-8"?>',
+               '<gpx version="1.1" creator="Traccar Live (QGIS)" xmlns="http://www.topografix.com/GPX/1/1">',
+               "<metadata><name>%s</name><time>%s</time></metadata>" % (name, _iso(datetime.now(timezone.utc)))]
+        if last is not None:
+            out.append(pt("wpt", last, "<name>%s</name><desc>Last fix %s</desc>" % (
+                name, _xml(_local_text(last["_t"])))))
+        if fixes:
+            out.append("<trk><name>%s</name><desc>%s</desc><trkseg>" % (
+                name, _xml(_span_text(self.win["frm"], self.win["to"]))))
+            out.extend("  " + pt("trkpt", p) for p in fixes)
+            out.append("</trkseg></trk>")
+        out.append("</gpx>")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
+
+    def _export_csv(self, dev_id, path, fixes):
+        """One row per fix; utf-8 with BOM so Excel reads accented names."""
+        name = self._name(dev_id)
+        with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+            w = csv.writer(fh)
+            w.writerow(["device_id", "name", "fix_time", "fix_local", "latitude", "longitude",
+                        "altitude_m", "speed_kmh", "course", "accuracy_m", "battery", "motion", "address"])
+            for p in fixes:
+                attrs = p.get("attributes") or {}
+                w.writerow([dev_id, name, _iso(p["_t"]), _local_text(p["_t"]), p["latitude"], p["longitude"],
+                            p.get("altitude") or 0, round((p.get("speed") or 0) * 1.852, 1),
+                            p.get("course") or 0, p.get("accuracy") or 0, attrs.get("batteryLevel"),
+                            attrs.get("motion"), p.get("address") or ""])
+
+    def _export_gpkg(self, dev_id, path, fixes):
+        """traccar_points (every fix) + traccar_tracks (one line), the shared schema. '' or an error."""
+        pts, trk, errors = create_template_gpkg(path)
+        if errors:
+            return "; ".join(errors)
+        if self._write_points(pts, fixes)[0] < 0:
+            return "positions could not be written"
+        if self.tracks.get(dev_id) and self._write_tracks(trk, {dev_id: fixes})[0] < 0:
+            return "track could not be written"
+        return ""
 
     # ════════════════════════════════════════════════════════════════════════
     #  Save — writes exactly what the time window shows
@@ -1981,28 +2876,30 @@ class TraccarLive:
             return None
         return lyr
 
-    def save_positions(self):
+    def save_positions(self, only=None):
+        """Save the devices shown on the map, or just device `only`."""
         lyr = self._target("points_layer_id", "positions")
         if lyr is None:
             return
         if self.cfg["points_mode"] == 1:
-            positions = [p for v in self.tracks.values() for p in v]
+            positions = [p for v in self._shown(self.tracks, only).values() for p in v]
         else:
-            positions = list(self.marker_pos.values())
+            positions = list(self._shown(self.marker_pos, only).values())
         if not positions:
-            self._bar("No positions to save", _MSG_WARN)
+            self._bar("No positions to save" + self._none_shown_hint(only), _MSG_WARN)
             return
         n, note = self._write_points(lyr, positions)
         if n >= 0:
             self._bar("Saved %d point(s) to %s%s" % (n, lyr.name(), note), _MSG_OK)
 
-    def save_tracks(self):
+    def save_tracks(self, only=None):
+        """Save the devices shown on the map, or just device `only`."""
         lyr = self._target("tracks_layer_id", "tracks")
         if lyr is None:
             return
-        by_dev = {k: v for k, v in self.tracks.items() if v}
+        by_dev = {k: v for k, v in self._shown(self.tracks, only).items() if v}
         if not by_dev:
-            self._bar("No fixes in this window to save", _MSG_WARN)
+            self._bar("No fixes in this window to save" + self._none_shown_hint(only), _MSG_WARN)
             return
         n, note = self._write_tracks(lyr, by_dev)
         if n >= 0:
