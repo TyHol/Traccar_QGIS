@@ -163,7 +163,7 @@ Your Traccar login is kept in **QGIS's password manager** (Settings → Options 
   ```
 - Security scan, as run by plugins.qgis.org: `pip install bandit` then `bandit -r traccar_live.py __init__.py` (should report *No issues identified*).
 - [`tests/real_server_check.py`](tests/real_server_check.py) — a read-only check against a real Traccar server, using the login saved in a QGIS profile (never printed).
-- The release zip contains a `traccar_live/` folder with the plugin files, `icon.png` and `LICENSE` (the layout plugins.qgis.org requires).
+- The release zip contains a `traccar_live/` folder with the plugin files, `icon.png` and `LICENSE` (the layout plugins.qgis.org requires). It is attached to each [GitHub release](https://github.com/TyHol/Traccar_QGIS/releases), not kept in the repository (`*.zip` is git-ignored).
 
 ## Licence
 Copyright © 2026 TyHol. Released under the [GNU General Public License v2.0 or later](LICENSE) (GPL-2.0-or-later), the same licence as QGIS.
