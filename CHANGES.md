@@ -1,11 +1,5 @@
 # Traccar Live (QGIS) — Changes
 
-## v0.3.1
-
-Passes the QGIS plugin repository's secrets scan, which blocked 0.3.0; no change in behaviour.
-- The Irish / UK grid letter tables are built from the alphabet instead of written out as 25-letter
-  strings, which the scanner took for possible encoded secrets ("Base64 High Entropy String").
-
 ## v0.3.0
 
 ### Dockable panel
@@ -48,6 +42,9 @@ Passes the QGIS plugin repository's secrets scan, which blocked 0.3.0; no change
   custom CRS (EPSG:2157 by default) and the what3words API key,
   kept encrypted in QGIS's password manager and sent in a request header; what3words is only
   called when you copy (it needs a plan with *convert-to-3wa*).
+
+The Irish / UK grid letter tables are built from the alphabet rather than written out as 25-letter
+strings, which the plugin repository's secrets scan took for possible encoded secrets.
 
 Tests: 151 checks, all pass on QGIS 3.44.15 LTR (Qt 5) and 4.2.3 (Qt 6).
 

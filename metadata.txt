@@ -4,7 +4,7 @@ qgisMinimumVersion=3.28
 qgisMaximumVersion=4.99
 description=Follow Traccar devices on the map within a chosen time window, and save their positions and tracks to project layers
 about=Shows Traccar GPS devices on the map (markers and tracks) for one time window — last N minutes, custom dates, or a feature's start/end — refreshed live in the background, drawn on the map or as temporary layers. Save positions (latest fix or every fix) and tracks (one line per device, Z = altitude, M = time) to your own layers in any CRS. Same layer schema as the QField plugin Traccar_QField. Needs a Traccar server account.
-version=0.3.1
+version=0.3.0
 author=TyHol
 email=tonyholmes@hotmail.com
 homepage=https://github.com/TyHol/Traccar_QGIS
@@ -16,7 +16,6 @@ category=Web
 experimental=True
 hasProcessingProvider=no
 changelog=
-    0.3.1 - Passes the plugin repository's secrets scan (grid letter tables built from the alphabet); no change in behaviour.
     0.3.0 - Dockable panel (docked, tabbed or floating). Per device: tick to show / hide on the map (remembered; hidden devices aren't saved by the buttons), save one device to a GPX, GeoPackage or CSV file, or to the layers.  Location column (lat/long, project or custom CRS, Irish / UK grid); copy a location (also what3words, WKT) or a track (WKT) to the clipboard. Playback of the tracks in the time window (go to a time, pan to and copy the position shown).
     0.2.4 - No tool config files in the package (repository scan: plain 'Validated'); code reformatted, no change in behaviour.
     0.2.3 - Code-quality clean-up (flake8, pylint, vulture all clean); no change in behaviour.
