@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Release zips are attached to GitHub releases, not kept in the repository
+*.zip
