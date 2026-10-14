@@ -1,5 +1,50 @@
 # Traccar Live (QGIS) — Changes
 
+## v0.3.0
+
+### Dockable panel
+- The main window is now a **dock widget**: docked on the right of the map by default; drag it to
+  another side, tab it with other panels, or float it. It reopens where it was left.
+- The **Traccar Live** toolbar button shows / hides the panel (checked while it is open).
+
+### Per device
+- A **tick box** on each device shows or hides it on the map (both live views). Hidden devices are left
+  out of *Zoom to all* and the Save buttons, and are remembered between sessions (by device id).
+  The list header shows "*n* of *m* shown", and is itself a tick box to show all / hide all.
+- **⋯** on each row (or right-click): *Zoom to device*, *Show only this device*, *Show all devices*,
+  **Save to file…**, and save just this device's positions / track to the layers (even when hidden).
+- **Save to file**: GPX (track with times and altitude + waypoint at the last fix), GeoPackage
+  (`traccar_points` + `traccar_tracks`, the shared schema) or CSV (one row per fix).
+
+### Playback
+- **Playback** box in the panel: ▶ / ⏸, a time slider over the tracks in the window, ⏮ to the first
+  fix, ■ to leave, and a speed from 1× to 1 hour per second.
+- Markers move smoothly along the tracks (interpolated between fixes); each track is drawn up to the
+  playback time, with the whole track faint underneath in the drawn-on-map view. Temporary layers
+  follow playback too. Only ticked devices play; Live updates continue during playback.
+- **At:** box to go to a time (to the second); **⌖** pans to the selected device's playback position
+  (or all shown devices). Double-click, *Pan to device*, **Copy location** and the *Location* column
+  all use the position at the playback time; the *Speed* (interpolated) and *Battery* columns follow it too. Accuracy circles between fixes use the
+  larger of the two fixes' accuracy ("the device was somewhere in here").
+- Tracks drawn on the map now keep **every fix** (before, tracks over 2000 fixes were thinned, which cut
+  corners — and during playback made the route change shape as it played). Each track is reprojected
+  once and drawn natively, so long tracks are faster as well as exact.
+
+### Location and clipboard
+- **Location** column in the device list (and a line in the marker tooltip), in the format chosen
+  under *Location as*: Lat / Long, Project CRS, Custom CRS, Irish Grid (`O 15904 34671`) or
+  UK Grid (`NS 45140 72887`) — same grid letters as the QField plugin *Conversion_tools*.
+- **Copy location** (⋯ menu): any of those formats, **what3words**, or a WKT point (WGS84 / project CRS).
+- **Copy track** (⋯ menu): the fixes in the window as a WKT LineString (WGS84 / project CRS), or one
+  line per fix with its local time and location.
+- Settings → Advanced → **Location**: lat / long as **decimal degrees, degrees + minutes or degrees +
+  minutes + seconds**, with **N/S/E/W or +/−** (also used for a geographic project / custom CRS);
+  custom CRS (EPSG:2157 by default) and the what3words API key,
+  kept encrypted in QGIS's password manager and sent in a request header; what3words is only
+  called when you copy (it needs a plan with *convert-to-3wa*).
+
+Tests: 151 checks, all pass on QGIS 3.44.15 LTR (Qt 5) and 4.2.3 (Qt 6).
+
 ## v0.2.4
 
 No change in behaviour.

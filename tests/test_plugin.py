@@ -59,6 +59,7 @@ def _fix(dev, t, lon, lat, i):
             "attributes": {"batteryLevel": 81, "motion": True}}
 
 
+W3W_KEY, W3W_CALLS = "w3w-test-key", []   # pragma: allowlist secret  (fake what3words API)
 POS = {1: [], 2: [], 3: []}
 for i in range(240):                                   # last 2 h, every 30 s
     t = NOW - timedelta(seconds=30 * (239 - i))
@@ -76,8 +77,23 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _json(self, status, body):
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self):
         import base64
+        if self.path.startswith("/v3/convert-to-3wa"):          # fake what3words API
+            W3W_CALLS.append(self.path)
+            if self.headers.get("X-Api-Key") != W3W_KEY:
+                self._json(401, {"error": {"code": "InvalidKey", "message": "Authentication failed; invalid API key"}})
+            else:
+                self._json(200, {"words": "filled.count.soap"})
+            return
         auth = self.headers.get("Authorization", "")
         if auth != "Basic " + base64.b64encode(("%s:%s" % (USER, PWD)).encode()).decode():
             self.send_response(401)
@@ -480,15 +496,18 @@ def t15_live_poll_appends_and_trims():
 def t16_dialogs():
     plugin.cfg["window_minutes"] = 60
     plugin.open_main()
-    d = plugin.dlg
+    d = plugin.dock
     wait(lambda: False, 0.2)
-    check("main window opens (non-modal)", d.isVisible() and not d.isModal())
+    from qgis.gui import QgsDockWidget
+    check("main panel opens as a dock widget", isinstance(d, QgsDockWidget) and d.isVisible()
+          and plugin.act_open.isChecked())
     check("device table filled", d.table.rowCount() == 3, d.table.rowCount())
     check("saves-to line shows layers", "Positions →" in d.saves_to_lbl.text())
     plugin.set_live(True)
     check("Live button and toolbar action in sync", d.live_btn.isChecked() and plugin.act_live.isChecked()
           and plugin.timer.isActive())
-    d.close()
+    plugin.act_open.setChecked(False)
+    check("toolbar button hides the panel", not d.isUserVisible())
     check("closing the window keeps Live running", plugin.live and plugin.timer.isActive())
     plugin.set_live(False)
     from qgis.PyQt.QtWidgets import QDialog
@@ -516,6 +535,363 @@ def t16_dialogs():
         check("help opens", True)
     finally:
         QDialog.exec = orig
+
+
+@test
+def t16b_per_device_show_hide():
+    plugin.cfg["window_minutes"] = 180
+    plugin.set_live_view("canvas")
+    wait(lambda: not plugin.loading)           # the load started by ▶ Live in t16
+    load(180)
+    plugin.open_main()
+    d = plugin.dock
+    item = plugin._item
+    r = [i for i, row in enumerate(d._rows) if row["name"] == "Phone A"][0]
+    d.table.item(r, 0).setCheckState(mod._UNCHECKED)        # untick Phone A in the list
+    wait(lambda: 1 in plugin.hidden_ids(), 2)
+    check("unticking a device hides it on the map",
+          [m["label"] for m in item.markers] == ["Van 3"] and not item.tracks, [m["label"] for m in item.markers])
+    check("hidden devices remembered in the settings",
+          QSettings().value("TraccarLive/hidden_devices") == "1", QSettings().value("TraccarLive/hidden_devices"))
+    check("device list says how many are shown", "2 of 3 shown" in d.devices_lbl.text()
+          and d.table.item(r, 0).checkState() == mod._UNCHECKED, d.devices_lbl.text())
+    plugin.cfg["points_mode"] = 0
+    lyr = QgsProject.instance().mapLayer(plugin.cfg["points_layer_id"])
+    before = lyr.featureCount()
+    plugin.save_positions()
+    check("Save positions skips hidden devices", lyr.featureCount() - before == 1, lyr.featureCount() - before)
+    plugin.save_positions(only=1)
+    added = sorted(feats(lyr), key=lambda x: x.id())[-1]
+    check("save one device (even hidden) from its menu", added["device_id"] == 1, added["device_id"])
+    from qgis.PyQt.QtWidgets import QMenu
+    shown = []
+    orig_exec = QMenu.exec
+    QMenu.exec = lambda self, *a: shown.extend(x.text() for x in self.actions())
+    try:
+        d._device_menu(r)
+    finally:
+        QMenu.exec = orig_exec
+    check("⋯ menu: zoom, show only, show all, save to file, save to layers",
+          any("Save to file" in t for t in shown) and any("Show only" in t for t in shown), shown)
+    plugin.show_only(2)
+    check("show only this device", plugin.hidden_ids() == {1, 3}, plugin.hidden_ids())
+    check("'Devices' checkbox partial when some are hidden", d.devices_lbl.checkState() == mod._PARTIAL)
+    d.devices_lbl.click()
+    check("'Devices' checkbox: click → all shown", not plugin.hidden_ids()
+          and d.devices_lbl.checkState() == mod._CHECKED, plugin.hidden_ids())
+    d.devices_lbl.click()
+    check("'Devices' checkbox: click again → none shown", plugin.hidden_ids() == {1, 2, 3}
+          and d.devices_lbl.checkState() == mod._UNCHECKED and not plugin._item.markers, plugin.hidden_ids())
+    plugin.show_all()
+    check("show all devices", not plugin.hidden_ids() and len(plugin._item.markers) == 2,
+          (plugin.hidden_ids(), [m["label"] for m in plugin._item.markers], plugin.play_t, plugin.loading))
+
+
+@test
+def t16c_export_device_files():
+    import csv as _csv
+    import xml.etree.ElementTree as ET  # nosec B405 - parses the file this test just wrote
+    n = len(plugin.tracks[1])
+    gpx = os.path.join(TMP, "phone a.gpx")
+    ok, msg = plugin.export_device(1, gpx)
+    root = ET.parse(gpx).getroot()  # nosec B314
+    ns = {"g": "http://www.topografix.com/GPX/1/1"}
+    pts = root.findall(".//g:trkpt", ns)
+    check("GPX: one track with every fix, times and elevation", ok and len(pts) == n
+          and pts[0].find("g:time", ns).text.endswith("Z") and pts[0].find("g:ele", ns) is not None, msg)
+    check("GPX: waypoint at the last fix, named after the device",
+          root.find("g:wpt/g:name", ns).text == "Phone A")
+    csvp = os.path.join(TMP, "phone_a.csv")
+    ok, msg = plugin.export_device(1, csvp)
+    with open(csvp, encoding="utf-8-sig", newline="") as fh:
+        rows = list(_csv.DictReader(fh))
+    check("CSV: one row per fix with lat/lon", ok and len(rows) == n and rows[0]["name"] == "Phone A"
+          and float(rows[0]["latitude"]) == plugin.tracks[1][0]["latitude"], msg)
+    gp = os.path.join(TMP, "phone_a.gpkg")
+    ok, msg = plugin.export_device(1, gp)
+    p_l = QgsVectorLayer(gp + "|layername=traccar_points", "p", "ogr")
+    t_l = QgsVectorLayer(gp + "|layername=traccar_tracks", "t", "ogr")
+    check("GeoPackage: every fix + one track, shared schema", ok and p_l.featureCount() == n
+          and t_l.featureCount() == 1 and next(t_l.getFeatures())["n_points"] == n, msg)
+    ok, msg = plugin.export_device(3, os.path.join(TMP, "spare.gpx"))
+    check("device with no fixes → clear message, no file", not ok and "No fixes" in msg
+          and not os.path.exists(os.path.join(TMP, "spare.gpx")), msg)
+
+
+@test
+def t16d_location_formats_and_copy():
+    check("Irish Grid reference", mod.irish_grid_ref(315904, 234671) == "O 15904 34671",
+          mod.irish_grid_ref(315904, 234671))
+    check("UK Grid references", mod.uk_grid_ref(245140, 672887) == "NS 45140 72887"
+          and mod.uk_grid_ref(651409, 313177) == "TG 51409 13177" and mod.uk_grid_ref(-5, 10) == "",
+          (mod.uk_grid_ref(245140, 672887), mod.uk_grid_ref(651409, 313177)))
+    pos = plugin.marker_pos[1]
+    QgsProject.instance().setCrs(QgsCoordinateReferenceSystem("EPSG:2157"))
+    plugin.cfg["custom_crs"] = "EPSG:29903"
+    f = {k: plugin.format_location(pos, k) for k, _l in mod.COORD_FORMATS}
+    import re
+    check("Lat / Long: 'lat, lon' to 6 decimals", f["latlon"] == "%.6f, %.6f" % (pos["latitude"], pos["longitude"]),
+          f["latlon"])
+    check("Irish Grid: 'O 12345 67890' (Dublin)", re.fullmatch(r"O \d{5} \d{5}", f["ig"]) is not None, f["ig"])
+    check("UK Grid: 'XX 12345 67890'", re.fullmatch(r"[A-Z]{2} \d{5} \d{5}", f["uk"]) is not None, f["uk"])
+    x, y = (float(v) for v in f["project"].split(","))
+    check("Project CRS (ITM): metres", 700000 < x < 730000 and 730000 < y < 750000, f["project"])
+    check("Custom CRS (Irish Grid 29903) and its label",
+          f["custom"] and plugin.coord_label("custom") == "Custom CRS (EPSG:29903)", (f["custom"], plugin.coord_label("custom")))
+    plugin.set_coord_format("ig")
+    d = plugin.dock
+    r = [i for i, row in enumerate(d._rows) if row["name"] == "Phone A"][0]
+    check("Location column shows the chosen format", d.table.item(r, 1).text() == f["ig"], d.table.item(r, 1).text())
+    check("marker tooltip includes the location", f["ig"] in plugin._marker_tip(1, pos))
+    cb = QgsApplication.clipboard()
+    plugin.copy_text(plugin.location_wkt(pos), "WKT")
+    pt = mod.QgsGeometry.fromWkt(cb.text()).asPoint()
+    check("Copy WKT point (WGS84)", cb.text().startswith("Point (") and abs(pt.x() - pos["longitude"]) < 1e-7
+          and abs(pt.y() - pos["latitude"]) < 1e-7, cb.text())
+    n = len(plugin.tracks[1])
+    plugin.copy_text(plugin.track_wkt(1, QgsProject.instance().crs()), "WKT track")
+    g = mod.QgsGeometry.fromWkt(cb.text())
+    check("Copy track as WKT LineString (project CRS) with every fix",
+          cb.text().startswith("LineString") and len(list(g.vertices())) == n
+          and next(g.vertices()).x() > 700000, cb.text()[:60])
+    lines = plugin.track_lines(1).splitlines()
+    check("Copy track as one location per line", len(lines) == n
+          and lines[-1].endswith("\t" + plugin.format_location(plugin.tracks[1][-1], "ig")), lines[-1:])
+    from qgis.PyQt.QtWidgets import QMenu
+    seen = []
+    orig_exec = QMenu.exec
+    QMenu.exec = lambda self, *a: seen.extend(
+        a.text() for m in [self] + [x.menu() for x in self.actions() if x.menu()] for a in m.actions())
+    try:
+        d._device_menu(r)
+    finally:
+        QMenu.exec = orig_exec
+    check("⋯ menu: Copy location (with previews) and Copy track",
+          any(t.startswith("Irish Grid:  O ") for t in seen) and any("WKT LineString" in t for t in seen)
+          and any("what3words" in t for t in seen), seen)
+    plugin.set_coord_format("latlon")
+
+
+@test
+def t16d2_latlon_styles():
+    f = mod.format_latlon
+    check("decimal degrees", f(53.365, -6.31, "dd") == "53.365000, -6.310000", f(53.365, -6.31, "dd"))
+    L = "letters"
+    check("degrees, minutes (N/S/E/W)", f(53.365, -6.31, "dm", L) == "53° 21.900' N, 6° 18.600' W",
+          f(53.365, -6.31, "dm", L))
+    check("degrees, minutes, seconds (N/S/E/W)",
+          f(53.365, -6.31, "dms", L) == '53° 21\' 54.00" N, 6° 18\' 36.00" W', f(53.365, -6.31, "dms", L))
+    check("south / east hemispheres", f(-33.5, 151.25, "dms", L) == '33° 30\' 00.00" S, 151° 15\' 00.00" E',
+          f(-33.5, 151.25, "dms", L))
+    check("decimal degrees with N/S/E/W", f(53.365, -6.31, "dd", L) == "53.365000 N, 6.310000 W",
+          f(53.365, -6.31, "dd", L))
+    check("+ / − signs with minutes and seconds",
+          f(53.365, -6.31, "dm") == "53° 21.900', -6° 18.600'"
+          and f(-33.5, 151.25, "dms") == '-33° 30\' 00.00", 151° 15\' 00.00"', (f(53.365, -6.31, "dm"), f(-33.5, 151.25, "dms")))
+    check("no '-0' when a tiny negative rounds to zero", f(-0.0000001, 0) == "0.000000, 0.000000", f(-0.0000001, 0))
+    check("rounding carries over (never 60.000')", f(53.9999999, 0, "dm", L).startswith("54° 00.000' N")
+          and f(53.9999999, 0, "dms", L).startswith('54° 00\' 00.00" N'),
+          (f(53.9999999, 0, "dm", L), f(53.9999999, 0, "dms", L)))
+    pos = plugin.marker_pos[1]
+    plugin.cfg.update(latlon_style="dms", latlon_hemi="letters")
+    check("Lat / Long location uses the chosen style and hemisphere", plugin.format_location(pos, "latlon")
+          == f(pos["latitude"], pos["longitude"], "dms", L) and plugin.format_location(pos, "latlon").endswith(" W"),
+          plugin.format_location(pos, "latlon"))
+    plugin.cfg["custom_crs"] = "EPSG:4258"                     # a geographic custom CRS (ETRS89)
+    check("geographic custom CRS uses it too", plugin.format_location(pos, "custom").count('"') == 2,
+          plugin.format_location(pos, "custom"))
+    sd = mod.SettingsDialog(plugin, IFACE.mainWindow(), 3)
+    check("Settings: Lat / Long style and hemisphere round-trip",
+          sd.values()["latlon_style"] == "dms" and sd.values()["latlon_hemi"] == "letters")
+    sd.deleteLater()
+    flush_deletes()
+    plugin.cfg.update(latlon_style="dd", latlon_hemi="signs", custom_crs="EPSG:29903")
+
+
+@test
+def t16e_what3words():
+    mod.W3W_URL = URL + "/v3"
+    pos = plugin.marker_pos[1]
+    cb = QgsApplication.clipboard()
+    cb.setText("")
+    plugin.set_w3w_key("wrong-key")
+    plugin.copy_w3w(pos)
+    wait(lambda: plugin._w3w_reply is None, 5)
+    check("what3words: wrong key → nothing copied", cb.text() == "" and len(W3W_CALLS) == 1)
+    plugin.set_w3w_key(W3W_KEY)
+    plugin._w3w = None                      # read it back from the password manager
+    check("what3words key kept in QGIS's password manager", plugin.w3w_key() == W3W_KEY)
+    plugin.copy_w3w(pos)
+    wait(lambda: cb.text() != "", 5)
+    check("what3words address copied", cb.text() == "///filled.count.soap", cb.text())
+    check("key sent in a header, not the URL", W3W_KEY not in W3W_CALLS[-1], W3W_CALLS[-1])
+    QSettings().sync()
+    import glob
+    leaked = [f for f in glob.glob(os.path.join(TMP, "**", "*.ini"), recursive=True)
+              if W3W_KEY in open(f, encoding="utf-8", errors="ignore").read()]
+    check("what3words key not in any settings file", not leaked, leaked)
+    s = mod.SettingsDialog(plugin, IFACE.mainWindow(), 3)
+    v = s.values()
+    check("Settings: custom CRS round-trips, key box blank ('saved')",
+          v["custom_crs"] == plugin.cfg["custom_crs"] and v["w3w_key"] == "" and "saved" in s.w3w_edit.placeholderText(),
+          (v["custom_crs"], s.w3w_edit.placeholderText()))
+    s.deleteLater()
+    flush_deletes()
+
+
+@test
+def t16f_playback():
+    plugin.set_live_view("canvas")
+    load(180)
+    plugin.open_main()
+    d = plugin.dock
+    tr = plugin.tracks[1]
+    rng = plugin.play_range()
+    check("playback range = first … last fix of the shown tracks", rng == (tr[0]["_t"], tr[-1]["_t"]), rng)
+    mid = tr[10]["_t"] + timedelta(seconds=15)               # half-way between fixes 10 and 11 (30 s apart)
+    plugin.set_play_time(mid)
+    trk, mk = plugin._overlay_data()
+    exp_lon = (tr[10]["longitude"] + tr[11]["longitude"]) / 2
+    exp_lat = (tr[10]["latitude"] + tr[11]["latitude"]) / 2
+    check("marker interpolated half-way between two fixes",
+          abs(mk[1]["longitude"] - exp_lon) < 1e-9 and abs(mk[1]["latitude"] - exp_lat) < 1e-9,
+          (mk[1]["longitude"], exp_lon))
+    item = plugin._item
+    check("track drawn up to the playback time, whole track faint underneath",
+          len(trk[1]) == 12 and len(item.tracks) == 2 and item.tracks[0][0].alpha() == 70
+          and len(item.tracks[1][1]) == 12, (len(trk[1]), len(item.tracks)))
+    check("only devices with fixes so far get a marker", list(mk) == [1] and len(item.markers) == 1)
+    check("marker tooltip shows the playback time", "Playback" in item.markers[0]["tip"], item.markers[0]["tip"])
+    check("slider + label follow the playback time",
+          d.pb_slider.value() == int((mid - rng[0]).total_seconds()) and "paused" in d.pb_lbl.text(),
+          (d.pb_slider.value(), d.pb_lbl.text()))
+    d.pb_slider.setValue(0)
+    check("dragging the slider moves playback", plugin.play_t == rng[0], plugin.play_t)
+    plugin.cfg["play_speed"] = 600
+    plugin.play(True)
+    wait(lambda: False, 0.6)
+    adv = (plugin.play_t - rng[0]).total_seconds()
+    check("▶ plays at the chosen speed (600 s of track per second)", 150 < adv < 600 and d.pb_play.text() == "⏸", adv)
+    plugin.cfg["play_speed"] = 86400
+    wait(lambda: not plugin.playing, 3)
+    check("pauses at the end of the tracks", not plugin.playing and plugin.play_t == rng[1]
+          and d.pb_play.text() == "▶" and not plugin.play_timer.isActive())
+    plugin.set_live_view("layers")
+    plugin.set_play_time(mid)
+    mkl = QgsProject.instance().mapLayer(plugin._mk_id)
+    tkl = QgsProject.instance().mapLayer(plugin._tk_id)
+    g = next(mkl.getFeatures()).geometry().asPoint()
+    check("temporary layers follow playback too", mkl.featureCount() == 1 and abs(g.x() - exp_lon) < 1e-9
+          and len(list(next(tkl.getFeatures()).geometry().vertices())) == 12)
+    plugin.stop_playback()
+    check("■ leaves playback: latest positions again", plugin.play_t is None and mkl.featureCount() == 2
+          and not d.pb_stop.isEnabled())
+    plugin.set_live_view("canvas")
+    plugin.cfg["play_speed"] = 60
+
+
+@test
+def t16g_playback_goto_pan_copy():
+    load(180)
+    plugin.open_main()
+    d = plugin.dock
+    tr = plugin.tracks[1]
+    target = tr[20]
+    d.pb_time.setDateTime(mod._qdt_local(target["_t"]))        # as if typed / picked in the "At:" box
+    check("typing a time in 'At:' moves playback there", plugin.play_t == target["_t"], (plugin.play_t, target["_t"]))
+    pos = plugin.shown_pos(1)
+    check("shown position = the fix at that time", abs(pos["longitude"] - target["longitude"]) < 1e-9
+          and abs(pos["latitude"] - target["latitude"]) < 1e-9)
+    r = [i for i, row in enumerate(d._rows) if row["name"] == "Phone A"][0]
+    check("Location column follows playback", d.table.item(r, 1).text() == plugin.format_location(target),
+          d.table.item(r, 1).text())
+    tr[20]["speed"], tr[21]["speed"] = 20.0, 30.0                  # knots
+    tr[20]["attributes"] = dict(tr[20]["attributes"], batteryLevel=55)
+    plugin.set_play_time(tr[20]["_t"])
+    check("Speed / Battery columns follow playback (at a fix)",
+          d.table.item(r, 4).text() == "37 km/h" and d.table.item(r, 5).text() == "55%",
+          (d.table.item(r, 4).text(), d.table.item(r, 5).text()))
+    plugin.set_play_time(tr[20]["_t"] + timedelta(seconds=15))      # half-way: 25 kn
+    check("Speed interpolated between fixes", d.table.item(r, 4).text() == "46 km/h", d.table.item(r, 4).text())
+    tr[21]["accuracy"] = 25.0                                      # tr[20] is 6 m
+    pos = plugin.shown_pos(1)
+    check("accuracy between fixes = the larger of the two ('somewhere in here')", pos["accuracy"] == 25.0,
+          pos["accuracy"])
+    plugin.set_live_view("layers")
+    mkl = QgsProject.instance().mapLayer(plugin._mk_id)
+    check("temporary layers: accuracy_m during playback", next(mkl.getFeatures())["accuracy_m"] == 25.0)
+    plugin.set_live_view("canvas")
+    plugin.set_play_time(tr[20]["_t"])
+    check("on an exact fix: that fix's own accuracy", plugin.shown_pos(1)["accuracy"] == 6.0,
+          plugin.shown_pos(1)["accuracy"])
+    plugin.set_play_time(target["_t"])
+
+    canvas = IFACE.mapCanvas()
+    xf = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"), canvas.mapSettings().destinationCrs(),
+                                QgsProject.instance())
+    exp = xf.transform(mod.QgsPointXY(target["longitude"], target["latitude"]))
+    canvas.setCenter(mod.QgsPointXY(exp.x() + 5000, exp.y() + 5000))
+    d.pb_pan.click()                                          # no device selected: the shown devices (only Phone A)
+    c = canvas.center()
+    check("⌖ pans to the position shown at the playback time",
+          abs(c.x() - exp.x()) < 1 and abs(c.y() - exp.y()) < 1, (c.x(), exp.x()))
+    plugin.pan_to_shown(3)                                    # Spare: never on the map
+    check("pan to a device not on the map at that time: message, no move", abs(canvas.center().x() - c.x()) < 1e-6)
+
+    from qgis.PyQt.QtWidgets import QMenu
+    cb = QgsApplication.clipboard()
+    cb.setText("")
+    seen = []
+
+    def fake_exec(menu, *a):
+        for act in menu.actions():
+            sub = act.menu()
+            for sa in (sub.actions() if sub else []):
+                seen.append(sa.text())
+                if sa.text().startswith("Lat / Long:"):
+                    sa.trigger()
+            seen.append(act.text())
+    orig_exec = QMenu.exec
+    QMenu.exec = fake_exec
+    try:
+        d._device_menu(r)
+    finally:
+        QMenu.exec = orig_exec
+    check("⋯ menu: 'Copy location (playback time)' and 'Pan to device'",
+          any("playback time" in t for t in seen) and "Pan to device" in seen, seen)
+    check("copied location = position at the playback time",
+          cb.text() == "%.6f, %.6f" % (target["latitude"], target["longitude"]), cb.text())
+    plugin.stop_playback()
+    check("after playback, Location / Speed / Battery back to the latest fix",
+          d.table.item(r, 1).text() == plugin.format_location(plugin.marker_pos[1])
+          and d.table.item(r, 4).text() == "5 km/h" and d.table.item(r, 5).text() == "81%",
+          (d.table.item(r, 1).text(), d.table.item(r, 4).text()))
+
+
+@test
+def t16h_playback_long_track_keeps_its_shape():
+    plugin.set_live_view("canvas")
+    load(180)
+    base = dict(plugin.tracks[1][0])
+    t0 = base["_t"]
+    zigzag = [dict(base, longitude=-6.33 + 0.0001 * i, latitude=53.35 + 0.001 * (i % 2),
+                   _t=t0 + timedelta(seconds=i)) for i in range(5000)]   # > the old 2000-point limit
+    plugin.tracks = {1: zigzag}
+    item = plugin._item
+
+    def poly_pts(poly):
+        return [(round(poly[k].x(), 6), round(poly[k].y(), 6)) for k in range(len(poly))]
+    plugin.set_play_time(t0 + timedelta(seconds=3000.5))
+    whole, played = poly_pts(item.tracks[0][1]), poly_pts(item.tracks[1][1])
+    check("long track drawn with every vertex (no thinning)", len(whole) == 5000, len(whole))
+    check("played part = the full track's own vertices + the moving end",
+          len(played) == 3002 and played[:3001] == whole[:3001], len(played))
+    plugin.set_play_time(t0 + timedelta(seconds=4200.5))
+    later = poly_pts(item.tracks[1][1])
+    check("playing on never changes the route already drawn", later[:3001] == played[:3001] and len(later) == 4202,
+          (len(later), [k for k in range(3001) if later[k] != played[k]][:3], later[3000:3002], played[3000:3002]))
+    plugin.stop_playback()
+    load(180)
 
 
 @test
@@ -591,7 +967,7 @@ def t18b_password_store():
 @test
 def t19_unload():
     plugin.unload()
-    check("unload cleanly", plugin.dlg is None and not plugin._actions)
+    check("unload cleanly", plugin.dock is None and not plugin._actions)
 
 
 # ── Report ───────────────────────────────────────────────────────────────────
