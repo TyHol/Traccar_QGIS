@@ -1,5 +1,11 @@
 # Traccar Live (QGIS) — Changes
 
+## v0.3.1
+
+Passes the QGIS plugin repository's secrets scan, which blocked 0.3.0; no change in behaviour.
+- The Irish / UK grid letter tables are built from the alphabet instead of written out as 25-letter
+  strings, which the scanner took for possible encoded secrets ("Base64 High Entropy String").
+
 ## v0.3.0
 
 ### Dockable panel
