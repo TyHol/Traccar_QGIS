@@ -1,6 +1,6 @@
 # Traccar Live (QGIS) — Changes
 
-## Unreleased
+## v0.4.0 (in development)
 
 ### Same tools and forms as the QField plugin
 - **＋ Add** button next to Clear (and the toolbar): **📤 Point**, **⬡ Area**, **〰 Line**, **⭕ Circle**,
