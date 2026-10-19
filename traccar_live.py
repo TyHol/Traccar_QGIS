@@ -1537,6 +1537,13 @@ local time. For a local date/time in labels use <code>datetime_from_epoch(epoch(
 <p>Settings → Tag stamps a text such as FIRE-2026-001 onto everything you save. With
 <i>From feature</i>, the feature's display value can be used instead.</p>
 <p>Same layers and fields as the QField plugin <i>Traccar_QField</i>, so one GeoPackage works in both.</p>
+<h3>About</h3>
+<p><b>Not an official Traccar product.</b> Traccar Live is an independent, community-made plugin; it is not
+made, endorsed or supported by Traccar or its developers, and is not affiliated with them.
+<a href="https://www.traccar.org">Traccar</a> is open-source GPS tracking software created by Anton Tananaev
+and its contributors — all credit for Traccar (the server, apps, API and documentation) goes to them. This
+plugin only connects to a Traccar server you have access to, through the interfaces Traccar publishes. For
+Traccar itself, see <a href="https://www.traccar.org">traccar.org</a>.</p>
 """
 
 
