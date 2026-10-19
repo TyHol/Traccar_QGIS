@@ -9,12 +9,14 @@ A QGIS plugin that shows your [Traccar](https://www.traccar.org) GPS devices on 
 - **One time window for everything** — *Last 15 minutes … Last 3 months*, custom dates, or the start/end of a feature such as an incident. The tracks on the map are the fixes inside the window, and the Save buttons save exactly that.
 - **Unobtrusive** — a dockable panel (docked, tabbed or floating) you can close while Live keeps running in the background; QGIS never freezes while loading.
 - **Per device** — tick devices to show or hide them; save any one device to a **GPX**, GeoPackage or CSV file; copy its location (lat/long, project or custom CRS, **Irish / UK grid**, **what3words**, WKT) or its track (WKT) to the clipboard.
+- **Geofences** — Traccar's areas, lines and circles drawn in their own colours, in a list where you can show / hide, edit, recolour or delete them.
+- **Add to Traccar** — click the map to send a point (a device), an area, a line or a circle, or send selected features; one form with Traccar's fields (description, speed limit, calendar, colour…).
 - **Playback** — replay the tracks in the time window, markers moving along them, at 1× up to 1 hour per second.
 - **Live view drawn on the map** (nothing added to the Layers panel) or as temporary layers when you want Identify, styling or printing.
 - **Two layers, saved on demand** — positions and tracks, into any point / line layers, in any CRS.
 - **Same layers and fields as the QField plugin [Traccar_QField](https://github.com/TyHol/Traccar_QField)**, so one GeoPackage works in the office and in the field.
 
-Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.3.0](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
+Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.4.0](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
 
 ---
 
@@ -36,9 +38,16 @@ You need a Traccar account — your own server or e.g. `https://server.traccar.o
 |---|---|
 | **Traccar Live** | shows / hides the Traccar Live panel (time window, devices, save buttons) |
 | **▶ Live / ⏹ Live** | starts / stops live updates without opening anything; its tooltip shows the last update and any error |
+| **📤 Point · ⬡ Area · 〰 Line · ⭕ Circle** | add to Traccar by clicking the map (also under **＋ Add** in the panel) — see *Geofences and points* |
 | Plugins → Traccar Live | the same, plus *Settings…* and *Help* |
 
 The panel docks on the right of the map by default; drag its title bar to dock it elsewhere or tab it with other panels, or float it as a separate window — it reopens where you left it. You can close it at any time — Live keeps running.
+
+### Geofences and points
+- **＋ Add** (next to Clear): **📤 Point** — click the map, give a name: a new name adds a device in Traccar, an existing device's name moves it there; for a new one you can also set its identifier, category (icon), group, phone, model and contact. **⬡ Area** / **〰 Line** — click each corner, then right-click or Enter (Backspace undoes a corner, Esc starts again). **⭕ Circle** — click the centre, choose a radius. **📑 Send selected features…** — the active layer's selected features: areas and lines become geofences, points become circles or points.
+- Geofences get a name, description, speed limit, corridor width (lines), Traccar calendar and a colour. One sent with the same name as one sent from QGIS or QField before is replaced.
+- The **Geofences** tab lists Traccar's geofences, each drawn on the map in its own colour (never grey). Tick to show / hide, double-click to zoom; ⋯ or right-click to **Edit…**, change the **Colour**, copy as WKT or **delete it from Traccar** (always asked first). Points you added have *Delete this point from Traccar…* under ⋯ in the device list.
+- Right-click the column titles of either tab to hide columns. Positions go to Traccar's OsmAnd port (5055), or to *Send to* in Settings → Connection; adding and deleting needs a Traccar account that is allowed to.
 
 ### Time window
 | Choice | What you get |
@@ -141,7 +150,7 @@ Everything in the plugin is shown in local time, with the right summer/winter of
 ## Settings
 | Tab | Contains |
 |---|---|
-| **Connection** | Server URL, email / username, password (leave blank to keep the saved one), *Test connection* |
+| **Connection** | Server URL, email / username, password (leave blank to keep the saved one), *Test connection*; *Send point*: name offered first, *Send to* (Traccar's OsmAnd address if not port 5055) |
 | **Layers** | Positions layer, device-name field, latest / every fix · Tracks layer, device-name field, add / keep most recent · *New GeoPackage…* |
 | **Tag** | On/off, tag text, field, use the feature's display value |
 | **Advanced** | Refresh interval (30 s by default), grey-marker limit, live view (on the map / temporary layers), **Location**: lat / long as decimal degrees, degrees + minutes or degrees + minutes + seconds, with N/S/E/W or +/−; custom CRS (EPSG:2157 by default); what3words API key, the layer and fields used by *From feature* |

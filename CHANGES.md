@@ -1,56 +1,47 @@
 # Traccar Live (QGIS) — Changes
 
-## v0.4.0 (in development)
+## v0.4.0 — Geofences, and adding to Traccar
 
-### Same tools and forms as the QField plugin
-- **＋ Add** button next to Clear (and the toolbar): **📤 Point**, **⬡ Area**, **〰 Line**, **⭕ Circle**,
-  **📑 Send selected features…**. The ⬡ Geofences button keeps *Reload* and *Delete*. Area and Line are new map tools: click each corner, right-click or
-  Enter to finish, Backspace to undo, Esc to start again.
-- **One send form** for every shape, laid out like QField's: name, then Traccar's fields —
-  geofences: description, speed limit (km/h, saved in knots as `speedLimit`), corridor width for lines
-  (`polylineDistance`), calendar (`calendarId`) and a row of **colour swatches** (the same ten as QField);
-  points: identifier, category (icon), group, phone, model, contact for a new device. Groups and
-  calendars are read from Traccar.
-- *Send selected features* keeps its own dialog, now with the swatches, a description field and, for
-  point layers, *as circles* or *as points (devices)*.
-- Changing a geofence's colour: ⋯ → **Colour** shows the swatches, plus *Other colour…*.
-- **Edit a geofence**: ⋯ → **Edit…** opens the same form, filled in — name, description, speed limit,
-  corridor width, calendar, colour and a circle's radius; *Save to Traccar* updates it (its shape stays).
-- **Tabs**: Devices and Geofences, with counts. Right-click a list's column titles to **hide columns**
-  (remembered: `device_columns_hidden`, `geofence_columns_hidden`). The geofence list has new
-  *Description* and *Speed limit* columns.
-
-### Send point
-- **📤 Send point** (toolbar, plugin menu and the panel): click the map, give the point a name, and it is
-  sent to Traccar. A new name adds a new device with that name (`POST /api/devices`, identifier
-  `qgis-<name>-<time>`); the name or identifier of an existing device moves that device. Positions are sent
-  with the OsmAnd protocol (`http://<server>:5055/?id=…&lat=…&lon=…&timestamp=…`); Live picks them up
-  straight away.
-- **⋯ → Delete this point from Traccar…** on a point added by Send point (identifier `qgis-…`) deletes that
-  device and its positions from Traccar, after a confirmation. Not offered for any other device.
 ### Geofences
-- Traccar's **geofences** (polygons, lines, circles) are drawn on the map in orange with their names, under
-  the live view; *Geofences* under Show switches them on / off. Reloaded with Refresh and Live.
-- **⬡ Geofences** button in the panel:
-  - **Send selected features to Traccar…** — the active layer's selected polygons, lines or points (as
-    circles of a chosen radius) become geofences, named from a field or a typed name (numbered). Any CRS;
-    multipart features become one geofence per part; polygon holes are dropped; shapes over Traccar's
-    4096-character area limit are simplified until they fit.
-  - **⭕ Circle** (also on the toolbar) — click the map, name it, radius 250 / 500 / 1000 m or any other.
-  - **Delete from Traccar** — any geofence; those sent from QGIS are marked with the
-    `createdByTraccarLiveQgis` attribute.
-- Sending a name that matches a geofence sent from QGIS before **replaces** it (`PUT`), so edited sectors
-  can be re-sent.
-- Each geofence is drawn in **its own colour** — Traccar's `color` attribute, else orange — and never greys
-  out like an old fix. *Send selected* and *⭕ Circle* ask for the colour and save it in Traccar.
-- **Geofence list** in the panel, under the devices: name (with a colour swatch), type (area / line /
-  circle with radius) and where it came from (QGIS or Traccar). Tick to show / hide each one (remembered),
-  double-click to zoom, ⋯ / right-click for **Colour…** (saved in Traccar), **Copy as WKT** and
-  **Delete from Traccar…**.
-- **Delete from Traccar** now covers every geofence, not only those sent from QGIS; one made in Traccar
-  gets a firmer warning first.
-- **Settings → Connection → Send point**: the name offered first, and an optional *Send to* address for
-  servers whose OsmAnd port isn't 5055 (or is behind a proxy).
+- Traccar's **geofences** (areas, lines, circles) are drawn on the map with their names, each in **its own
+  colour** (Traccar's `color` attribute, else orange). They never go grey like an old fix. *Geofences*
+  under Show switches them on or off; they reload with Refresh and Live.
+- A **Geofences tab** lists them with type, origin (QGIS / QField or Traccar), description and speed
+  limit. Tick to show / hide each one (remembered), double-click to zoom, and ⋯ or right-click to
+  **Edit…**, change the **Colour** (ten swatches or any other), **Copy as WKT** or **Delete from Traccar…**
+  (always asked first; one made in Traccar gets an extra warning).
+- **Edit…** opens the send form filled in: name, description, speed limit, corridor width, calendar,
+  colour and a circle's radius. *Save to Traccar* updates the geofence; its shape stays.
+
+### Add to Traccar
+- **＋ Add** next to Clear (also on the toolbar and in the plugin menu), with the same tools as the
+  QField plugin:
+  - **📤 Point** — click the map and give a name. A new name adds a device in Traccar (identifier
+    `qgis-<name>-<time>`, or your own) and sends the position through Traccar's OsmAnd port; an existing
+    device's name moves that device. Points added this way can be deleted again from the device list (⋯).
+  - **⬡ Area** / **〰 Line** — click each corner; right-click or Enter to finish, Backspace to undo, Esc to
+    start again.
+  - **⭕ Circle** — click the centre; radius 250, 500, 1000 m or any other.
+  - **📑 Send selected features…** — the active layer's selected features: areas and lines become
+    geofences, points become circles or points (devices); name and description from fields. Any CRS,
+    multipart, Z / M; holes are dropped and very detailed shapes simplified to fit Traccar's limit.
+- **One send form** for every shape, the same as QField's. Geofences: name, description, speed limit
+  (km/h; Traccar stores knots), corridor width for lines, Traccar calendar and a colour. New points:
+  identifier, category (map icon), group, phone, model and contact. Groups and calendars come from
+  your Traccar server.
+- A geofence sent with the same name as one sent from QGIS or QField before **replaces** it, so an
+  edited sector can be sent again.
+- **Settings → Connection → Send point**: the name offered first, and a *Send to* address for servers
+  whose OsmAnd port isn't 5055.
+
+### Panel
+- **Devices** and **Geofences** tabs, with counts. Right-click a list's column titles to hide columns
+  (remembered).
+
+### Also
+- README, metadata and Help say clearly that this is **not an official Traccar plugin** and credit
+  Traccar (Anton Tananaev and contributors) for all things Traccar.
+- Tested on QGIS 3.44 LTR and 4.2 (177 checks).
 
 ## v0.3.0
 
