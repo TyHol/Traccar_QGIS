@@ -6,7 +6,7 @@ Traccar Live – QGIS Plugin  v0.3
 
 Follows Traccar devices on the QGIS map within one chosen time window, and saves
 their positions and tracks to two project layers on demand. Mirrors the QField
-plugin Traccar_QField v0.4, and uses the same layer schema, so one GeoPackage
+plugin Traccar_QField v0.6, and uses the same layer schema, so one GeoPackage
 works in both.
 
   Time window  — Last 15 min … 3 months, custom dates, or a feature's start/end.
