@@ -1073,11 +1073,15 @@ def t16j_send_form_and_tools():
         "name": "Sector B", "description": "North", "radius": 500, "corridor_m": 0, "speed_kmh": 0,
         "calendar_id": 0, "color": "#00838F"}
     try:
-        plugin.act_area.setChecked(True)
+        from qgis.gui import QgsMapToolPan
         canvas = IFACE.mapCanvas()
+        pan = QgsMapToolPan(canvas)
+        canvas.setMapTool(pan)
+        check("Add tools are plain menu items, not tick boxes",
+              not any(a.isCheckable() for a in (plugin.act_send, plugin.act_area, plugin.act_line, plugin.act_circle)))
+        plugin.act_area.trigger()
         tool = plugin._tools["area"]
-        check("⬡ Area is a map tool; Point / Line / Circle switch it off",
-              canvas.mapTool() is tool and isinstance(tool, mod._ShapeTool))
+        check("⬡ Area starts its map tool", canvas.mapTool() is tool and isinstance(tool, mod._ShapeTool))
 
 
         def click(lon, lat, button):
@@ -1094,8 +1098,19 @@ def t16j_send_form_and_tools():
         click(-6.30, 53.37, left)
         click(-6.29, 53.37, right)                     # too early: needs three corners
         check("right-click with two corners: not finished", not forms and len(tool.pts) == 1, len(tool.pts))
+        check("first corner drawn as a dot", tool.dots.numberOfVertices() == 1, tool.dots.numberOfVertices())
         click(-6.29, 53.37, left)
         click(-6.29, 53.36, left)
+        shape = tool.band.asGeometry()
+        check("the area is drawn while adding corners (filled polygon, 3 dots)",
+              shape.type() == mod._GEOM_POLY and shape.area() > 0 and tool.dots.numberOfVertices() == 3,
+              (shape.asWkt()[:60], tool.dots.numberOfVertices()))
+        mp = canvas.getCoordinateTransform().transform(mod.QgsPointXY(-6.31, 53.355))
+        tool.canvasMoveEvent(QgsMapMouseEvent(canvas, mod._e(QEvent, "Type", "MouseMove"), QPointF(mp.x(), mp.y()).toPoint(),
+                                              mod._e(mod.Qt, "MouseButton", "NoButton"),
+                                              mod._e(mod.Qt, "MouseButton", "NoButton"),
+                                              mod._e(mod.Qt, "KeyboardModifier", "NoModifier")))
+        check("dashed line follows the mouse to the next corner", not tool.rubber.asGeometry().isEmpty())
         click(0, 0, right)
         check("right-click → the send form with the corners (lat, lon)",
               forms and forms[0][0] == "area" and len(forms[0][1]) == 3
@@ -1104,10 +1119,17 @@ def t16j_send_form_and_tools():
               wait(lambda: any(g.get("name") == "Sector B" for g in GEOFENCES)) and not tool.pts
               and [g for g in GEOFENCES if g["name"] == "Sector B"][0]["description"] == "North"
               and [g for g in GEOFENCES if g["name"] == "Sector B"][0]["area"].startswith("POLYGON ((53.37"))
-        plugin.act_line.setChecked(True)
-        check("Line tool takes over; Area unticked", canvas.mapTool() is plugin._tools["line"]
-              and not plugin.act_area.isChecked())
-        plugin.act_line.setChecked(False)
+        check("after sending, the map tool from before (Pan) is back", canvas.mapTool() is pan)
+        plugin.act_line.trigger()
+        check("〰 Line starts its map tool", canvas.mapTool() is plugin._tools["line"])
+        from qgis.PyQt.QtGui import QKeyEvent
+        esc = QKeyEvent(mod._e(QEvent, "Type", "KeyPress"), mod._e(mod.Qt, "Key", "Key_Escape"),
+                        mod._e(mod.Qt, "KeyboardModifier", "NoModifier"))
+        plugin._tools["line"].keyPressEvent(esc)
+        check("Esc with no corners stops adding: Pan is back", canvas.mapTool() is pan)
+        plugin.act_send.trigger()
+        plugin.end_tool()                               # the hint bar's Cancel
+        check("Cancel stops adding a point: Pan is back", canvas.mapTool() is pan)
         # ── Circle and Point use the same form ──
         plugin.circle_at(53.36, -6.33)
         check("circle from the form", wait(lambda: any(g.get("area", "").startswith("CIRCLE (53.360000 -6.330000, 500")

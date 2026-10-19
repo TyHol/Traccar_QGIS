@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-Traccar Live – QGIS Plugin  v0.4.1
+Traccar Live – QGIS Plugin  v0.4.2
 
 Follows Traccar devices on the QGIS map within one chosen time window, and saves
 their positions and tracks to two project layers on demand. Mirrors the QField
@@ -587,12 +587,13 @@ def osmand_url(cfg):
 
 
 class _ClickTool(QgsMapToolEmitPoint):
-    """Map tool: each left click → on_click(lat, lon) in WGS84; on_off() when another tool takes over."""
+    """Map tool: a left click → on_click(lat, lon) in WGS84; Esc → on_cancel(); on_off() when another
+    map tool takes over."""
 
-    def __init__(self, plugin, canvas, on_click, on_off):
+    def __init__(self, plugin, canvas, on_click, on_off, on_cancel):
         super().__init__(canvas)
         self.p = plugin
-        self._on_click, self._on_off = on_click, on_off
+        self._on_click, self._on_off, self._on_cancel = on_click, on_off, on_cancel
         self.setCursor(QCursor(_e(Qt, "CursorShape", "CrossCursor")))
         self.canvasClicked.connect(self._clicked)
 
@@ -607,6 +608,11 @@ class _ClickTool(QgsMapToolEmitPoint):
             return
         self._on_click(ll.y(), ll.x())
 
+    def keyPressEvent(self, e):
+        if e.key() == _e(Qt, "Key", "Key_Escape"):
+            e.accept()
+            self._on_cancel()
+
     def deactivate(self):
         super().deactivate()
         self._on_off()
@@ -614,34 +620,55 @@ class _ClickTool(QgsMapToolEmitPoint):
 
 class _ShapeTool(QgsMapTool):
     """Map tool for an area or a line: left-click each corner, then right-click (or Enter) to finish.
-    Backspace removes the last corner, Esc starts again. on_done(kind, [(lat, lon), …]) in WGS84;
-    the corners stay until reset() — so a cancelled send can carry on."""
+    Backspace removes the last corner, Esc clears the corners (or, with none, stops adding).
+    Drawn as it grows: the shape, a dot on each corner and a dashed line to the mouse.
+    on_done(kind, [(lat, lon), …]) in WGS84; the corners stay until reset(), so a cancelled send
+    can carry on."""
 
-    def __init__(self, plugin, canvas, kind, on_done, on_off):
+    def __init__(self, plugin, canvas, kind, on_done, on_off, on_cancel):
         super().__init__(canvas)
         self.p, self.kind = plugin, kind
-        self._on_done, self._on_off = on_done, on_off
+        self._on_done, self._on_off, self._on_cancel = on_done, on_off, on_cancel
         self.pts = []
-        self.band = QgsRubberBand(canvas, _GEOM_POLY if kind == "area" else _GEOM_LINE)
-        color = QColor(plugin.cfg["geofence_color"])
-        self.band.setStrokeColor(color)
+        self.band = QgsRubberBand(canvas, _GEOM_POLY if kind == "area" else _GEOM_LINE)   # the shape
+        self.rubber = QgsRubberBand(canvas, _GEOM_LINE)                                     # to the mouse
+        self.dots = QgsRubberBand(canvas, _GEOM_POINT)                                      # the corners
+        self.setCursor(QCursor(_e(Qt, "CursorShape", "CrossCursor")))
+        self._style()
+
+    def _style(self):
+        color = QColor(self.p.cfg["geofence_color"])
         fill = QColor(color)
-        fill.setAlpha(50)
+        fill.setAlpha(60)
+        self.band.setStrokeColor(color)
         self.band.setFillColor(fill)
         self.band.setWidth(2)
-        self.setCursor(QCursor(_e(Qt, "CursorShape", "CrossCursor")))
+        self.rubber.setStrokeColor(color)
+        self.rubber.setWidth(1)
+        self.rubber.setLineStyle(_e(Qt, "PenStyle", "DashLine"))
+        self.dots.setColor(color)
+        self.dots.setIcon(_e(QgsRubberBand, "IconType", "ICON_CIRCLE"))
+        self.dots.setIconSize(9)
+        self.dots.setWidth(2)
 
     def _redraw(self, moving=None):
-        self.band.reset(_GEOM_POLY if self.kind == "area" else _GEOM_LINE)
-        color = QColor(self.p.cfg["geofence_color"])
-        self.band.setStrokeColor(color)
-        fill = QColor(color)
-        fill.setAlpha(50)
-        self.band.setFillColor(fill)
-        for pt in self.pts + ([moving] if moving is not None else []):
-            self.band.addPoint(pt, False)
-        self.band.updatePosition()
-        self.band.update()
+        self._style()
+        pts = [QgsPointXY(p) for p in self.pts]
+        if self.kind == "area" and len(pts) >= 3:
+            self.band.setToGeometry(QgsGeometry.fromPolygonXY([pts + pts[:1]]), None)
+        elif len(pts) >= 2:
+            self.band.setToGeometry(QgsGeometry.fromPolylineXY(pts), None)
+        else:
+            self.band.reset(_GEOM_POLY if self.kind == "area" else _GEOM_LINE)
+        if moving is not None and pts:                      # dashed line(s) from the last (and first) corner
+            ends = [pts[-1], QgsPointXY(moving)] + ([pts[0]] if self.kind == "area" and len(pts) >= 2 else [])
+            self.rubber.setToGeometry(QgsGeometry.fromPolylineXY(ends), None)
+        else:
+            self.rubber.reset(_GEOM_LINE)
+        if pts:
+            self.dots.setToGeometry(QgsGeometry.fromMultiPointXY(pts), None)
+        else:
+            self.dots.reset(_GEOM_POINT)
 
     def canvasMoveEvent(self, e):
         if self.pts:
@@ -650,17 +677,20 @@ class _ShapeTool(QgsMapTool):
     def canvasReleaseEvent(self, e):
         if e.button() == _e(Qt, "MouseButton", "LeftButton"):
             self.pts.append(QgsPointXY(e.mapPoint()))
-            self._redraw()
+            self._redraw(e.mapPoint())
             n = len(self.pts)
-            self.p._bar("%d corner%s — click the next, right-click or Enter to finish, Backspace to undo, "
-                        "Esc to start again" % (n, "" if n == 1 else "s"), _MSG_INFO, 4)
+            self.p.tool_hint("%d corner%s — click the next; right-click or Enter to finish, Backspace to undo"
+                             % (n, "" if n == 1 else "s"))
         elif e.button() == _e(Qt, "MouseButton", "RightButton"):
             self.finish()
 
     def keyPressEvent(self, e):
         key = e.key()
         if key == _e(Qt, "Key", "Key_Escape"):
-            self.reset()
+            if self.pts:
+                self.reset()
+            else:
+                self._on_cancel()
         elif key in (_e(Qt, "Key", "Key_Backspace"), _e(Qt, "Key", "Key_Delete")):
             self.pts = self.pts[:-1]
             self._redraw()
@@ -687,6 +717,13 @@ class _ShapeTool(QgsMapTool):
     def reset(self):
         self.pts = []
         self._redraw()
+
+    def remove_bands(self):
+        for band in (self.band, self.rubber, self.dots):
+            try:
+                self.canvas().scene().removeItem(band)
+            except (RuntimeError, AttributeError):
+                pass
 
     def deactivate(self):
         self.reset()
@@ -2269,7 +2306,8 @@ row (only offered for points whose identifier starts with <i>qgis-</i>, never fo
 Positions go to Traccar's OsmAnd port 5055, or to the <i>Send to</i> address in
 <b>Settings → Connection → Send point</b>.</li>
 <li><b>⬡ Area</b> / <b>〰 Line</b> — click each corner, then right-click (or Enter) to finish; Backspace
-removes the last corner, Esc starts again.</li>
+removes the last corner, Esc clears the corners. The shape is drawn as you go, with a dashed line to the
+mouse.</li>
 <li><b>⭕ Circle</b> — click the centre; radius 250, 500, 1000 m or any other.</li>
 <li><b>Right-click the map</b> → <i>Traccar Live</i> → <i>Send point here…</i> or <i>Send circle here…</i> at
 that spot (and <i>Send selected features</i> when something is selected). In the Layers panel, right-click a
@@ -2279,6 +2317,8 @@ geofences, points become circles or points (devices). Name and description can c
 works; holes in polygons are dropped (Traccar has none), and very detailed shapes are simplified to fit
 Traccar's size limit.</li>
 </ul>
+<p>While adding, a bar over the map says what to do and has a <b>Cancel</b> button (or press Esc). Once the
+shape is sent, or cancelled, the map tool you had before (e.g. Pan) comes back — nothing to switch off.</p>
 <p>Areas, lines and circles become Traccar <b>geofences</b>. The send form asks for a name, a description,
 a <b>speed limit</b> (Traccar warns when a device goes faster inside it), the <b>corridor width</b> of a line
 (how close a device must be to count as on it), a Traccar <b>calendar</b> (active only at those times) and a
@@ -2373,25 +2413,21 @@ class TraccarLive:
         self.act_live.setToolTip("Traccar Live: start / stop live updates")
         self.act_live.toggled.connect(self.set_live)
         self.act_send = QAction("📤 Point", mw)
-        self.act_send.setCheckable(True)
         self.act_send.setToolTip("Traccar Live: click the map to send a point to Traccar "
                                  "(a new device, or move an existing one there)")
-        self.act_send.toggled.connect(lambda on: self.set_tool("send", on))
+        self.act_send.triggered.connect(lambda _c=False: self.start_tool("send"))
         self.act_area = QAction("⬡ Area", mw)
-        self.act_area.setCheckable(True)
         self.act_area.setToolTip("Traccar Live: click each corner of an area, right-click to finish — "
                                  "sent to Traccar as a geofence")
-        self.act_area.toggled.connect(lambda on: self.set_tool("area", on))
+        self.act_area.triggered.connect(lambda _c=False: self.start_tool("area"))
         self.act_line = QAction("〰 Line", mw)
-        self.act_line.setCheckable(True)
         self.act_line.setToolTip("Traccar Live: click each point of a line, right-click to finish — "
                                  "sent to Traccar as a geofence")
-        self.act_line.toggled.connect(lambda on: self.set_tool("line", on))
+        self.act_line.triggered.connect(lambda _c=False: self.start_tool("line"))
         self.act_circle = QAction("⭕ Circle", mw)
-        self.act_circle.setCheckable(True)
         self.act_circle.setToolTip("Traccar Live: click the map to send a circle (250 / 500 / 1000 m …) "
                                    "to Traccar as a geofence")
-        self.act_circle.toggled.connect(lambda on: self.set_tool("circle", on))
+        self.act_circle.triggered.connect(lambda _c=False: self.start_tool("circle"))
         self.act_send_sel = QAction("📑 Send selected features…", mw)
         self.act_send_sel.setToolTip("Send the selected polygons, lines or points of the active layer "
                                      "to Traccar: areas and lines as geofences, points as circles or points")
@@ -2423,15 +2459,12 @@ class TraccarLive:
         self.play_timer.stop()
         self.api.abort_all()
         canvas = self.iface.mapCanvas()
+        self._clear_tool_hint()
         for tool in self._tools.values():
             if canvas.mapTool() is tool:
                 canvas.unsetMapTool(tool)
-            band = getattr(tool, "band", None)          # Area / Line tool's drawing
-            if band is not None:
-                try:
-                    canvas.scene().removeItem(band)
-                except (RuntimeError, AttributeError):
-                    pass
+            if isinstance(tool, _ShapeTool):            # Area / Line tool's drawing
+                tool.remove_bands()
         self._tools = {}
         self._remove_geofence_item()
         for r in list(self._send_replies):
@@ -3603,36 +3636,76 @@ class TraccarLive:
             sub.addAction("📑  Send %d selected feature(s) of '%s'…" % (lyr.selectedFeatureCount(), lyr.name()),
                           self.send_selected)
 
-    def _tool_action(self, which):
-        return {"send": self.act_send, "area": self.act_area, "line": self.act_line,
-                "circle": self.act_circle}[which]
+    # ── Map tools: "send" (📤 Point), "area" (⬡ Area), "line" (〰 Line), "circle" (⭕ Circle) ──
+    # Plain menu items: choosing one starts its tool, with a hint bar and a Cancel button. Once the
+    # shape is sent — or on Cancel / Esc — the map tool you had before comes back.
+    TOOL_HINTS = {"send": "Click the map where the point goes",
+                  "circle": "Click the map at the centre of the circle",
+                  "area": "Click each corner of the area; right-click or Enter to finish, Backspace to undo",
+                  "line": "Click each point of the line; right-click or Enter to finish, Backspace to undo"}
 
-    def set_tool(self, which, on):
+    def start_tool(self, which):
         canvas = self.iface.mapCanvas()
+        current = canvas.mapTool()
+        if current not in self._tools.values():
+            self._tool_prev = current                  # come back to this one afterwards
         tool = self._tools.get(which)
-        if on:
-            if tool is None:
-                off = lambda: self.tool_off(which)      # noqa: E731
-                if which in ("area", "line"):
-                    tool = _ShapeTool(self, canvas, which, self.shape_done, off)
-                else:
-                    tool = _ClickTool(self, canvas, self.send_point if which == "send" else self.circle_at, off)
-                self._tools[which] = tool
-            canvas.setMapTool(tool)
-            self._bar({"send": "Click the map where the point goes",
-                       "circle": "Click the map at the centre of the circle",
-                       "area": "Click each corner of the area, then right-click (or Enter) to finish",
-                       "line": "Click each point of the line, then right-click (or Enter) to finish"}[which],
-                      _MSG_INFO, 4)
-        elif tool is not None and canvas.mapTool() is tool:
-            canvas.unsetMapTool(tool)
+        if tool is None:
+            off, cancel = (lambda: self._tool_off(which)), (lambda: self.end_tool())   # noqa: E731
+            if which in ("area", "line"):
+                tool = _ShapeTool(self, canvas, which, self.shape_done, off, cancel)
+            else:
+                tool = _ClickTool(self, canvas, self.send_point if which == "send" else self.circle_at,
+                                  off, cancel)
+            self._tools[which] = tool
+        canvas.setMapTool(tool)
+        self._tool_which = which
+        self.tool_hint(self.TOOL_HINTS[which])
 
-    def tool_off(self, which):
-        """The tool was switched off (another map tool chosen): untick its button."""
-        act = self._tool_action(which)
-        act.blockSignals(True)
-        act.setChecked(False)
-        act.blockSignals(False)
+    def tool_hint(self, text):
+        """The bar over the map while adding: what to do, and Cancel."""
+        bar = self.iface.messageBar()
+        self._clear_tool_hint()
+        try:
+            item = bar.createMessage("Traccar Live", text)
+            btn = QPushButton("Cancel")
+            btn.clicked.connect(self.end_tool)
+            item.layout().addWidget(btn)
+            self._tool_msg = bar.pushWidget(item, _MSG_INFO, 0)
+        except (AttributeError, TypeError, RuntimeError):
+            self._tool_msg = None
+
+    def _clear_tool_hint(self):
+        if getattr(self, "_tool_msg", None) is not None:
+            try:
+                self.iface.messageBar().popWidget(self._tool_msg)
+            except (RuntimeError, TypeError, AttributeError):
+                pass
+        self._tool_msg = None
+
+    def end_tool(self):
+        """Stop adding: the map tool from before comes back (Pan if there was none)."""
+        canvas = self.iface.mapCanvas()
+        tool = self._tools.get(getattr(self, "_tool_which", None))
+        self._tool_which = None
+        self._clear_tool_hint()
+        if tool is not None and canvas.mapTool() is tool:
+            canvas.unsetMapTool(tool)
+            prev = getattr(self, "_tool_prev", None)
+            try:
+                if prev is not None:
+                    canvas.setMapTool(prev)
+                else:
+                    self.iface.actionPan().trigger()
+            except (RuntimeError, AttributeError):
+                pass
+        self._tool_prev = None
+
+    def _tool_off(self, which):
+        """Another map tool took over: drop the hint bar."""
+        if getattr(self, "_tool_which", None) == which:
+            self._tool_which = None
+            self._clear_tool_hint()
 
     def _send_dialog(self, mode, coords, edit=None):
         """The send form (or, with edit = a geofence's JSON, the edit form); its values, or None."""
@@ -3658,6 +3731,7 @@ class TraccarLive:
         tool = self._tools.get(kind)
         if tool is not None:
             tool.reset()
+        self.end_tool()
 
     def send_point(self, lat, lon):
         """Ask for a name (and details), then send lat / lon (WGS84) as a fix of that device, time = now.
@@ -3668,8 +3742,9 @@ class TraccarLive:
             return
         v = self._send_dialog("point", [(lat, lon)])
         if v is None:
-            return
+            return                                  # still adding: click again, or Cancel / Esc
         self.send_point_to(v, lat, lon)
+        self.end_tool()
 
     def send_point_to(self, v, lat, lon):
         """Send-dialog values v → a fix at lat / lon of the device named v["name"] (added if new)."""
@@ -3983,6 +4058,7 @@ class TraccarLive:
         self.set_cfg("geofence_color", v["color"])
         self._upsert_geofences([(v["name"], "CIRCLE (%s, %.1f)" % (_ll(lat, lon), v["radius"]), False)],
                                v["color"], geofence_extra(v))
+        self.end_tool()
 
     def delete_geofence(self, gid, name):
         """Ask, then delete a geofence from Traccar (one made in Traccar itself gets a firmer warning)."""

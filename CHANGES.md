@@ -1,5 +1,16 @@
 # Traccar Live (QGIS) — Changes
 
+## v0.4.2 (in development)
+
+- **Areas and lines are drawn while you add them**: the shape (filled for an area), a dot on each corner
+  and a dashed line to the mouse. Before, nothing showed until the geofence came back from Traccar
+  (the preview was never refreshed).
+- **No tick boxes for adding.** Point, Area, Line and Circle are plain menu items: choosing one starts
+  it, with a bar over the map saying what to do and a **Cancel** button (or Esc). Once the shape is sent
+  — or cancelled — the map tool you had before (e.g. Pan) comes back by itself.
+- Tests: the drawing, the dashed line, and getting the previous map tool back after sending, Esc and
+  Cancel; 187 checks.
+
 ## v0.4.1 — Right-click to send
 
 - **Right-click → Send to Traccar.** Right-click the map (Pan, Identify and other tools with a map menu):
