@@ -1162,6 +1162,35 @@ def t16j_send_form_and_tools():
               and edits[-1][0] == "circle")
     finally:
         plugin._send_dialog = orig
+    # ── right-click on the map: Traccar Live submenu for the clicked spot ──
+    from qgis.PyQt.QtWidgets import QMenu
+    canvas = IFACE.mapCanvas()
+    canvas.setDestinationCrs(mod.WGS84)
+    canvas.setExtent(mod.QgsRectangle(-6.4, 53.3, -6.2, 53.4))
+    px = canvas.getCoordinateTransform().transform(mod.QgsPointXY(-6.31, 53.355))
+    ev = QgsMapMouseEvent(canvas, mod._e(QEvent, "Type", "MouseButtonRelease"), QPointF(px.x(), px.y()).toPoint(),
+                          mod._e(mod.Qt, "MouseButton", "RightButton"), mod._e(mod.Qt, "MouseButton", "RightButton"),
+                          mod._e(mod.Qt, "KeyboardModifier", "NoModifier"))
+    menu = QMenu()
+    canvas.contextMenuAboutToShow.emit(menu, ev)
+    sub = [a.menu() for a in menu.actions() if a.menu() is not None and a.text() == "Traccar Live"]
+    texts = [a.text() for a in sub[0].actions()] if sub else []
+    check("right-click on the map: Traccar Live → Send point here / Send circle here",
+          len(texts) >= 2 and "Send point here" in texts[0] and "Send circle here" in texts[1], texts)
+    circles = []
+    plugin._send_dialog = lambda mode, coords, edit=None: circles.append((mode, coords)) or {
+        "name": "RV right-click", "description": "", "radius": 300, "corridor_m": 0, "speed_kmh": 0,
+        "calendar_id": 0, "color": "#2E7D32"}
+    try:
+        sub[0].actions()[1].trigger()
+        check("Send circle here: a circle at the clicked spot",
+              wait(lambda: any(g.get("name") == "RV right-click" for g in GEOFENCES)) and circles[0][0] == "circle"
+              and abs(circles[0][1][0][0] - 53.355) < 0.001 and abs(circles[0][1][0][1] + 6.31) < 0.001
+              and [g for g in GEOFENCES if g["name"] == "RV right-click"][0]["area"].endswith(", 300.0)"), circles)
+    finally:
+        plugin._send_dialog = orig
+    check("Layers panel right-click: Send selected features to Traccar…",
+          plugin.act_layer_send is not None and "Send selected features" in plugin.act_layer_send.text())
 
 
 @test

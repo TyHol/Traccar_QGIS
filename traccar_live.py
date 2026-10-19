@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-Traccar Live – QGIS Plugin  v0.4
+Traccar Live – QGIS Plugin  v0.4.1
 
 Follows Traccar devices on the QGIS map within one chosen time window, and saves
 their positions and tracks to two project layers on demand. Mirrors the QField
-plugin Traccar_QField v0.7, and uses the same layer schema, so one GeoPackage
+plugin Traccar_QField v0.7.1, and uses the same layer schema, so one GeoPackage
 works in both.
 
   Time window  — Last 15 min … 3 months, custom dates, or a feature's start/end.
@@ -106,6 +106,8 @@ def _new_or_old(new_root, new_name, old_root, old_name):
 _GEOM_POINT = _new_or_old(getattr(Qgis, "GeometryType", None), "Point", QgsWkbTypes, "PointGeometry")
 _GEOM_LINE = _new_or_old(getattr(Qgis, "GeometryType", None), "Line",  QgsWkbTypes, "LineGeometry")
 _GEOM_POLY = _new_or_old(getattr(Qgis, "GeometryType", None), "Polygon", QgsWkbTypes, "PolygonGeometry")
+_LAYER_VECTOR = _new_or_old(getattr(Qgis, "LayerType", None), "Vector",
+                            getattr(__import__("qgis.core", fromlist=["core"]), "QgsMapLayerType", None), "VectorLayer")
 _LF_POINT = _new_or_old(getattr(Qgis, "LayerFilter", None), "PointLayer",
                         getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "PointLayer")
 _LF_LINE = _new_or_old(getattr(Qgis, "LayerFilter", None), "LineLayer",
@@ -2269,6 +2271,9 @@ Positions go to Traccar's OsmAnd port 5055, or to the <i>Send to</i> address in
 <li><b>⬡ Area</b> / <b>〰 Line</b> — click each corner, then right-click (or Enter) to finish; Backspace
 removes the last corner, Esc starts again.</li>
 <li><b>⭕ Circle</b> — click the centre; radius 250, 500, 1000 m or any other.</li>
+<li><b>Right-click the map</b> → <i>Traccar Live</i> → <i>Send point here…</i> or <i>Send circle here…</i> at
+that spot (and <i>Send selected features</i> when something is selected). In the Layers panel, right-click a
+vector layer → <i>Send selected features to Traccar…</i>.</li>
 <li><b>📑 Send selected features…</b> — the selected features of the active layer: areas and lines become
 geofences, points become circles or points (devices). Name and description can come from fields. Any CRS
 works; holes in polygons are dropped (Traccar has none), and very detailed shapes are simplified to fit
@@ -2406,6 +2411,11 @@ class TraccarLive:
         canvas = self.iface.mapCanvas()
         canvas.xyCoordinates.connect(self._on_canvas_move)
         canvas.destinationCrsChanged.connect(self._on_crs_changed)
+        # Right-click: the map's menu (Pan, Identify… tools) and a vector layer's menu in the Layers panel
+        canvas.contextMenuAboutToShow.connect(self._canvas_menu)
+        self.act_layer_send = QAction("📑 Send selected features to Traccar…", mw)
+        self.act_layer_send.triggered.connect(self.send_selected)
+        self.iface.addCustomActionForLayerType(self.act_layer_send, "", _LAYER_VECTOR, True)
         self._remove_stale_overlays()
 
     def unload(self):
@@ -2432,11 +2442,15 @@ class TraccarLive:
         for sig, slot in ((QgsProject.instance().readProject, self._on_project_changed),
                           (QgsProject.instance().cleared, self._on_project_changed),
                           (canvas.xyCoordinates, self._on_canvas_move),
-                          (canvas.destinationCrsChanged, self._on_crs_changed)):
+                          (canvas.destinationCrsChanged, self._on_crs_changed),
+                          (canvas.contextMenuAboutToShow, self._canvas_menu)):
             try:
                 sig.disconnect(slot)
             except (TypeError, RuntimeError):
                 pass
+        if getattr(self, "act_layer_send", None) is not None:
+            self.iface.removeCustomActionForLayerType(self.act_layer_send)
+            self.act_layer_send = None
         self._remove_overlays()
         if self.dock is not None:
             self.dock.save_geometry()
@@ -3570,6 +3584,25 @@ class TraccarLive:
         reply.finished.connect(finished)
 
     # ── Map tools: "send" (📤 Point), "area" (⬡ Area), "line" (〰 Line), "circle" (⭕ Circle) ──
+    def _canvas_menu(self, menu, event):
+        """Right-click on the map: a Traccar Live submenu for the clicked spot."""
+        tr = QgsCoordinateTransform(self.iface.mapCanvas().mapSettings().destinationCrs(), WGS84,
+                                    QgsProject.instance())
+        try:
+            ll = tr.transform(event.mapPoint())
+        except QgsCsException:
+            return
+        lat, lon = ll.y(), ll.x()
+        menu.addSeparator()
+        sub = menu.addMenu(QIcon(os.path.join(os.path.dirname(__file__), "icon.png")), "Traccar Live")
+        sub.addAction("📤  Send point here…", lambda: self.send_point(lat, lon))
+        sub.addAction("⭕  Send circle here…", lambda: self.circle_at(lat, lon))
+        lyr = self.iface.activeLayer()
+        if isinstance(lyr, QgsVectorLayer) and lyr.selectedFeatureCount():
+            sub.addSeparator()
+            sub.addAction("📑  Send %d selected feature(s) of '%s'…" % (lyr.selectedFeatureCount(), lyr.name()),
+                          self.send_selected)
+
     def _tool_action(self, which):
         return {"send": self.act_send, "area": self.act_area, "line": self.act_line,
                 "circle": self.act_circle}[which]

@@ -1,5 +1,13 @@
 # Traccar Live (QGIS) — Changes
 
+## v0.4.1 (in development)
+
+- **Right-click → Send to Traccar.** Right-click the map (Pan, Identify and other tools with a map menu):
+  **Traccar Live → Send point here… / Send circle here…** at the clicked spot, and *Send selected
+  features* when the active layer has a selection. In the Layers panel, right-click a vector layer:
+  **Send selected features to Traccar…**. Same as the QField plugin's long-press menu.
+- Tested on QGIS 3.44 LTR and 4.2 (180 checks).
+
 ## v0.4.0 — Geofences, and adding to Traccar
 
 ### Geofences
