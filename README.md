@@ -16,7 +16,7 @@ A QGIS plugin that shows your [Traccar](https://www.traccar.org) GPS devices on 
 - **Two layers, saved on demand** — positions and tracks, into any point / line layers, in any CRS.
 - **Same layers and fields as the QField plugin [Traccar_QField](https://github.com/TyHol/Traccar_QField)**, so one GeoPackage works in the office and in the field.
 
-Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.4.0](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
+Works in **QGIS 3.28 – 4.x** (Qt 5 and Qt 6). Latest release: **[v0.4.1](https://github.com/TyHol/Traccar_QGIS/releases/latest)** · Changes: [CHANGES.md](CHANGES.md)
 
 ---
 
@@ -38,8 +38,7 @@ You need a Traccar account — your own server or e.g. `https://server.traccar.o
 |---|---|
 | **Traccar Live** | shows / hides the Traccar Live panel (time window, devices, save buttons) |
 | **▶ Live / ⏹ Live** | starts / stops live updates without opening anything; its tooltip shows the last update and any error |
-| **📤 Point · ⬡ Area · 〰 Line · ⭕ Circle** | add to Traccar by clicking the map (also under **＋ Add** in the panel) — see *Geofences and points* |
-| Plugins → Traccar Live | the same, plus *Settings…* and *Help* |
+| Plugins → Traccar Live | the same, plus **📤 Point**, **⬡ Area**, **〰 Line**, **⭕ Circle** and **📑 Send selected features…** (also under **＋ Add** in the panel — see *Geofences and points*), *Settings…* and *Help* |
 
 The panel docks on the right of the map by default; drag its title bar to dock it elsewhere or tab it with other panels, or float it as a separate window — it reopens where you left it. You can close it at any time — Live keeps running.
 

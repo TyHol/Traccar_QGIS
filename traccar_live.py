@@ -2258,7 +2258,7 @@ added to that edit session for you to save.</p>
 as UTC); the optional text fields <i>fix_local</i>, <i>start_local</i> and <i>last_local</i> hold the
 local time. For a local date/time in labels use <code>datetime_from_epoch(epoch("fix_time"))</code>.</p>
 <h3>Adding to Traccar</h3>
-<p>The <b>＋ Add</b> button next to Clear (also the toolbar and the plugin menu) has the same tools as the
+<p>The <b>＋ Add</b> button next to Clear (also the plugin menu) has the same tools as the
 QField plugin:</p>
 <ul>
 <li><b>📤 Point</b> — click the map, give a name. A new name (e.g. <i>RV1</i>) adds a new device in Traccar
@@ -2400,7 +2400,7 @@ class TraccarLive:
         self.act_settings.triggered.connect(lambda: self.open_settings(0))
         self.act_help = QAction("Help", mw)
         self.act_help.triggered.connect(self.show_help)
-        for act in (self.act_open, self.act_live, self.act_send, self.act_area, self.act_line, self.act_circle):
+        for act in (self.act_open, self.act_live):        # the add tools are under ＋ Add and in the menu
             self.iface.addToolBarIcon(act)
         for act in (self.act_open, self.act_live, self.act_send, self.act_area, self.act_line, self.act_circle,
                     self.act_send_sel, self.act_settings, self.act_help):

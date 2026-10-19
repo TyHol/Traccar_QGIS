@@ -1,11 +1,13 @@
 # Traccar Live (QGIS) — Changes
 
-## v0.4.1 (in development)
+## v0.4.1 — Right-click to send
 
 - **Right-click → Send to Traccar.** Right-click the map (Pan, Identify and other tools with a map menu):
   **Traccar Live → Send point here… / Send circle here…** at the clicked spot, and *Send selected
   features* when the active layer has a selection. In the Layers panel, right-click a vector layer:
   **Send selected features to Traccar…**. Same as the QField plugin's long-press menu.
+- **Point, Area, Line and Circle are no longer on the toolbar** — they are under **＋ Add** in the panel
+  and in Plugins → Traccar Live. The toolbar keeps *Traccar Live* and *▶ Live*.
 - Tested on QGIS 3.44 LTR and 4.2 (180 checks).
 
 ## v0.4.0 — Geofences, and adding to Traccar
@@ -22,7 +24,7 @@
   colour and a circle's radius. *Save to Traccar* updates the geofence; its shape stays.
 
 ### Add to Traccar
-- **＋ Add** next to Clear (also on the toolbar and in the plugin menu), with the same tools as the
+- **＋ Add** next to Clear (also in the plugin menu), with the same tools as the
   QField plugin:
   - **📤 Point** — click the map and give a name. A new name adds a device in Traccar (identifier
     `qgis-<name>-<time>`, or your own) and sends the position through Traccar's OsmAnd port; an existing
