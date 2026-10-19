@@ -1197,6 +1197,39 @@ class _GeofenceItem(_LiveItem):
             painter.fillPath(path, QBrush(QColor(s["color"]).darker(140)))
 
 
+class _PendingItem(_LiveItem):
+    """Points just sent to Traccar, drawn at once until a refresh shows the real device:
+    a dashed ring in the device's colour and "name (sending…)". points: [{"pt": QgsPointXY in
+    map coordinates, "label": str, "color": "#rrggbb"}]."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.points = []
+        self.setZValue(60)
+
+    def paint(self, painter, _option=None, _widget=None):
+        off = self.pos()
+        painter.setRenderHint(_ANTIALIAS, True)
+        font = QFont()
+        font.setPointSizeF(9)
+        font.setBold(True)
+        font.setItalic(True)
+        for m in self.points:
+            c = self.toCanvasCoordinates(m["pt"]) - off
+            color = QColor(m["color"])
+            fill = QColor(color)
+            fill.setAlpha(90)
+            pen = QPen(color, 2.5)
+            pen.setStyle(_e(Qt, "PenStyle", "DashLine"))
+            painter.setPen(pen)
+            painter.setBrush(QBrush(fill))
+            painter.drawEllipse(c, 7.5, 7.5)
+            path = QPainterPath()
+            path.addText(c + QPointF(10, -8), font, m["label"])
+            painter.strokePath(path, QPen(QColor(255, 255, 255, 230), 3))
+            painter.fillPath(path, QBrush(color.darker(130)))
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Main panel (dock widget: docked, tabbed or floating)
 # ════════════════════════════════════════════════════════════════════════════
@@ -2401,6 +2434,8 @@ class TraccarLive:
         self.geofences = []        # [{id, name, area, mine, raw, color, kind}] from Traccar, by name
         self._gf_item = None       # canvas item drawing them
         self._send_name = ""       # last name sent to, offered again on the next click
+        self.pending_points = []   # points just sent: drawn until a refresh shows the real device
+        self._pending_item = None
         self.groups = []           # Traccar groups and calendars, for the send form
         self.calendars = []
 
@@ -2471,6 +2506,8 @@ class TraccarLive:
                 tool.remove_bands()
         self._tools = {}
         self._remove_geofence_item()
+        self.pending_points = []
+        self._draw_pending()
         for r in list(self._send_replies):
             try:
                 r.abort()
@@ -2706,6 +2743,8 @@ class TraccarLive:
         self._remove_overlays()
         self.geofences = []
         self._draw_geofences()
+        self.pending_points = []
+        self._draw_pending()
         self._rebuild()
 
     def reload_window(self):
@@ -2810,6 +2849,7 @@ class TraccarLive:
             self._ui()
             return
         self.loading, self.load_started = True, time.time()
+        started = self.load_started
         self.status_msg = "Loading…"
         self._ui()
         self.load_geofences()
@@ -2843,6 +2883,7 @@ class TraccarLive:
                     else:
                         self.last_error = ""
                     self._rebuild()
+                    self._settle_pending(started)
 
                 def one_done():
                     state["pending"] -= 1
@@ -2881,6 +2922,7 @@ class TraccarLive:
         self.load_geofences()
         if not self.win["moving"]:
             return
+        started = time.time()
 
         def fail(msg):
             self._error(msg)
@@ -2918,6 +2960,7 @@ class TraccarLive:
                 self.last_update = now.astimezone().strftime("%H:%M:%S")
                 self.last_error = ""
                 self._rebuild()
+                self._settle_pending(started)
 
             self.api.get("/api/positions", got_latest, fail)
 
@@ -3314,6 +3357,8 @@ class TraccarLive:
             self._update_canvas()
         if self._gf_item is not None:
             self._draw_geofences()
+        if self._pending_item is not None:
+            self._draw_pending()
 
     # ── As temporary layers ───────────────────────────────────────────────
     def _update_layers(self):
@@ -3757,6 +3802,11 @@ class TraccarLive:
         name = v["name"]
         self._send_name = name
         t = int(time.time())
+        key = self._add_pending(name, lat, lon)
+
+        def failed(msg):
+            self._drop_pending(key)
+            self._bar(msg, _MSG_WARN, 12)
 
         def got_devices(devs):
             """OsmAnd needs the device's Identifier (uniqueId), not its name: accept either."""
@@ -3765,24 +3815,72 @@ class TraccarLive:
                 uid = next((d.get("uniqueId") for d in devs
                             if (d.get("name") or "").strip().lower() == name.lower()), None)
             if uid is not None:
-                self._send_fix(base, uid, name, lat, lon, t, where)
+                self._send_fix(base, uid, name, lat, lon, t, where, key)
                 return
             new_uid = v.get("unique_id") or SENT_POINT_PREFIX + "%s-%d" % (
                 re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:30] or "point", t)
             body = {"name": name, "uniqueId": new_uid, "category": v.get("category") or "default"}
             if v.get("group_id"):
                 body["groupId"] = v["group_id"]
-            for key in ("phone", "model", "contact"):
-                if v.get(key):
-                    body[key] = v[key]
+            for field in ("phone", "model", "contact"):
+                if v.get(field):
+                    body[field] = v[field]
             self.api.post("/api/devices", body,
-                          lambda d: self._send_fix(base, d.get("uniqueId") or new_uid, name, lat, lon, t, where),
-                          lambda m: self._bar("Couldn't add '%s' to Traccar (%s) — your account may not be "
-                                              "allowed to add devices." % (name, m), _MSG_WARN, 12))
+                          lambda d: self._send_fix(base, d.get("uniqueId") or new_uid, name, lat, lon, t, where, key),
+                          lambda m: failed("Couldn't add '%s' to Traccar (%s) — your account may not be "
+                                           "allowed to add devices." % (name, m)))
 
         self.api.get("/api/devices", got_devices,
-                     lambda m: self._bar("Send point needs your Traccar login to find or add '%s': %s"
-                                         % (name, m), _MSG_WARN, 10))
+                     lambda m: failed("Send point needs your Traccar login to find or add '%s': %s" % (name, m)))
+
+    # ── Points being sent: shown at once, until a refresh after Traccar accepted them ──
+    def _add_pending(self, name, lat, lon):
+        self._pending_seq = getattr(self, "_pending_seq", 0) + 1
+        self.pending_points.append({"key": self._pending_seq, "name": name, "lat": lat, "lon": lon,
+                                    "confirmed": None})
+        self._draw_pending()
+        return self._pending_seq
+
+    def _drop_pending(self, key):
+        self.pending_points = [m for m in self.pending_points if m["key"] != key]
+        self._draw_pending()
+
+    def _confirm_pending(self, key):
+        for m in self.pending_points:
+            if m["key"] == key:
+                m["confirmed"] = time.time()
+
+    def _settle_pending(self, fetch_started):
+        """A refresh that started after Traccar accepted a point shows the real device: drop the stand-in."""
+        keep = [m for m in self.pending_points if m["confirmed"] is None or m["confirmed"] > fetch_started]
+        if len(keep) != len(self.pending_points):
+            self.pending_points = keep
+            self._draw_pending()
+
+    def _draw_pending(self):
+        canvas = self.iface.mapCanvas()
+        if not self.pending_points:
+            if self._pending_item is not None:
+                try:
+                    self._pending_item.scene().removeItem(self._pending_item)
+                except (RuntimeError, AttributeError):
+                    pass
+                self._pending_item = None
+                canvas.refresh()
+            return
+        if self._pending_item is None:
+            self._pending_item = _PendingItem(canvas)
+        tr = QgsCoordinateTransform(WGS84, canvas.mapSettings().destinationCrs(), QgsProject.instance())
+        pts = []
+        for m in self.pending_points:
+            try:
+                pt = tr.transform(QgsPointXY(m["lon"], m["lat"]))
+            except QgsCsException:
+                continue
+            pts.append({"pt": pt, "label": "%s (sending…)" % m["name"], "color": _device_color(m["name"])})
+        self._pending_item.points = pts
+        self._pending_item.updatePosition()
+        self._pending_item.update()
 
     # ── Geofences (areas / lines / circles in Traccar) ────────────────────
     def load_geofences(self):
@@ -4201,8 +4299,9 @@ class TraccarLive:
         self.api.delete("/api/devices/%d" % dev_id, done,
                         lambda m: self._bar("Couldn't delete '%s' from Traccar: %s" % (name, m), _MSG_WARN, 10))
 
-    def _send_fix(self, base, dev, name, lat, lon, t, where):
-        """OsmAnd fix for the device with identifier dev (shown to the user as name)."""
+    def _send_fix(self, base, dev, name, lat, lon, t, where, key=None):
+        """OsmAnd fix for the device with identifier dev (shown to the user as name); key: its
+        stand-in marker (kept until a refresh after this fix, dropped if it fails)."""
         url = "%s%sid=%s&lat=%.7f&lon=%.7f&timestamp=%d&valid=true" % (
             base, "&" if "?" in base else "?", _quote(dev, safe=""), lat, lon, t)
         req = QNetworkRequest(QUrl(url))
@@ -4219,10 +4318,13 @@ class TraccarLive:
             err, errstr = reply.error(), reply.errorString()
             reply.deleteLater()
             if err == _NET_OK and (status is None or int(status) == 200):
+                self._confirm_pending(key)
                 self._bar("Sent to Traccar as '%s':  %s" % (name, where), _MSG_OK, 4)
                 if self.win is not None and self.win["moving"]:
                     QTimer.singleShot(2000, self.poll_live)      # show it without waiting for Live
-            elif status and int(status) == 400:
+                return
+            self._drop_pending(key)
+            if status and int(status) == 400:
                 self._bar("Traccar refused the point for '%s' (HTTP 400, identifier '%s') — check the "
                           "device isn't disabled, and that 'Send to' is the same Traccar server as the "
                           "Server URL." % (name, dev), _MSG_WARN, 10)

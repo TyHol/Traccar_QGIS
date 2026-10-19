@@ -11,8 +11,12 @@
 - **A sent geofence stays on the map** while Traccar saves it — marked *sending…* in the Geofences tab
   — instead of vanishing until the reload; Traccar's copy then replaces it (or, if Traccar refused it,
   it goes).
+- **A sent point shows at once too**: a dashed ring in the device's colour and "*name* (sending…)",
+  until the first refresh or Live update after Traccar accepted it — then the real marker is there
+  (in a past time window it simply goes). If Traccar refuses the point, it goes at once.
+- Fixed: the point's details loop reused a variable name, which would have lost track of the marker.
 - Tests: the drawing, the dashed line, getting the previous map tool back after sending, Esc and
-  Cancel, and a sent geofence shown at once; 189 checks.
+  Cancel, a sent geofence and a sent point shown at once; 193 checks.
 
 ## v0.4.1 — Right-click to send
 
