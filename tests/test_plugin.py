@@ -1066,7 +1066,7 @@ def t16j_send_form_and_tools():
     # ── Area tool: corners on the map, right-click → form → geofence ──
     forms = []
     orig = plugin._send_dialog
-    plugin._send_dialog = lambda mode, coords: forms.append((mode, coords)) or {
+    plugin._send_dialog = lambda mode, coords, edit=None: forms.append((mode, coords)) or {
         "name": "Sector B", "description": "North", "radius": 500, "corridor_m": 0, "speed_kmh": 0,
         "calendar_id": 0, "color": "#00838F"}
     try:
@@ -1122,6 +1122,43 @@ def t16j_send_form_and_tools():
     finally:
         plugin._send_dialog = orig
         plugin.cfg["send_url"] = ""
+    acts = [a.text() for a in d.add_menu.actions() if not a.isSeparator()]
+    check("＋ Add next to Clear: Point, Area, Line, Circle, Send selected",
+          acts == [plugin.act_send.text(), plugin.act_area.text(), plugin.act_line.text(),
+                   plugin.act_circle.text(), plugin.act_send_sel.text()], acts)
+    # ── edit a geofence with the same form ──
+    plugin._upsert_geofences([("Sector C", "POLYGON ((53.37 -6.30, 53.37 -6.29, 53.36 -6.29, 53.37 -6.30))", False)],
+                             "#00838F", {"description": "North", "attributes": {"speedLimit": 5.4}})
+    wait(lambda: any(g["name"] == "Sector C" for g in plugin.geofences), 3)
+    gid = [g for g in plugin.geofences if g["name"] == "Sector C"][0]["id"]
+    f = mod.SendDialog(plugin, "area", [(53.37, -6.30)], None, [g for g in plugin.geofences if g["id"] == gid][0]["raw"])
+    check("edit form filled in with the geofence's values",
+          f.name.text() == "Sector C" and f.description.text() == "North" and f.speed.value() == 10
+          and f.swatches.color() == "#00838F" and f.windowTitle().endswith("Edit geofence"),
+          (f.name.text(), f.description.text(), f.speed.value(), f.swatches.color()))
+    f.deleteLater()
+    edits = []
+    plugin._send_dialog = lambda mode, coords, edit=None: edits.append((mode, edit)) or {
+        "name": "Sector C2", "description": "North shore", "radius": 750, "corridor_m": 0, "speed_kmh": 0,
+        "calendar_id": 9, "color": "#C62828"}
+    try:
+        plugin.edit_geofence(gid)
+        g = lambda: [x for x in GEOFENCES if x["id"] == gid][0]   # noqa: E731
+        check("Edit saves name, description, calendar and colour; speed limit cleared; shape kept",
+              wait(lambda: g()["name"] == "Sector C2") and edits[0][0] == "area" and g()["description"] == "North shore"
+              and g()["calendarId"] == 9 and g()["attributes"]["color"] == "#C62828"
+              and "speedLimit" not in g()["attributes"] and g()["area"].startswith("POLYGON ((53.37")
+              and g()["attributes"].get("createdByTraccarLiveQgis") is True, g())
+        cid = [x for x in GEOFENCES if x["area"].startswith("CIRCLE (53.360000 -6.330000")][0]["id"]
+        wait(lambda: [x for x in plugin.geofences if x["id"] == gid][0]["name"] == "Sector C2", 3)
+        plugin.load_geofences()
+        wait(lambda: any(x["id"] == cid for x in plugin.geofences), 3)
+        plugin.edit_geofence(cid)
+        check("editing a circle can change its radius",
+              wait(lambda: [x for x in GEOFENCES if x["id"] == cid][0]["area"] == "CIRCLE (53.360000 -6.330000, 750.0)")
+              and edits[-1][0] == "circle")
+    finally:
+        plugin._send_dialog = orig
 
 
 @test

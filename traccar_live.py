@@ -713,9 +713,10 @@ class _SwatchRow(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
-        self._color = color.upper() if color.upper() in SWATCHES else SWATCHES[0]
+        color = (color or SWATCHES[0]).upper()
+        self._color = color
         self.buttons = {}
-        for c in SWATCHES:
+        for c in SWATCHES + (() if color in SWATCHES else (color,)):     # keep a colour set elsewhere
             b = QToolButton()
             b.setFixedSize(26, 26)
             b.setCheckable(True)
@@ -739,17 +740,19 @@ class _SwatchRow(QWidget):
 
 class SendDialog(QDialog):
     """Name and details for one shape sent to Traccar. mode: "point" (a device), or "circle",
-    "area", "line" (geofences). coords: [(lat, lon), …] in WGS84. values() after exec()."""
+    "area", "line" (geofences). coords: [(lat, lon), …] in WGS84. values() after exec().
+    edit: a geofence from Traccar (its raw JSON) — the form then edits it instead."""
 
     TITLES = {"point": "Send point", "circle": "Send circle as a geofence",
               "area": "Send area as a geofence", "line": "Send line as a geofence"}
 
-    def __init__(self, plugin, mode, coords, parent=None):
+    def __init__(self, plugin, mode, coords, parent=None, edit=None):
         super().__init__(parent)
-        self.p, self.mode, self.coords = plugin, mode, coords
-        self.setWindowTitle("Traccar Live – " + self.TITLES[mode])
+        self.p, self.mode, self.coords, self.edit = plugin, mode, coords, edit
+        title = "Edit geofence" if edit is not None else self.TITLES[mode]
+        self.setWindowTitle("Traccar Live – " + title)
         f = QFormLayout(self)
-        head = QLabel(self.TITLES[mode])
+        head = QLabel(title)
         head.setStyleSheet("font-weight:bold;font-size:14px;")
         f.addRow(head)
         if mode in ("point", "circle"):
@@ -787,7 +790,8 @@ class SendDialog(QDialog):
             f.addRow("Contact:", self.contact)
         else:
             self.name.setPlaceholderText("e.g. Sector A")
-            f.addRow(_hint("A geofence sent from QGIS or QField before with the same name is replaced."))
+            if edit is None:
+                f.addRow(_hint("A geofence sent from QGIS or QField before with the same name is replaced."))
             self.description = QLineEdit()
             f.addRow("Description:", self.description)
             self.radius = QSpinBox()
@@ -824,16 +828,38 @@ class SendDialog(QDialog):
                 self.calendar.addItem(c.get("name") or str(c["id"]), c["id"])
             self.calendar.setToolTip("Only active at the times of this Traccar calendar")
             f.addRow("Calendar:", self.calendar)
-            self.swatches = _SwatchRow(plugin.cfg["geofence_color"])
+            now = QColor(str(((edit or {}).get("attributes") or {}).get("color") or ""))
+            self.swatches = _SwatchRow(now.name() if edit is not None and now.isValid()
+                                       else GEOFENCE_COLOR if edit is not None else plugin.cfg["geofence_color"])
             f.addRow("Colour:", self.swatches)
+        if edit is not None:
+            self._fill(edit)
         bb = QDialogButtonBox(_BTN_CANCEL)
-        send = bb.addButton("Send to Traccar", _e(QDialogButtonBox, "ButtonRole", "AcceptRole"))
+        send = bb.addButton("Save to Traccar" if edit is not None else "Send to Traccar",
+                            _e(QDialogButtonBox, "ButtonRole", "AcceptRole"))
         send.setDefault(True)
         bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
         f.addRow(bb)
         self.name.selectAll()
         self.name.setFocus()
+
+    def _fill(self, raw):
+        """Edit: the geofence's current values into the form."""
+        attrs = raw.get("attributes") or {}
+        self.name.setText(raw.get("name") or "")
+        self.description.setText(raw.get("description") or "")
+        if attrs.get("speedLimit"):
+            self.speed.setValue(int(round(float(attrs["speedLimit"]) * 1.852)))
+        if attrs.get("polylineDistance"):
+            self.corridor.setValue(int(round(float(attrs["polylineDistance"]))))
+        i = self.calendar.findData(raw.get("calendarId") or 0)
+        self.calendar.setCurrentIndex(max(0, i))
+        m = re.search(r",\s*(-?\d+(?:\.\d+)?)\s*\)\s*$", raw.get("area") or "")
+        if self.mode == "circle" and m:
+            self.radius.setValue(int(round(float(m.group(1)))))
+        color = QColor(str(attrs.get("color") or ""))
+        self.swatches.set_color(color.name().upper() if color.isValid() else GEOFENCE_COLOR)
 
     def _accept(self):
         if not self.name.text().strip():
@@ -1207,6 +1233,15 @@ class MainDock(QgsDockWidget):
         row.addWidget(self.live_btn, 2)
         row.addWidget(self.refresh_btn, 1)
         row.addWidget(self.clear_btn, 1)
+        self.add_btn = QPushButton("＋ Add")        # same Add menu as the QField plugin
+        self.add_btn.setToolTip("Add a point, area, line or circle to Traccar, or send selected features")
+        self.add_menu = QMenu(self.add_btn)
+        for act in (self.p.act_send, self.p.act_area, self.p.act_line, self.p.act_circle):
+            self.add_menu.addAction(act)
+        self.add_menu.addSeparator()
+        self.add_menu.addAction(self.p.act_send_sel)
+        self.add_btn.setMenu(self.add_menu)
+        row.addWidget(self.add_btn, 1)
         root.addLayout(row)
 
         # ── What to show ──────────────────────────────────────────────────
@@ -1304,17 +1339,6 @@ class MainDock(QgsDockWidget):
                 lambda _pos, t=table, k=key, cs=cols: self._columns_menu(t, k, cs))
             self._apply_hidden_columns(table, key, cols)
 
-        # ── Add to Traccar (same tools as the QField plugin) ──────────────
-        add = QHBoxLayout()
-        add.addWidget(QLabel("Add:"))
-        for act in (self.p.act_send, self.p.act_area, self.p.act_line, self.p.act_circle, self.p.act_send_sel):
-            b = QToolButton()
-            b.setDefaultAction(act)                 # same on/off state as the toolbar buttons
-            b.setToolButtonStyle(_e(Qt, "ToolButtonStyle", "ToolButtonTextOnly"))
-            add.addWidget(b)
-        add.addStretch()
-        root.addLayout(add)
-
         # ── Playback ──────────────────────────────────────────────────────
         pb = QGroupBox("Playback")
         pl = QVBoxLayout(pb)
@@ -1379,7 +1403,7 @@ class MainDock(QgsDockWidget):
         self.help_btn = QPushButton("Help")
         self.gf_btn = QToolButton()
         self.gf_btn.setText("⬡  Geofences")
-        self.gf_btn.setToolTip("Send areas, lines and circles to Traccar as geofences, or delete them")
+        self.gf_btn.setToolTip("Reload or delete geofences (add them with ＋ Add)")
         self.gf_btn.setPopupMode(_e(QToolButton, "ToolButtonPopupMode", "InstantPopup"))
         self.gf_menu = QMenu(self.gf_btn)
         self.gf_btn.setMenu(self.gf_menu)
@@ -1661,8 +1685,6 @@ class MainDock(QgsDockWidget):
     def _fill_geofence_menu(self):
         m, p = self.gf_menu, self.p
         m.clear()
-        for act in (p.act_area, p.act_line, p.act_circle, p.act_send_sel):
-            m.addAction(act)
         m.addAction("↻  Reload geofences", p.load_geofences)
         sub = m.addMenu("🗑  Delete from Traccar")
         sub.setEnabled(bool(p.geofences))
@@ -1765,6 +1787,7 @@ class MainDock(QgsDockWidget):
         menu.addSection("%s  (%s, from %s)" % (g["name"] or "(no name)", p.geofence_type(g),
                                                "QGIS / QField" if g["mine"] else "Traccar"))
         menu.addAction("Zoom to geofence", lambda: p.zoom_to_geofence(gid))
+        menu.addAction("✏  Edit…", lambda: p.edit_geofence(gid))
         colours = menu.addMenu("🎨  Colour")              # the same swatches as the send form and QField
         for c in SWATCHES:
             swatch = QPixmap(16, 16)
@@ -2233,7 +2256,7 @@ added to that edit session for you to save.</p>
 as UTC); the optional text fields <i>fix_local</i>, <i>start_local</i> and <i>last_local</i> hold the
 local time. For a local date/time in labels use <code>datetime_from_epoch(epoch("fix_time"))</code>.</p>
 <h3>Adding to Traccar</h3>
-<p>The <b>Add</b> row under the lists (also the toolbar and the plugin menu) has the same tools as the
+<p>The <b>＋ Add</b> button next to Clear (also the toolbar and the plugin menu) has the same tools as the
 QField plugin:</p>
 <ul>
 <li><b>📤 Point</b> — click the map, give a name. A new name (e.g. <i>RV1</i>) adds a new device in Traccar
@@ -2261,8 +2284,9 @@ geofences.</p>
 <p>Traccar's geofences are drawn on the map with their names, each in its own colour (the colour set in
 Traccar, else orange) — they never go grey like old fixes. Tick <i>Geofences</i> under Show; they are
 refreshed with Live. The <b>Geofences</b> tab lists them: tick one to show or hide it, double-click to zoom
-to it, and ⋯ or right-click to <b>change its colour</b> (saved in Traccar, so its map shows it too), copy it
-as WKT, or <b>delete it from Traccar</b> — you are always asked first, and deleting one made in Traccar gets
+to it, and ⋯ or right-click to <b>edit</b> it (name, description, speed limit, corridor width, calendar,
+radius of a circle — the same form as for adding), <b>change its colour</b> (saved in Traccar, so its map
+shows it too), copy it as WKT, or <b>delete it from Traccar</b> — you are always asked first, and deleting one made in Traccar gets
 an extra warning, as Traccar alerts may use it. Right-click the column titles of either tab to hide columns
 you don't need (remembered). Other Traccar users see a geofence when it is shared with them in Traccar
 (admins see all).</p>
@@ -3570,9 +3594,9 @@ class TraccarLive:
         act.setChecked(False)
         act.blockSignals(False)
 
-    def _send_dialog(self, mode, coords):
-        """The send form; its values, or None when cancelled."""
-        d = SendDialog(self, mode, coords, self.iface.mainWindow())
+    def _send_dialog(self, mode, coords, edit=None):
+        """The send form (or, with edit = a geofence's JSON, the edit form); its values, or None."""
+        d = SendDialog(self, mode, coords, self.iface.mainWindow(), edit)
         ok = d.exec() == _DLG_OK
         v = d.values() if ok else None
         d.deleteLater()
@@ -3958,6 +3982,38 @@ class TraccarLive:
 
         def done(_g):
             self._bar("Colour of '%s' saved in Traccar" % g["name"], _MSG_OK, 3)
+            self.load_geofences()
+
+        self.api.put("/api/geofences/%d" % gid, body, done,
+                     lambda m: self._bar("Couldn't change '%s' in Traccar: %s" % (g["name"], m), _MSG_WARN, 10))
+
+    def edit_geofence(self, gid):
+        """The send form, filled in with the geofence's values; Save puts the changes in Traccar."""
+        g = self._geofence(gid)
+        if g is None:
+            return
+        raw = g["raw"]
+        mode = {"polygon": "area", "line": "line", "circle": "circle"}.get(g["kind"], "area")
+        m = re.match(r"\s*CIRCLE\s*\(\s*%s\s+%s" % (_NUM, _NUM), g["area"], re.I)
+        coords = [(float(m.group(1)), float(m.group(2)))] if m else []
+        if not coords:
+            parsed = parse_geofence_area(g["area"])
+            coords = [(lat, lon) for lon, lat in (parsed[1] if parsed else [])]
+        v = self._send_dialog(mode, coords, raw)
+        if v is None:
+            return
+        extra = geofence_extra(v)
+        attrs = dict(raw.get("attributes") or {})
+        attrs.pop("speedLimit", None)
+        attrs.pop("polylineDistance", None)
+        attrs.update(extra["attributes"])
+        body = dict(raw, name=v["name"], description=extra["description"], calendarId=extra["calendarId"],
+                    attributes=attrs)
+        if mode == "circle" and coords:
+            body["area"] = "CIRCLE (%s, %.1f)" % (_ll(*coords[0]), v["radius"])
+
+        def done(_g):
+            self._bar("'%s' saved in Traccar" % v["name"], _MSG_OK, 3)
             self.load_geofences()
 
         self.api.put("/api/geofences/%d" % gid, body, done,

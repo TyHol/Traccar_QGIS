@@ -3,8 +3,8 @@
 ## Unreleased
 
 ### Same tools and forms as the QField plugin
-- **Add** row in the panel (and on the toolbar): **📤 Point**, **⬡ Area**, **〰 Line**, **⭕ Circle**,
-  **📑 Send selected features…**. Area and Line are new map tools: click each corner, right-click or
+- **＋ Add** button next to Clear (and the toolbar): **📤 Point**, **⬡ Area**, **〰 Line**, **⭕ Circle**,
+  **📑 Send selected features…**. The ⬡ Geofences button keeps *Reload* and *Delete*. Area and Line are new map tools: click each corner, right-click or
   Enter to finish, Backspace to undo, Esc to start again.
 - **One send form** for every shape, laid out like QField's: name, then Traccar's fields —
   geofences: description, speed limit (km/h, saved in knots as `speedLimit`), corridor width for lines
@@ -14,6 +14,8 @@
 - *Send selected features* keeps its own dialog, now with the swatches, a description field and, for
   point layers, *as circles* or *as points (devices)*.
 - Changing a geofence's colour: ⋯ → **Colour** shows the swatches, plus *Other colour…*.
+- **Edit a geofence**: ⋯ → **Edit…** opens the same form, filled in — name, description, speed limit,
+  corridor width, calendar, colour and a circle's radius; *Save to Traccar* updates it (its shape stays).
 - **Tabs**: Devices and Geofences, with counts. Right-click a list's column titles to **hide columns**
   (remembered: `device_columns_hidden`, `geofence_columns_hidden`). The geofence list has new
   *Description* and *Speed limit* columns.
