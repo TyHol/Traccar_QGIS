@@ -1033,6 +1033,16 @@ def t16i_geofences():
           wait(lambda: GEOFENCES[0]["area"].endswith("-6.28)")) and len(GEOFENCES) == 1
           and GEOFENCES[0]["attributes"] == {"createdByTraccarLiveQgis": True, "color": "#6A1B9A"},
           GEOFENCES)
+    # ── a sent geofence stays on the map while Traccar saves it ──
+    plugin._upsert_geofences([("Pending A", "CIRCLE (53.35 -6.30, 100)", False)], "#C62828")
+    now = [g for g in plugin.geofences if g["name"] == "Pending A"]
+    row = [r for r in range(d.gf_table.rowCount()) if d.gf_table.item(r, 0).text() == "Pending A"]
+    check("sent geofence shown at once (before Traccar replies), marked 'sending…'",
+          now and now[0].get("pending") and any(sh["label"] == "Pending A" for sh in plugin._gf_item.shapes)
+          and row and d.gf_table.item(row[0], 2).text() == "sending…", now)
+    check("…then replaced by Traccar's copy",
+          wait(lambda: any(g["name"] == "Pending A" and not g.get("pending") and g["id"] > 0 for g in plugin.geofences))
+          and sum(1 for g in plugin.geofences if g["name"] == "Pending A") == 1)
 
 
 @test
@@ -1154,8 +1164,8 @@ def t16j_send_form_and_tools():
     # ── edit a geofence with the same form ──
     plugin._upsert_geofences([("Sector C", "POLYGON ((53.37 -6.30, 53.37 -6.29, 53.36 -6.29, 53.37 -6.30))", False)],
                              "#00838F", {"description": "North", "attributes": {"speedLimit": 5.4}})
-    wait(lambda: any(g["name"] == "Sector C" for g in plugin.geofences), 3)
-    gid = [g for g in plugin.geofences if g["name"] == "Sector C"][0]["id"]
+    wait(lambda: any(g["name"] == "Sector C" and not g.get("pending") for g in plugin.geofences), 3)
+    gid = [g for g in plugin.geofences if g["name"] == "Sector C" and not g.get("pending")][0]["id"]
     f = mod.SendDialog(plugin, "area", [(53.37, -6.30)], None, [g for g in plugin.geofences if g["id"] == gid][0]["raw"])
     check("edit form filled in with the geofence's values",
           f.name.text() == "Sector C" and f.description.text() == "North" and f.speed.value() == 10

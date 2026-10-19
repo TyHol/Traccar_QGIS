@@ -6,7 +6,7 @@ Traccar Live – QGIS Plugin  v0.4.2
 
 Follows Traccar devices on the QGIS map within one chosen time window, and saves
 their positions and tracks to two project layers on demand. Mirrors the QField
-plugin Traccar_QField v0.7.1, and uses the same layer schema, so one GeoPackage
+plugin Traccar_QField v0.7.2, and uses the same layer schema, so one GeoPackage
 works in both.
 
   Time window  — Last 15 min … 3 months, custom dates, or a feature's start/end.
@@ -1728,7 +1728,7 @@ class MainDock(QgsDockWidget):
         sub = m.addMenu("🗑  Delete from Traccar")
         sub.setEnabled(bool(p.geofences))
         for title, mine in (("Sent from QGIS / QField", True), ("Made in Traccar", False)):
-            gfs = [g for g in p.geofences if g["mine"] == mine]
+            gfs = [g for g in p.geofences if g["mine"] == mine and not g.get("pending")]
             if gfs:
                 sub.addSection(title)
             for g in gfs:
@@ -1796,7 +1796,8 @@ class MainDock(QgsDockWidget):
         for r, g in enumerate(rows):
             on = g["id"] not in hidden
             for col, v in enumerate([g["name"] or "(no name)", p.geofence_type(g),
-                                     "QGIS / QField" if g["mine"] else "Traccar", g["description"],
+                                     "sending…" if g.get("pending") else "QGIS / QField" if g["mine"] else "Traccar",
+                                     g["description"],
                                      "%d km/h" % g["speed_kmh"] if g["speed_kmh"] else "", "⋯"]):
                 item = QTableWidgetItem(v)
                 if col == 0:
@@ -1822,6 +1823,9 @@ class MainDock(QgsDockWidget):
             return
         g, p = self._gf_rows[r], self.p
         gid = g["id"]
+        if g.get("pending"):                            # not in Traccar yet: nothing to change
+            p._bar("'%s' is still being sent to Traccar" % g["name"], _MSG_INFO, 3)
+            return
         menu = QMenu(self.gf_table)
         menu.addSection("%s  (%s, from %s)" % (g["name"] or "(no name)", p.geofence_type(g),
                                                "QGIS / QField" if g["mine"] else "Traccar"))
@@ -3897,6 +3901,23 @@ class TraccarLive:
             self._gf_item = None
             self.iface.mapCanvas().refresh()
 
+    def _show_pending(self, items, color, extra, attrs):
+        """Draw geofences being sent straight away (marked 'sending…'), so a shape doesn't vanish
+        between sending it and Traccar's reply. The reload after sending replaces them with
+        Traccar's copies — or removes them if Traccar refused."""
+        names = {n.strip().lower() for n, _a, _s in items}
+        keep = [g for g in self.geofences if not (g["mine"] and g["name"].strip().lower() in names)]
+        for k, (name, area, _simp) in enumerate(items, 1):
+            parsed = parse_geofence_area(area)
+            speed = attrs.get("speedLimit")
+            keep.append({"id": -k, "name": name, "area": area, "mine": True, "pending": True,
+                         "raw": dict(extra, name=name, area=area, attributes=dict(attrs)),
+                         "color": QColor(color).name().upper(), "kind": parsed[0] if parsed else "",
+                         "description": extra.get("description", ""),
+                         "speed_kmh": round(float(speed) * 1.852) if speed else 0})
+        self.geofences = sorted(keep, key=lambda g: g["name"].lower())
+        self._draw_geofences()
+
     def _upsert_geofences(self, items, color, extra=None):
         """items: [(name, area, simplified)], all given colour ("#RRGGBB", Traccar's 'color'
         attribute) and the extra fields from the send form ({description, calendarId, attributes}).
@@ -3904,6 +3925,7 @@ class TraccarLive:
         anything else is added (POST). Then the map is redrawn."""
         extra = dict(extra or {})
         attrs = dict(extra.pop("attributes", {}), **{GEOFENCE_MARK: True, "color": color})
+        self._show_pending(items, color, extra, attrs)
 
         def got(existing):
             mine = {(g.get("name") or "").strip().lower(): g for g in existing
@@ -4063,7 +4085,7 @@ class TraccarLive:
     def delete_geofence(self, gid, name):
         """Ask, then delete a geofence from Traccar (one made in Traccar itself gets a firmer warning)."""
         g = self._geofence(gid)
-        if g is None:
+        if g is None or g.get("pending"):        # not in Traccar yet
             return
         yes = _e(QMessageBox, "StandardButton", "Yes")
         no = _e(QMessageBox, "StandardButton", "No")
@@ -4085,7 +4107,7 @@ class TraccarLive:
     def set_geofence_color(self, gid, color=None):
         """Save a colour on the geofence in Traccar (its 'color' attribute); None = pick any colour."""
         g = self._geofence(gid)
-        if g is None:
+        if g is None or g.get("pending"):        # not in Traccar yet
             return
         if color is None:
             picked = QColorDialog.getColor(QColor(g["color"]), self.iface.mainWindow(),
@@ -4106,7 +4128,7 @@ class TraccarLive:
     def edit_geofence(self, gid):
         """The send form, filled in with the geofence's values; Save puts the changes in Traccar."""
         g = self._geofence(gid)
-        if g is None:
+        if g is None or g.get("pending"):        # not in Traccar yet
             return
         raw = g["raw"]
         mode = {"polygon": "area", "line": "line", "circle": "circle"}.get(g["kind"], "area")

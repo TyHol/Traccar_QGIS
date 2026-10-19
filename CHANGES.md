@@ -8,8 +8,11 @@
 - **No tick boxes for adding.** Point, Area, Line and Circle are plain menu items: choosing one starts
   it, with a bar over the map saying what to do and a **Cancel** button (or Esc). Once the shape is sent
   — or cancelled — the map tool you had before (e.g. Pan) comes back by itself.
-- Tests: the drawing, the dashed line, and getting the previous map tool back after sending, Esc and
-  Cancel; 187 checks.
+- **A sent geofence stays on the map** while Traccar saves it — marked *sending…* in the Geofences tab
+  — instead of vanishing until the reload; Traccar's copy then replaces it (or, if Traccar refused it,
+  it goes).
+- Tests: the drawing, the dashed line, getting the previous map tool back after sending, Esc and
+  Cancel, and a sent geofence shown at once; 189 checks.
 
 ## v0.4.1 — Right-click to send
 
