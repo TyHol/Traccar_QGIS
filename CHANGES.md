@@ -1,5 +1,31 @@
 # Traccar Live (QGIS) — Changes
 
+## Unreleased
+
+### Send point
+- **📤 Send point** (toolbar, plugin menu and the panel): click the map, give the point a name, and it is
+  sent to Traccar. A new name adds a new device with that name (`POST /api/devices`, identifier
+  `qgis-<name>-<time>`); the name or identifier of an existing device moves that device. Positions are sent
+  with the OsmAnd protocol (`http://<server>:5055/?id=…&lat=…&lon=…&timestamp=…`); Live picks them up
+  straight away.
+- **⋯ → Delete this point from Traccar…** on a point added by Send point (identifier `qgis-…`) deletes that
+  device and its positions from Traccar, after a confirmation. Not offered for any other device.
+### Geofences
+- Traccar's **geofences** (polygons, lines, circles) are drawn on the map in orange with their names, under
+  the live view; *Geofences* under Show switches them on / off. Reloaded with Refresh and Live.
+- **⬡ Geofences** button in the panel:
+  - **Send selected features to Traccar…** — the active layer's selected polygons, lines or points (as
+    circles of a chosen radius) become geofences, named from a field or a typed name (numbered). Any CRS;
+    multipart features become one geofence per part; polygon holes are dropped; shapes over Traccar's
+    4096-character area limit are simplified until they fit.
+  - **⭕ Circle** (also on the toolbar) — click the map, name it, radius 250 / 500 / 1000 m or any other.
+  - **Delete from Traccar** — only geofences sent from QGIS (marked with the `createdByTraccarLiveQgis`
+    attribute).
+- Sending a name that matches a geofence sent from QGIS before **replaces** it (`PUT`), so edited sectors
+  can be re-sent.
+- **Settings → Connection → Send point**: the name offered first, and an optional *Send to* address for
+  servers whose OsmAnd port isn't 5055 (or is behind a proxy).
+
 ## v0.3.0
 
 ### Dockable panel

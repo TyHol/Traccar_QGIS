@@ -56,7 +56,7 @@ from qgis.PyQt.QtWidgets import (
     QRadioButton, QButtonGroup, QPushButton, QDialogButtonBox, QTabWidget,
     QWidget, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton, QToolTip,
-    QMenu, QScrollArea, QFrame, QSlider,
+    QMenu, QScrollArea, QFrame, QSlider, QInputDialog,
 )
 from qgis.core import (
     Qgis, QgsApplication, QgsAuthMethodConfig, QgsProject, QgsVectorLayer, QgsFeature,
@@ -71,6 +71,7 @@ from qgis.core import (
 )
 from qgis.gui import (
     QgsMapLayerComboBox, QgsFieldComboBox, QgsMapCanvasItem, QgsDockWidget, QgsProjectionSelectionWidget,
+    QgsMapToolEmitPoint,
 )
 
 try:
@@ -104,6 +105,7 @@ def _new_or_old(new_root, new_name, old_root, old_name):
 
 _GEOM_POINT = _new_or_old(getattr(Qgis, "GeometryType", None), "Point", QgsWkbTypes, "PointGeometry")
 _GEOM_LINE = _new_or_old(getattr(Qgis, "GeometryType", None), "Line",  QgsWkbTypes, "LineGeometry")
+_GEOM_POLY = _new_or_old(getattr(Qgis, "GeometryType", None), "Polygon", QgsWkbTypes, "PolygonGeometry")
 _LF_POINT = _new_or_old(getattr(Qgis, "LayerFilter", None), "PointLayer",
                         getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "PointLayer")
 _LF_LINE = _new_or_old(getattr(Qgis, "LayerFilter", None), "LineLayer",
@@ -222,6 +224,10 @@ DEFAULTS = {
     "latlon_style": "dd",           # lat / long as "dd" decimal degrees, "dm" deg + min, "dms" deg + min + sec
     "latlon_hemi": "signs",         # "signs" (-6.31) or "letters" (6.31 W)
     "play_speed": 60,               # playback: seconds of track per real second
+    "send_device_id": "",           # Send point: name offered first when a point is clicked
+    "send_url": "",                 # Send point: OsmAnd endpoint; blank = http://<server host>:5055
+    "show_geofences": True,         # Traccar geofences drawn on the map
+    "circle_radius": 500,           # ⭕ Circle / points sent as geofences: radius in metres
     "v2_migrated": False,
 }
 
@@ -478,6 +484,21 @@ class _Api:
         self._pending = set()
 
     def get(self, path, on_ok, on_err):
+        self._request("GET", path, None, on_ok, on_err)
+
+    def post(self, path, obj, on_ok, on_err):
+        """POST obj as JSON (e.g. create a device); errors include Traccar's reason."""
+        self._request("POST", path, json.dumps(obj).encode("utf-8"), on_ok, on_err)
+
+    def put(self, path, obj, on_ok, on_err):
+        """PUT obj as JSON (update, e.g. a geofence)."""
+        self._request("PUT", path, json.dumps(obj).encode("utf-8"), on_ok, on_err)
+
+    def delete(self, path, on_ok, on_err):
+        """DELETE (e.g. a device); on_ok(None) — Traccar answers 204 with no body."""
+        self._request("DELETE", path, None, on_ok, on_err)
+
+    def _request(self, method, path, body, on_ok, on_err):
         login = self.creds()
         if not login:
             on_err("No saved Traccar login — set it up in Settings… → Connection")
@@ -491,7 +512,14 @@ class _Api:
             req.setTransferTimeout(30000)
         except AttributeError:     # pragma: no cover
             pass
-        reply = QgsNetworkAccessManager.instance().get(req)
+        nam = QgsNetworkAccessManager.instance()
+        if method in ("POST", "PUT"):
+            req.setRawHeader(b"Content-Type", b"application/json")
+            reply = nam.post(req, body) if method == "POST" else nam.put(req, body)
+        elif method == "DELETE":
+            reply = nam.deleteResource(req)
+        else:
+            reply = nam.get(req)
         self._pending.add(reply)
 
         def finished():
@@ -501,7 +529,10 @@ class _Api:
             errstr = reply.errorString()
             data = bytes(reply.readAll())
             reply.deleteLater()
-            if err == _NET_OK and (status is None or int(status) == 200):
+            if err == _NET_OK and (status is None or int(status) in (200, 204)):
+                if not data.strip() and method == "DELETE":
+                    on_ok(None)
+                    return
                 try:
                     obj = json.loads(data.decode("utf-8"))
                 except Exception as exc:
@@ -510,8 +541,9 @@ class _Api:
                 on_ok(obj)
             elif status:
                 status = int(status)
+                reason = data.decode("utf-8", "replace").strip().split(" - ")[0][:150] if method != "GET" else ""
                 on_err("Wrong username or password (HTTP 401)" if status == 401
-                       else "HTTP %d on %s" % (status, path.split("?")[0]))
+                       else "HTTP %d on %s%s" % (status, path.split("?")[0], (": " + reason) if reason else ""))
             else:
                 on_err("No response — check the server URL (%s)" % errstr)
 
@@ -524,6 +556,133 @@ class _Api:
             except RuntimeError:
                 pass
         self._pending.clear()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Send point — a clicked map point becomes a fix of one Traccar device, sent with
+#  the OsmAnd protocol (plain HTTP, port 5055 by default, no login: the device
+#  identifier is the key, as for the phone apps).
+# ════════════════════════════════════════════════════════════════════════════
+
+OSMAND_PORT = 5055
+SENT_POINT_PREFIX = "qgis-"     # identifier of devices added by Send point (the only ones it may delete)
+
+
+def osmand_url(cfg):
+    """The OsmAnd endpoint: the 'Send to' setting, else http://<server host>:5055/."""
+    if cfg["send_url"]:
+        url = cfg["send_url"]
+        return url if "://" in url else "http://" + url
+    host = QUrl(cfg["server_url"] or DEFAULT_URL).host()
+    return "http://%s:%d/" % (host, OSMAND_PORT) if host else ""
+
+
+class _ClickTool(QgsMapToolEmitPoint):
+    """Map tool: each left click → on_click(lat, lon) in WGS84; on_off() when another tool takes over."""
+
+    def __init__(self, plugin, canvas, on_click, on_off):
+        super().__init__(canvas)
+        self.p = plugin
+        self._on_click, self._on_off = on_click, on_off
+        self.setCursor(QCursor(_e(Qt, "CursorShape", "CrossCursor")))
+        self.canvasClicked.connect(self._clicked)
+
+    def _clicked(self, point, button):
+        if button != _e(Qt, "MouseButton", "LeftButton"):
+            return
+        tr = QgsCoordinateTransform(self.canvas().mapSettings().destinationCrs(), WGS84, QgsProject.instance())
+        try:
+            ll = tr.transform(point)
+        except QgsCsException:
+            self.p._bar("That point can't be converted to latitude / longitude", _MSG_WARN)
+            return
+        self._on_click(ll.y(), ll.x())
+
+    def deactivate(self):
+        super().deactivate()
+        self._on_off()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Geofences — Traccar's areas: POLYGON, LINESTRING or CIRCLE in WKT-like text with
+#  LATITUDE FIRST ("POLYGON ((52.1 -9.5, …))", "CIRCLE (52.1 -9.5, 500)").
+# ════════════════════════════════════════════════════════════════════════════
+
+GEOFENCE_MARK = "createdByTraccarLiveQgis"   # attribute on geofences the plugin sent (the only ones it changes)
+GEOFENCE_MAX_WKT = 4000                     # Traccar keeps the area in a 4096-character column
+GEOFENCE_COLOR = "#E65100"
+CIRCLE_RADII = (250, 500, 1000)
+_EARTH_M_PER_DEG = 111320.0
+_NUM = r"(-?\d+(?:\.\d+)?)"
+
+
+def _ll(lat, lon):
+    return "%.6f %.6f" % (lat, lon)
+
+
+def _area_wkt(g):
+    """A single line or polygon (WGS84) → Traccar area text; polygons keep their outer ring only."""
+    if g.type() == _GEOM_LINE:
+        return "LINESTRING (%s)" % ", ".join(_ll(p.y(), p.x()) for p in g.asPolyline())
+    rings = g.asPolygon()
+    return "POLYGON ((%s))" % ", ".join(_ll(p.y(), p.x()) for p in rings[0]) if rings else ""
+
+
+def geofence_areas(geom, crs, radius):
+    """A feature's geometry → [(area text, simplified?)], one per part. Points become
+    circles of radius metres; polygon holes are dropped (Traccar has none); shapes too
+    detailed for Traccar's limit are simplified until they fit. May raise QgsCsException."""
+    g = QgsGeometry(geom)
+    if g.isEmpty():
+        return []
+    if crs.isValid() and crs != WGS84:
+        g.transform(QgsCoordinateTransform(crs, WGS84, QgsProject.instance()))
+    if QgsWkbTypes.isCurvedType(g.wkbType()):
+        g.convertToStraightSegment()
+    gtype, multi = g.type(), g.isMultipart()
+    if gtype == _GEOM_POINT:
+        pts = g.asMultiPoint() if multi else [g.asPoint()]
+        return [("CIRCLE (%s, %.1f)" % (_ll(p.y(), p.x()), radius), False) for p in pts]
+    if gtype == _GEOM_LINE:
+        parts = [QgsGeometry.fromPolylineXY(ln) for ln in (g.asMultiPolyline() if multi else [g.asPolyline()])]
+    elif gtype == _GEOM_POLY:
+        parts = [QgsGeometry.fromPolygonXY([pg[0]]) for pg in (g.asMultiPolygon() if multi else [g.asPolygon()])
+                 if pg]
+    else:
+        return []
+    out = []
+    for part in parts:
+        wkt, tol, simplified = _area_wkt(part), 0.0, False
+        while len(wkt) > GEOFENCE_MAX_WKT and tol < 1:
+            tol = tol * 2 or 0.00001                          # degrees: ~1 m, doubling
+            wkt, simplified = _area_wkt(part.simplify(tol)), True
+        if wkt and len(wkt) <= GEOFENCE_MAX_WKT:
+            out.append((wkt, simplified))
+    return out
+
+
+def parse_geofence_area(area):
+    """Traccar area text → ("polygon" | "line" | "circle", [(lon, lat), …]), or None.
+    Circles come back as a 72-sided ring for drawing."""
+    s = (area or "").strip()
+    m = re.match(r"CIRCLE\s*\(\s*%s\s+%s\s*,\s*%s\s*\)" % (_NUM, _NUM, _NUM), s, re.I)
+    if m:
+        lat, lon, r = (float(v) for v in m.groups())
+        k = _EARTH_M_PER_DEG
+        kx = k * max(math.cos(math.radians(lat)), 0.01)
+        return "circle", [(lon + r * math.sin(a) / kx, lat + r * math.cos(a) / k)
+                          for a in (2 * math.pi * i / 72 for i in range(73))]
+    m = re.match(r"(POLYGON|LINESTRING)\s*\(+(.*?)\)+\s*$", s, re.I | re.S)
+    if not m:
+        return None
+    pts = []
+    for pair in m.group(2).split(","):
+        xy = pair.split()
+        try:
+            pts.append((float(xy[1]), float(xy[0])))
+        except (IndexError, ValueError):
+            return None
+    return ("line" if m.group(1).upper() == "LINESTRING" else "polygon"), pts
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -654,6 +813,54 @@ class _LiveItem(QgsMapCanvasItem):
                 painter.fillPath(path, QBrush(m["color"].darker(130)))
 
 
+class _GeofenceItem(_LiveItem):
+    """Traccar geofences painted onto the map under the live view: outline, light fill
+    (not for lines) and the name. shapes: [{"poly": QPolygonF in map coordinates,
+    "closed": bool, "label": str, "label_pt": QgsPointXY}]."""
+
+    def __init__(self, canvas):
+        super().__init__(canvas)
+        self.shapes = []
+        self.setZValue(40)
+
+    def paint(self, painter, _option=None, _widget=None):
+        if not self.shapes:
+            return
+        off = self.pos()
+        edge = QColor(GEOFENCE_COLOR)
+        fill = QColor(GEOFENCE_COLOR)
+        fill.setAlpha(35)
+        painter.setRenderHint(_ANTIALIAS, True)
+        painter.save()
+        painter.setTransform(self._map_to_item(off), True)
+        pen = QPen(edge)
+        pen.setWidthF(2.0)
+        pen.setCosmetic(True)
+        pen.setJoinStyle(_JOIN_ROUND)
+        painter.setPen(pen)
+        for s in self.shapes:
+            if s["closed"]:
+                painter.setBrush(QBrush(fill))
+                painter.drawPolygon(s["poly"])
+            else:
+                painter.setBrush(QBrush(_NO_BRUSH))
+                painter.drawPolyline(s["poly"])
+        painter.restore()
+        if not self.show_labels:
+            return
+        font = QFont()
+        font.setPointSizeF(9)
+        font.setItalic(True)
+        for s in self.shapes:
+            if not s["label"]:
+                continue
+            c = self.toCanvasCoordinates(s["label_pt"]) - off
+            path = QPainterPath()
+            path.addText(c + QPointF(-3.5 * len(s["label"]), 4), font, s["label"])
+            painter.strokePath(path, QPen(QColor(255, 255, 255, 230), 3))
+            painter.fillPath(path, QBrush(edge.darker(140)))
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Main panel (dock widget: docked, tabbed or floating)
 # ════════════════════════════════════════════════════════════════════════════
@@ -738,7 +945,9 @@ class MainDock(QgsDockWidget):
         self.chk_labels = QCheckBox("Labels")
         self.chk_tracks = QCheckBox("Tracks")
         self.chk_accuracy = QCheckBox("Accuracy")
-        for c in (self.chk_markers, self.chk_labels, self.chk_tracks, self.chk_accuracy):
+        self.chk_geofences = QCheckBox("Geofences")
+        self.chk_geofences.setToolTip("Traccar's geofences (areas, lines, circles)")
+        for c in (self.chk_markers, self.chk_labels, self.chk_tracks, self.chk_accuracy, self.chk_geofences):
             show.addWidget(c)
         show.addStretch()
         root.addLayout(show)
@@ -842,9 +1051,19 @@ class MainDock(QgsDockWidget):
         foot = QHBoxLayout()
         self.settings_btn = QPushButton("Settings…")
         self.help_btn = QPushButton("Help")
+        self.send_btn = QToolButton()
+        self.send_btn.setDefaultAction(self.p.act_send)     # same on/off state as the toolbar button
+        self.gf_btn = QToolButton()
+        self.gf_btn.setText("⬡  Geofences")
+        self.gf_btn.setToolTip("Send areas, lines and circles to Traccar as geofences, or delete them")
+        self.gf_btn.setPopupMode(_e(QToolButton, "ToolButtonPopupMode", "InstantPopup"))
+        self.gf_menu = QMenu(self.gf_btn)
+        self.gf_btn.setMenu(self.gf_menu)
         foot.addWidget(self.settings_btn)
         foot.addWidget(self.help_btn)
         foot.addStretch()
+        foot.addWidget(self.gf_btn)
+        foot.addWidget(self.send_btn)
         root.addLayout(foot)
 
         scroll = QScrollArea()
@@ -867,6 +1086,8 @@ class MainDock(QgsDockWidget):
         self.chk_labels.toggled.connect(lambda on: self.p.set_show("show_labels", on))
         self.chk_tracks.toggled.connect(lambda on: self.p.set_show("show_tracks", on))
         self.chk_accuracy.toggled.connect(lambda on: self.p.set_show("show_accuracy", on))
+        self.chk_geofences.toggled.connect(lambda on: self.p.set_show("show_geofences", on))
+        self.gf_menu.aboutToShow.connect(self._fill_geofence_menu)
         self.coord_combo.activated.connect(
             lambda _i: self.p.set_coord_format(self.coord_combo.currentData()))
         self.pb_start.clicked.connect(self._play_from_start)
@@ -911,7 +1132,8 @@ class MainDock(QgsDockWidget):
         self.duration_spin.setValue(c["feature_duration"])
         self.duration_spin.blockSignals(False)
         for chk, key in ((self.chk_markers, "show_markers"), (self.chk_labels, "show_labels"),
-                         (self.chk_tracks, "show_tracks"), (self.chk_accuracy, "show_accuracy")):
+                         (self.chk_tracks, "show_tracks"), (self.chk_accuracy, "show_accuracy"),
+                         (self.chk_geofences, "show_geofences")):
             chk.blockSignals(True)
             chk.setChecked(bool(c[key]))
             chk.blockSignals(False)
@@ -1097,8 +1319,24 @@ class MainDock(QgsDockWidget):
         menu.addAction("💾  Save to file (GPX, GeoPackage, CSV)…", lambda: self.p.save_device_file(dev_id))
         menu.addAction("📍  Save positions of this device", lambda: self.p.save_positions(only=dev_id))
         menu.addAction("〰  Save track of this device", lambda: self.p.save_tracks(only=dev_id))
+        if self.p.is_sent_point(dev_id):            # only points added with 📤 Send point
+            menu.addSeparator()
+            menu.addAction("🗑  Delete this point from Traccar…", lambda: self.p.delete_sent_point(dev_id))
         menu.exec(QCursor.pos())
         menu.deleteLater()
+
+    def _fill_geofence_menu(self):
+        m, p = self.gf_menu, self.p
+        m.clear()
+        m.addAction(p.act_send_sel)
+        m.addAction(p.act_circle)
+        m.addAction("↻  Reload geofences", p.load_geofences)
+        mine = sorted((g for g in p.geofences if g["mine"]), key=lambda g: g["name"].lower())
+        sub = m.addMenu("🗑  Delete from Traccar")
+        sub.setEnabled(bool(mine))
+        sub.setToolTip("Only geofences sent from QGIS")
+        for g in mine:
+            sub.addAction(g["name"] or "(no name)", lambda gid=g["id"], n=g["name"]: p.delete_geofence(gid, n))
 
     def _copy_menus(self, menu, row):
         """'Copy location' (each format, what3words, WKT) and 'Copy track' submenus."""
@@ -1180,6 +1418,24 @@ class SettingsDialog(QDialog):
         hint.setStyleSheet("color:#666;")
         f.addRow(hint)
         test.clicked.connect(self._test)
+
+        g = QGroupBox("📤  Send point")
+        gf = QFormLayout(g)
+        self.send_id_edit = QLineEdit(c["send_device_id"])
+        self.send_id_edit.setPlaceholderText("e.g. qgis-marker")
+        self.send_url_edit = QLineEdit(c["send_url"])
+        self.send_url_edit.setPlaceholderText(osmand_url(dict(c, send_url="")))
+        gf.addRow("Default name:", self.send_id_edit)
+        gf.addRow("Send to (OsmAnd):", self.send_url_edit)
+        hint = QLabel("Each point clicked with <i>📤 Send point</i> asks for a name (this one is offered "
+                      "first). A new name adds a new device with that name in Traccar at the point; the "
+                      "name or identifier of an existing device moves that device there. Positions go to "
+                      "Traccar's OsmAnd port (5055 unless your server uses another); leave <i>Send to</i> "
+                      "blank for the server above on port 5055.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#666;")
+        gf.addRow(hint)
+        f.addRow(g)
         self.tabs.addTab(t, "Connection")
 
         # ── Layers ────────────────────────────────────────────────────────
@@ -1428,6 +1684,8 @@ class SettingsDialog(QDialog):
             "server_url":  self.url_edit.text().strip().rstrip("/") or DEFAULT_URL,
             "username":    self.user_edit.text().strip(),
             "password":    self.pass_edit.text(),
+            "send_device_id": self.send_id_edit.text().strip(),
+            "send_url":       self.send_url_edit.text().strip(),
             "points_layer_id":   pt.id() if pt else "",
             "points_name_field": self.pt_name.currentField() if pt else "",
             "points_mode":       1 if self.pt_every.isChecked() else 0,
@@ -1533,6 +1791,33 @@ added to that edit session for you to save.</p>
 <p>Times here are local, including summer time. Date/time fields are stored in UTC (QGIS shows them
 as UTC); the optional text fields <i>fix_local</i>, <i>start_local</i> and <i>last_local</i> hold the
 local time. For a local date/time in labels use <code>datetime_from_epoch(epoch("fix_time"))</code>.</p>
+<h3>Send point</h3>
+<p><b>📤 Send point</b> (toolbar, menu or the panel) lets you click the map to put that spot on Traccar —
+for example a casualty or rendezvous point that everyone on Traccar then sees. For each click you give
+it a <b>name</b>: a new name (e.g. <i>RV1</i>) adds a new device with that name in Traccar, sitting at the
+point; the name of an existing device moves that device there instead (its earlier points stay in its
+track). Your Traccar account must be allowed to add devices for new names. To remove a point added this
+way, use <b>⋯ → Delete this point from Traccar…</b> on its row (only offered for points added with Send
+point, never for real trackers). Positions are sent with
+Traccar's OsmAnd protocol to port 5055 of your server, or to the <i>Send to</i> address in
+<b>Settings → Connection → Send point</b> if your server uses another.</p>
+<h3>Geofences (areas, lines, circles)</h3>
+<p>Traccar's <b>geofences</b> are drawn on the map in orange with their names (tick <i>Geofences</i> under
+Show), and refreshed with Live. To add your own, use the <b>⬡ Geofences</b> button in the panel:</p>
+<ul>
+<li><b>Send selected features to Traccar…</b> — select polygons, lines or points in the active layer
+(e.g. search sectors), pick the field that names them, and they become geofences. Points become circles
+of the radius you choose. Any CRS works. Holes in polygons are dropped (Traccar has none), and very
+detailed shapes are simplified to fit Traccar's size limit.</li>
+<li><b>⭕ Circle</b> (also on the toolbar) — click the map, give a name and a radius (250, 500, 1000 m
+or any other).</li>
+<li><b>Delete from Traccar</b> — lists the geofences sent from QGIS; geofences made in Traccar itself are
+never changed or deleted here.</li>
+</ul>
+<p>Sending a geofence with the same name as one sent from QGIS before <b>replaces</b> it, so you can edit
+a sector in QGIS and send it again. Other Traccar users see a geofence when it is shared with them in
+Traccar (admins see all). Geofences can also raise alerts in Traccar when a device enters or leaves them.
+They are drawn on the map in both live views (on screen only).</p>
 <h3>Tag</h3>
 <p>Settings → Tag stamps a text such as FIRE-2026-001 onto everything you save. With
 <i>From feature</i>, the feature's display value can be used instead.</p>
@@ -1583,6 +1868,12 @@ class TraccarLive:
         self._play_clock = 0.0
         self._pb_src, self._pb_times = None, {}    # fix times (epoch s) per device, for bisect
         self._w3w_reply = None
+        self._tools = {}           # "send" / "circle" → _ClickTool
+        self._send_replies = set()
+        self.geofences = []        # [{id, name, area, mine}] from Traccar
+        self._gf_item = None       # canvas item drawing them
+        self._circle_name = ""
+        self._send_name = ""       # last name sent to, offered again on the next click
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
     def initGui(self):
@@ -1596,13 +1887,28 @@ class TraccarLive:
         self.act_live.setCheckable(True)
         self.act_live.setToolTip("Traccar Live: start / stop live updates")
         self.act_live.toggled.connect(self.set_live)
+        self.act_send = QAction("📤 Send point", mw)
+        self.act_send.setCheckable(True)
+        self.act_send.setToolTip("Traccar Live: click the map to send that point to Traccar "
+                                 "as a position of your send device")
+        self.act_send.toggled.connect(lambda on: self.set_tool("send", on))
+        self.act_circle = QAction("⭕ Circle", mw)
+        self.act_circle.setCheckable(True)
+        self.act_circle.setToolTip("Traccar Live: click the map to send a circle (250 / 500 / 1000 m …) "
+                                   "to Traccar as a geofence")
+        self.act_circle.toggled.connect(lambda on: self.set_tool("circle", on))
+        self.act_send_sel = QAction("⬡ Send selected features to Traccar…", mw)
+        self.act_send_sel.setToolTip("Send the selected polygons, lines or points of the active layer "
+                                     "to Traccar as geofences")
+        self.act_send_sel.triggered.connect(self.send_selected)
         self.act_settings = QAction("Settings…", mw)
         self.act_settings.triggered.connect(lambda: self.open_settings(0))
         self.act_help = QAction("Help", mw)
         self.act_help.triggered.connect(self.show_help)
-        for act in (self.act_open, self.act_live):
+        for act in (self.act_open, self.act_live, self.act_send, self.act_circle):
             self.iface.addToolBarIcon(act)
-        for act in (self.act_open, self.act_live, self.act_settings, self.act_help):
+        for act in (self.act_open, self.act_live, self.act_send, self.act_circle, self.act_send_sel,
+                    self.act_settings, self.act_help):
             self.iface.addPluginToMenu(MENU_LABEL, act)
             self._actions.append(act)
         QgsProject.instance().readProject.connect(self._on_project_changed)
@@ -1617,6 +1923,16 @@ class TraccarLive:
         self.play_timer.stop()
         self.api.abort_all()
         canvas = self.iface.mapCanvas()
+        for tool in self._tools.values():
+            if canvas.mapTool() is tool:
+                canvas.unsetMapTool(tool)
+        self._tools = {}
+        self._remove_geofence_item()
+        for r in list(self._send_replies):
+            try:
+                r.abort()
+            except RuntimeError:
+                pass
         for sig, slot in ((QgsProject.instance().readProject, self._on_project_changed),
                           (QgsProject.instance().cleared, self._on_project_changed),
                           (canvas.xyCoordinates, self._on_canvas_move),
@@ -1841,6 +2157,8 @@ class TraccarLive:
         self.tracks, self.latest, self.marker_pos = {}, {}, {}
         self.status_msg = ""
         self._remove_overlays()
+        self.geofences = []
+        self._remove_geofence_item()
         self._rebuild()
 
     def reload_window(self):
@@ -1947,6 +2265,7 @@ class TraccarLive:
         self.loading, self.load_started = True, time.time()
         self.status_msg = "Loading…"
         self._ui()
+        self.load_geofences()
 
         def fail(msg):
             self.loading = False
@@ -1955,7 +2274,8 @@ class TraccarLive:
 
         def got_devices(devs):
             self.devices = {d["id"]: {"name": d.get("name") or str(d["id"]),
-                                      "status": d.get("status") or ""} for d in devs}
+                                      "status": d.get("status") or "",
+                                      "uniqueId": d.get("uniqueId") or ""} for d in devs}
 
             def got_latest(positions):
                 latest = {}
@@ -2011,6 +2331,7 @@ class TraccarLive:
         if self.win is None:
             self.load_window()
             return
+        self.load_geofences()
         if not self.win["moving"]:
             return
 
@@ -2019,7 +2340,8 @@ class TraccarLive:
 
         def got_devices(devs):
             self.devices = {d["id"]: {"name": d.get("name") or str(d["id"]),
-                                      "status": d.get("status") or ""} for d in devs}
+                                      "status": d.get("status") or "",
+                                      "uniqueId": d.get("uniqueId") or ""} for d in devs}
 
             def got_latest(positions):
                 w = self.win
@@ -2192,6 +2514,10 @@ class TraccarLive:
 
     def set_show(self, key, on):
         self.set_cfg(key, bool(on))
+        if key in ("show_geofences", "show_labels"):
+            self._draw_geofences()
+            if key == "show_geofences":
+                return
         if self._item is not None:
             self._apply_item_flags()
             self._item.update()
@@ -2439,6 +2765,8 @@ class TraccarLive:
     def _on_crs_changed(self):
         if self._item is not None and self.win is not None:
             self._update_canvas()
+        if self._gf_item is not None:
+            self._draw_geofences()
 
     # ── As temporary layers ───────────────────────────────────────────────
     def _update_layers(self):
@@ -2742,6 +3070,348 @@ class TraccarLive:
                 return
             err = (body.get("error") or {}).get("message") if isinstance(body, dict) else None
             self._bar("what3words: " + (err or ("HTTP %s" % status if status else errstr)), _MSG_WARN, 8)
+
+        reply.finished.connect(finished)
+
+    # ── Send point (map click → OsmAnd fix of the send device) ────────────
+    # ── Map click tools: "send" (📤 Send point) and "circle" (⭕ Circle) ────
+    def set_tool(self, which, on):
+        canvas = self.iface.mapCanvas()
+        tool = self._tools.get(which)
+        if on:
+            if tool is None:
+                tool = self._tools[which] = _ClickTool(
+                    self, canvas, self.send_point if which == "send" else self.circle_at,
+                    lambda: self.tool_off(which))
+            canvas.setMapTool(tool)
+            self._bar("Click the map to send a %s to Traccar" % ("point" if which == "send" else "circle"),
+                      _MSG_INFO, 3)
+        elif tool is not None and canvas.mapTool() is tool:
+            canvas.unsetMapTool(tool)
+
+    def tool_off(self, which):
+        """The tool was switched off (another map tool chosen): untick its button."""
+        act = self.act_send if which == "send" else self.act_circle
+        act.blockSignals(True)
+        act.setChecked(False)
+        act.blockSignals(False)
+
+    def send_point(self, lat, lon):
+        """Ask for a name, then send lat / lon (WGS84) as a fix of that device, time = now.
+        An existing device (by name or identifier) moves there; a new name creates a new device."""
+        base = osmand_url(self.cfg)
+        if not base:
+            self._bar("Set up the connection first (Settings… → Connection)", _MSG_WARN)
+            return
+        where = self.format_location({"latitude": lat, "longitude": lon}) or format_latlon(lat, lon)
+        name, ok = QInputDialog.getText(
+            self.iface.mainWindow(), "Traccar Live – Send point",
+            "Send this point to Traccar:\n%s\n\nName — a new name adds a new point (device) in Traccar;\n"
+            "the name of an existing device moves that device here:" % where,
+            _e(QLineEdit, "EchoMode", "Normal"), self._send_name or self.cfg["send_device_id"])
+        name = name.strip()
+        if not ok or not name:
+            return
+        self._send_name = name
+        t = int(time.time())
+
+        def got_devices(devs):
+            """OsmAnd needs the device's Identifier (uniqueId), not its name: accept either."""
+            uid = next((d.get("uniqueId") for d in devs if d.get("uniqueId") == name), None)
+            if uid is None:
+                uid = next((d.get("uniqueId") for d in devs
+                            if (d.get("name") or "").strip().lower() == name.lower()), None)
+            if uid is not None:
+                self._send_fix(base, uid, name, lat, lon, t, where)
+                return
+            new_uid = SENT_POINT_PREFIX + "%s-%d" % (re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:30] or "point", t)
+            self.api.post("/api/devices", {"name": name, "uniqueId": new_uid},
+                          lambda d: self._send_fix(base, d.get("uniqueId") or new_uid, name, lat, lon, t, where),
+                          lambda m: self._bar("Couldn't add '%s' to Traccar (%s) — your account may not be "
+                                              "allowed to add devices." % (name, m), _MSG_WARN, 12))
+
+        self.api.get("/api/devices", got_devices,
+                     lambda m: self._bar("Send point needs your Traccar login to find or add '%s': %s"
+                                         % (name, m), _MSG_WARN, 10))
+
+    # ── Geofences (areas / lines / circles in Traccar) ────────────────────
+    def load_geofences(self):
+        if not self.cfg["username"]:
+            return
+
+        def ok(gfs):
+            self.geofences = [{"id": g["id"], "name": g.get("name") or "", "area": g.get("area") or "",
+                               "mine": bool((g.get("attributes") or {}).get(GEOFENCE_MARK))} for g in gfs]
+            self._draw_geofences()
+
+        self.api.get("/api/geofences", ok, lambda m: self._log("Geofences: " + m, _MSG_WARN))
+
+    def _draw_geofences(self):
+        canvas = self.iface.mapCanvas()
+        if not self.cfg["show_geofences"] or not self.geofences:
+            self._remove_geofence_item()
+            return
+        if self._gf_item is None:
+            self._gf_item = _GeofenceItem(canvas)
+        tr = QgsCoordinateTransform(WGS84, canvas.mapSettings().destinationCrs(), QgsProject.instance())
+        shapes = []
+        for g in self.geofences:
+            parsed = parse_geofence_area(g["area"])
+            if not parsed or not parsed[1]:
+                continue
+            kind, lonlat = parsed
+            try:
+                pts = [tr.transform(QgsPointXY(lon, lat)) for lon, lat in lonlat]
+            except QgsCsException:
+                continue
+            if kind == "line":
+                label_pt = pts[len(pts) // 2]
+            else:
+                inner = QgsGeometry.fromPolygonXY([pts]).pointOnSurface()
+                label_pt = inner.asPoint() if not inner.isEmpty() else pts[0]
+            shapes.append({"poly": QPolygonF([QPointF(p.x(), p.y()) for p in pts]),
+                           "closed": kind != "line", "label": g["name"], "label_pt": label_pt})
+        self._gf_item.shapes = shapes
+        self._gf_item.show_labels = bool(self.cfg["show_labels"])
+        self._gf_item.updatePosition()
+        self._gf_item.update()
+
+    def _remove_geofence_item(self):
+        if self._gf_item is not None:
+            try:
+                self._gf_item.scene().removeItem(self._gf_item)
+            except (RuntimeError, AttributeError):
+                pass
+            self._gf_item = None
+            self.iface.mapCanvas().refresh()
+
+    def _upsert_geofences(self, items):
+        """items: [(name, area, simplified)]. A geofence sent from QGIS before under the same
+        name is replaced (PUT); anything else is added (POST). Then the map is redrawn."""
+        def got(existing):
+            mine = {(g.get("name") or "").strip().lower(): g for g in existing
+                    if (g.get("attributes") or {}).get(GEOFENCE_MARK)}
+            st = {"left": len(items), "added": 0, "replaced": 0, "errors": []}
+            simplified = any(s for _n, _a, s in items)
+
+            def done():
+                st["left"] -= 1
+                if st["left"] > 0:
+                    return
+                n = st["added"] + st["replaced"]
+                msg = "Sent %d geofence(s) to Traccar" % n
+                if st["replaced"]:
+                    msg += " (%d replaced)" % st["replaced"]
+                if simplified:
+                    msg += " — some shapes were simplified to fit Traccar's size limit"
+                if st["errors"]:
+                    self._bar("%s; %d failed: %s" % (msg, len(st["errors"]), st["errors"][0]), _MSG_WARN, 12)
+                else:
+                    self._bar(msg, _MSG_OK, 5)
+                self.load_geofences()
+
+            for name, area, _simp in items:
+                old = mine.get(name.strip().lower())
+
+                def ok(_g, key="replaced" if old else "added"):
+                    st[key] += 1
+                    done()
+
+                def bad(m, name=name):
+                    st["errors"].append("%s: %s" % (name, m))
+                    done()
+
+                if old:
+                    body = dict(old, name=name, area=area,
+                                attributes=dict(old.get("attributes") or {}, **{GEOFENCE_MARK: True}))
+                    self.api.put("/api/geofences/%d" % old["id"], body, ok, bad)
+                else:
+                    self.api.post("/api/geofences", {"name": name, "area": area,
+                                                     "attributes": {GEOFENCE_MARK: True}}, ok, bad)
+
+        self.api.get("/api/geofences", got,
+                     lambda m: self._bar("Sending geofences needs your Traccar login: %s" % m, _MSG_WARN, 10))
+
+    def send_selected(self):
+        """The active layer's selected features → geofences (polygons, lines; points as circles)."""
+        lyr = self.iface.activeLayer()
+        if not isinstance(lyr, QgsVectorLayer) or not lyr.selectedFeatureCount():
+            self._bar("Select the features to send first (in the active layer of the Layers panel)", _MSG_WARN)
+            return
+        n = lyr.selectedFeatureCount()
+        is_point = lyr.geometryType() == _GEOM_POINT
+        d = QDialog(self.iface.mainWindow())
+        d.setWindowTitle("Traccar Live – Send to Traccar")
+        f = QFormLayout(d)
+        intro = QLabel("%d selected feature(s) of '%s' become geofences in Traccar%s."
+                       % (n, lyr.name(), " (circles)" if is_point else ""))
+        intro.setWordWrap(True)
+        f.addRow(intro)
+        fld = QgsFieldComboBox()
+        fld.setLayer(lyr)
+        fld.setAllowEmptyFieldName(True)
+        names = {nm.lower(): nm for nm in lyr.fields().names()}
+        fld.setField(next((names[k] for k in ("name", "title", "sector", "sector_id", "incident_ref")
+                           if k in names), ""))
+        txt = QLineEdit()
+        txt.setPlaceholderText("used when no field is chosen (numbered if several)")
+        f.addRow("Name from field:", fld)
+        f.addRow("… or name:", txt)
+        rad = QSpinBox()
+        rad.setRange(10, 100000)
+        rad.setSingleStep(50)
+        rad.setSuffix(" m")
+        rad.setValue(int(self.cfg["circle_radius"]))
+        if is_point:
+            f.addRow("Circle radius:", rad)
+        hint = QLabel("A geofence sent from QGIS before with the same name is replaced.")
+        hint.setStyleSheet("color:#666;")
+        f.addRow(hint)
+        bb = QDialogButtonBox(_BTN_OK | _BTN_CANCEL)
+        bb.accepted.connect(d.accept)
+        bb.rejected.connect(d.reject)
+        f.addRow(bb)
+        accepted = d.exec() == _DLG_OK
+        field, text, radius = fld.currentField(), txt.text().strip(), rad.value()
+        d.deleteLater()
+        if not accepted:
+            return
+        if is_point:
+            self.set_cfg("circle_radius", radius)
+        items, skipped = [], 0
+        for i, feat in enumerate(lyr.selectedFeatures(), 1):
+            name = ""
+            if field:
+                v = feat[field]
+                name = "" if _is_null(v) else str(v).strip()
+            if not name:
+                name = (text or lyr.name()) if n == 1 else "%s %d" % (text or lyr.name(), i)
+            try:
+                areas = geofence_areas(feat.geometry(), lyr.crs(), radius)
+            except QgsCsException:
+                areas = []
+            if not areas:
+                skipped += 1
+            for j, (area, simp) in enumerate(areas, 1):
+                items.append((name if len(areas) == 1 else "%s (%d)" % (name, j), area, simp))
+        if skipped:
+            self._bar("%d feature(s) skipped: no geometry Traccar can take" % skipped, _MSG_WARN)
+        if items:
+            self._upsert_geofences(items)
+
+    def circle_at(self, lat, lon):
+        """⭕ Circle tool: ask for a name and radius, then send a circle geofence."""
+        where = self.format_location({"latitude": lat, "longitude": lon}) or format_latlon(lat, lon)
+        d = QDialog(self.iface.mainWindow())
+        d.setWindowTitle("Traccar Live – Circle")
+        f = QFormLayout(d)
+        f.addRow(QLabel("Centre:  " + where))
+        name = QLineEdit(self._circle_name)
+        name.setPlaceholderText("e.g. Search area A")
+        rad = QSpinBox()
+        rad.setRange(10, 100000)
+        rad.setSingleStep(50)
+        rad.setSuffix(" m")
+        rad.setValue(int(self.cfg["circle_radius"]))
+        row = QHBoxLayout()
+        row.addWidget(rad, 1)
+        for r in CIRCLE_RADII:
+            b = QToolButton()
+            b.setText("%d m" % r)
+            b.clicked.connect(lambda _c=False, r=r: rad.setValue(r))
+            row.addWidget(b)
+        f.addRow("Name:", name)
+        f.addRow("Radius:", row)
+        bb = QDialogButtonBox(_BTN_OK | _BTN_CANCEL)
+        bb.accepted.connect(d.accept)
+        bb.rejected.connect(d.reject)
+        f.addRow(bb)
+        name.selectAll()
+        accepted = d.exec() == _DLG_OK
+        text, radius = name.text().strip(), rad.value()
+        d.deleteLater()
+        if not accepted:
+            return
+        text = text or "Circle %s" % datetime.now().strftime("%H:%M")
+        self._circle_name = text
+        self.set_cfg("circle_radius", radius)
+        self._upsert_geofences([(text, "CIRCLE (%s, %.1f)" % (_ll(lat, lon), radius), False)])
+
+    def delete_geofence(self, gid, name):
+        """Ask, then delete a geofence sent from QGIS."""
+        if not any(g["id"] == gid and g["mine"] for g in self.geofences):
+            return
+        yes = _e(QMessageBox, "StandardButton", "Yes")
+        no = _e(QMessageBox, "StandardButton", "No")
+        if QMessageBox.question(self.iface.mainWindow(), "Traccar Live – Delete geofence",
+                                "Delete the geofence '%s' from Traccar?\n\nIt disappears for everyone. "
+                                "This can't be undone." % name, yes | no, no) != yes:
+            return
+
+        def done(_none):
+            self.geofences = [g for g in self.geofences if g["id"] != gid]
+            self._draw_geofences()
+            self._bar("Deleted the geofence '%s' from Traccar" % name, _MSG_OK, 4)
+
+        self.api.delete("/api/geofences/%d" % gid, done,
+                        lambda m: self._bar("Couldn't delete '%s' from Traccar: %s" % (name, m), _MSG_WARN, 10))
+
+    def is_sent_point(self, dev_id):
+        """A device added by Send point (identifier qgis-…) — the only kind the plugin deletes."""
+        return self.devices.get(dev_id, {}).get("uniqueId", "").startswith(SENT_POINT_PREFIX)
+
+    def delete_sent_point(self, dev_id):
+        """Ask, then delete a Send point device (and its positions) from Traccar."""
+        if not self.is_sent_point(dev_id):
+            return
+        name = self._name(dev_id)
+        yes = _e(QMessageBox, "StandardButton", "Yes")
+        no = _e(QMessageBox, "StandardButton", "No")
+        if QMessageBox.question(self.iface.mainWindow(), "Traccar Live – Delete point",
+                                "Delete '%s' from Traccar?\n\nIt disappears for everyone, with all its "
+                                "positions. This can't be undone." % name, yes | no, no) != yes:
+            return
+
+        def done(_none):
+            self.devices.pop(dev_id, None)
+            for d in (self.tracks, self.latest, self.marker_pos, self._line_cache):
+                d.pop(dev_id, None)
+            self._rebuild()
+            self._bar("Deleted '%s' from Traccar" % name, _MSG_OK, 4)
+
+        self.api.delete("/api/devices/%d" % dev_id, done,
+                        lambda m: self._bar("Couldn't delete '%s' from Traccar: %s" % (name, m), _MSG_WARN, 10))
+
+    def _send_fix(self, base, dev, name, lat, lon, t, where):
+        """OsmAnd fix for the device with identifier dev (shown to the user as name)."""
+        url = "%s%sid=%s&lat=%.7f&lon=%.7f&timestamp=%d&valid=true" % (
+            base, "&" if "?" in base else "?", _quote(dev, safe=""), lat, lon, t)
+        req = QNetworkRequest(QUrl(url))
+        try:
+            req.setTransferTimeout(15000)
+        except AttributeError:     # pragma: no cover
+            pass
+        reply = QgsNetworkAccessManager.instance().get(req)
+        self._send_replies.add(reply)
+
+        def finished():
+            self._send_replies.discard(reply)
+            status = reply.attribute(_HTTP_STATUS)
+            err, errstr = reply.error(), reply.errorString()
+            reply.deleteLater()
+            if err == _NET_OK and (status is None or int(status) == 200):
+                self._bar("Sent to Traccar as '%s':  %s" % (name, where), _MSG_OK, 4)
+                if self.win is not None and self.win["moving"]:
+                    QTimer.singleShot(2000, self.poll_live)      # show it without waiting for Live
+            elif status and int(status) == 400:
+                self._bar("Traccar refused the point for '%s' (HTTP 400, identifier '%s') — check the "
+                          "device isn't disabled, and that 'Send to' is the same Traccar server as the "
+                          "Server URL." % (name, dev), _MSG_WARN, 10)
+            elif status:
+                self._bar("Send point: HTTP %d from %s" % (int(status), base), _MSG_WARN, 8)
+            else:
+                self._bar("Send point: no response from %s — check 'Send to' in Settings → Connection "
+                          "(%s)" % (base, errstr), _MSG_WARN, 10)
 
         reply.finished.connect(finished)
 
