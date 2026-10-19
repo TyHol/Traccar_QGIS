@@ -2,6 +2,10 @@
 
 A QGIS plugin that shows your [Traccar](https://www.traccar.org) GPS devices on the map for a chosen time window — live — and saves their positions and tracks into your project's layers when you ask it to.
 
+> **Not an official Traccar product.** Traccar Live is an independent, community-made plugin. It is not made, endorsed or supported by Traccar or its developers, and is not affiliated with them.
+>
+> [Traccar](https://www.traccar.org) is open-source GPS tracking software created by Anton Tananaev and its contributors. The Traccar name, the Traccar server, apps, API and documentation belong to their respective owners. This plugin only connects to a Traccar server that you have access to, using the interfaces Traccar publishes ([Traccar API](https://www.traccar.org/traccar-api/)). For Traccar itself (installation, apps and support), see [traccar.org](https://www.traccar.org).
+
 - **One time window for everything** — *Last 15 minutes … Last 3 months*, custom dates, or the start/end of a feature such as an incident. The tracks on the map are the fixes inside the window, and the Save buttons save exactly that.
 - **Unobtrusive** — a dockable panel (docked, tabbed or floating) you can close while Live keeps running in the background; QGIS never freezes while loading.
 - **Per device** — tick devices to show or hide them; save any one device to a **GPX**, GeoPackage or CSV file; copy its location (lat/long, project or custom CRS, **Irish / UK grid**, **what3words**, WKT) or its track (WKT) to the clipboard.
@@ -164,6 +168,9 @@ Your Traccar login is kept in **QGIS's password manager** (Settings → Options 
 - Security scan, as run by plugins.qgis.org: `pip install bandit` then `bandit -r traccar_live.py __init__.py` (should report *No issues identified*).
 - [`tests/real_server_check.py`](tests/real_server_check.py) — a read-only check against a real Traccar server, using the login saved in a QGIS profile (never printed).
 - The release zip contains a `traccar_live/` folder with the plugin files, `icon.png` and `LICENSE` (the layout plugins.qgis.org requires). It is attached to each [GitHub release](https://github.com/TyHol/Traccar_QGIS/releases), not kept in the repository (`*.zip` is git-ignored).
+
+## Credits
+Traccar — the GPS tracking server, apps, API and protocols this plugin works with — is created by Anton Tananaev and the Traccar contributors ([traccar.org](https://www.traccar.org), [GitHub](https://github.com/traccar/traccar)). All credit for Traccar goes to them; this plugin is not affiliated with or endorsed by Traccar.
 
 ## Licence
 Copyright © 2026 TyHol. Released under the [GNU General Public License v2.0 or later](LICENSE) (GPL-2.0-or-later), the same licence as QGIS.
