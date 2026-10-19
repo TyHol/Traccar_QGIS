@@ -73,6 +73,15 @@ def _p(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+GEOFENCES = [   # one made in Traccar (own colour), one sent from QGIS before
+    {"id": 7, "name": "Lake sector", "description": "", "calendarId": 0,
+     "area": "POLYGON ((53.36 -6.34, 53.37 -6.34, 53.37 -6.32, 53.36 -6.32, 53.36 -6.34))",
+     "attributes": {"color": "#1565c0"}},
+    {"id": 8, "name": "Trail", "description": "", "calendarId": 0,
+     "area": "LINESTRING (53.35 -6.30, 53.355 -6.29)", "attributes": {"createdByTraccarLiveQgis": True}},
+]
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -85,8 +94,48 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):
+    def _authed(self):
         import base64
+        if self.headers.get("Authorization", "") == "Basic " + base64.b64encode(
+                ("%s:%s" % (USER, PWD)).encode()).decode():
+            return True
+        self.send_response(401)
+        self.end_headers()
+        return False
+
+    def _body(self):
+        return json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"null")
+
+    def do_POST(self):
+        if not self._authed():
+            return
+        if self.path == "/api/geofences":
+            g = dict(self._body(), id=max([g["id"] for g in GEOFENCES] + [0]) + 1)
+            GEOFENCES.append(g)
+            self._json(200, g)
+        else:
+            self._json(404, {})
+
+    def do_PUT(self):
+        if not self._authed():
+            return
+        gid = int(self.path.rsplit("/", 1)[-1]) if self.path.startswith("/api/geofences/") else None
+        for i, g in enumerate(GEOFENCES):
+            if g["id"] == gid:
+                GEOFENCES[i] = self._body()
+                self._json(200, GEOFENCES[i])
+                return
+        self._json(404, {})
+
+    def do_DELETE(self):
+        if not self._authed():
+            return
+        gid = int(self.path.rsplit("/", 1)[-1]) if self.path.startswith("/api/geofences/") else None
+        GEOFENCES[:] = [g for g in GEOFENCES if g["id"] != gid]
+        self.send_response(204)
+        self.end_headers()
+
+    def do_GET(self):
         if self.path.startswith("/v3/convert-to-3wa"):          # fake what3words API
             W3W_CALLS.append(self.path)
             if self.headers.get("X-Api-Key") != W3W_KEY:
@@ -94,14 +143,13 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, {"words": "filled.count.soap"})
             return
-        auth = self.headers.get("Authorization", "")
-        if auth != "Basic " + base64.b64encode(("%s:%s" % (USER, PWD)).encode()).decode():
-            self.send_response(401)
-            self.end_headers()
+        if not self._authed():
             return
         u = urlparse(self.path)
         q = parse_qs(u.query)
-        if u.path == "/api/devices":
+        if u.path == "/api/geofences":
+            body = GEOFENCES
+        elif u.path == "/api/devices":
             body = DEVICES
         elif u.path == "/api/positions" and "deviceId" in q:
             d = int(q["deviceId"][0])
@@ -892,6 +940,63 @@ def t16h_playback_long_track_keeps_its_shape():
           (len(later), [k for k in range(3001) if later[k] != played[k]][:3], later[3000:3002], played[3000:3002]))
     plugin.stop_playback()
     load(180)
+
+
+@test
+def t16i_geofences():
+    from qgis.PyQt.QtWidgets import QMessageBox, QColorDialog
+    from qgis.PyQt.QtGui import QColor
+    plugin.open_main()
+    d = plugin.dock
+    plugin.cfg["show_geofences"] = True
+    plugin.load_geofences()
+    check("geofences listed in the panel, by name, with their type and origin",
+          wait(lambda: d.gf_table.rowCount() == 2) and d.gf_box.isVisibleTo(d)
+          and [d.gf_table.item(r, c).text() for r in range(2) for c in (0, 1, 2)]
+          == ["Lake sector", "Area", "Traccar", "Trail", "Line", "QGIS"],
+          [d.gf_table.item(r, c).text() for r in range(d.gf_table.rowCount()) for c in (0, 1, 2)])
+    shapes = plugin._gf_item.shapes if plugin._gf_item else []
+    check("each drawn in its own colour (Traccar's 'color', else the default)",
+          sorted(s["color"] for s in shapes) == sorted(["#1565c0", mod.GEOFENCE_COLOR]),
+          [s["color"] for s in shapes])
+    d.gf_table.item(0, 0).setCheckState(mod._UNCHECKED)
+    wait(lambda: plugin.hidden_geofence_ids() == {7}, 2)
+    check("unticking hides one geofence from the map",
+          [s["label"] for s in plugin._gf_item.shapes] == ["Trail"] and "1 of 2" in d.gf_lbl.text(),
+          d.gf_lbl.text())
+    plugin.set_all_geofences_shown(True)
+    check("WKT copy is longitude first",
+          plugin.geofence_wkt(8) == "LINESTRING (-6.300000 53.350000, -6.290000 53.355000)",
+          plugin.geofence_wkt(8))
+    orig_color, orig_q = QColorDialog.getColor, QMessageBox.question
+    try:
+        QColorDialog.getColor = staticmethod(lambda *a, **k: QColor("#2e7d32"))
+        plugin.set_geofence_color(7)
+        check("colour change is saved in Traccar, keeping the rest of the geofence",
+              wait(lambda: GEOFENCES[0]["attributes"].get("color") == "#2e7d32")
+              and GEOFENCES[0]["area"].startswith("POLYGON") and GEOFENCES[0]["name"] == "Lake sector",
+              GEOFENCES[0])
+        wait(lambda: any(g["color"] == "#2e7d32" for g in plugin.geofences), 3)
+        asked = []
+        no = mod._e(QMessageBox, "StandardButton", "No")
+        yes = mod._e(QMessageBox, "StandardButton", "Yes")
+        QMessageBox.question = staticmethod(lambda *a, **k: asked.append(a[2]) or no)
+        plugin.delete_geofence(7, "Lake sector")
+        check("deleting a geofence made in Traccar asks first, with a firmer warning; No keeps it",
+              asked and "made in Traccar" in asked[0] and len(GEOFENCES) == 2, asked)
+        QMessageBox.question = staticmethod(lambda *a, **k: yes)
+        plugin.delete_geofence(7, "Lake sector")
+        check("Yes deletes it from Traccar and from the list",
+              wait(lambda: d.gf_table.rowCount() == 1) and [g["id"] for g in GEOFENCES] == [8])
+    finally:
+        QColorDialog.getColor, QMessageBox.question = orig_color, orig_q
+    plugin.cfg["geofence_color"] = "#6a1b9a"
+    plugin._upsert_geofences([("Trail", "LINESTRING (53.35 -6.30, 53.36 -6.28)", False)],
+                             plugin.cfg["geofence_color"])
+    check("re-sending replaces it and sets the chosen colour",
+          wait(lambda: GEOFENCES[0]["area"].endswith("-6.28)")) and len(GEOFENCES) == 1
+          and GEOFENCES[0]["attributes"] == {"createdByTraccarLiveQgis": True, "color": "#6a1b9a"},
+          GEOFENCES)
 
 
 @test

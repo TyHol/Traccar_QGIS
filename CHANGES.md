@@ -19,10 +19,18 @@
     multipart features become one geofence per part; polygon holes are dropped; shapes over Traccar's
     4096-character area limit are simplified until they fit.
   - **⭕ Circle** (also on the toolbar) — click the map, name it, radius 250 / 500 / 1000 m or any other.
-  - **Delete from Traccar** — only geofences sent from QGIS (marked with the `createdByTraccarLiveQgis`
-    attribute).
+  - **Delete from Traccar** — any geofence; those sent from QGIS are marked with the
+    `createdByTraccarLiveQgis` attribute.
 - Sending a name that matches a geofence sent from QGIS before **replaces** it (`PUT`), so edited sectors
   can be re-sent.
+- Each geofence is drawn in **its own colour** — Traccar's `color` attribute, else orange — and never greys
+  out like an old fix. *Send selected* and *⭕ Circle* ask for the colour and save it in Traccar.
+- **Geofence list** in the panel, under the devices: name (with a colour swatch), type (area / line /
+  circle with radius) and where it came from (QGIS or Traccar). Tick to show / hide each one (remembered),
+  double-click to zoom, ⋯ / right-click for **Colour…** (saved in Traccar), **Copy as WKT** and
+  **Delete from Traccar…**.
+- **Delete from Traccar** now covers every geofence, not only those sent from QGIS; one made in Traccar
+  gets a firmer warning first.
 - **Settings → Connection → Send point**: the name offered first, and an optional *Send to* address for
   servers whose OsmAnd port isn't 5055 (or is behind a proxy).
 

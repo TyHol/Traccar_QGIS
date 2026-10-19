@@ -47,7 +47,7 @@ from urllib.parse import quote as _quote
 
 from qgis.PyQt.QtCore import QTimer, QSettings, QDateTime, QDate, QTime, QUrl, Qt, QPointF
 from qgis.PyQt.QtGui import (
-    QColor, QCursor, QIcon, QPainter, QPen, QBrush, QFont, QPolygonF, QPainterPath, QTransform,
+    QColor, QCursor, QIcon, QPainter, QPen, QBrush, QFont, QPolygonF, QPainterPath, QTransform, QPixmap,
 )
 from qgis.PyQt.QtNetwork import QNetworkRequest, QNetworkReply
 from qgis.PyQt.QtWidgets import (
@@ -56,7 +56,7 @@ from qgis.PyQt.QtWidgets import (
     QRadioButton, QButtonGroup, QPushButton, QDialogButtonBox, QTabWidget,
     QWidget, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton, QToolTip,
-    QMenu, QScrollArea, QFrame, QSlider, QInputDialog,
+    QMenu, QScrollArea, QFrame, QSlider, QInputDialog, QColorDialog,
 )
 from qgis.core import (
     Qgis, QgsApplication, QgsAuthMethodConfig, QgsProject, QgsVectorLayer, QgsFeature,
@@ -71,7 +71,7 @@ from qgis.core import (
 )
 from qgis.gui import (
     QgsMapLayerComboBox, QgsFieldComboBox, QgsMapCanvasItem, QgsDockWidget, QgsProjectionSelectionWidget,
-    QgsMapToolEmitPoint,
+    QgsMapToolEmitPoint, QgsColorButton,
 )
 
 try:
@@ -177,6 +177,7 @@ COORD_FORMATS = [("latlon", "Lat / Long"), ("project", "Project CRS"), ("custom"
 W3W_URL = "https://api.what3words.com/v3"
 W3W_KEY_SETTING = "TraccarLive/w3w_key"     # in QGIS's password manager (encrypted)
 _MENU_COL = 6                               # the ⋯ column of the device list
+_GF_MENU_COL = 3                            # the ⋯ column of the geofence list
 # Playback speed: seconds of track per real second
 PLAY_SPEEDS = [("1×", 1), ("10×", 10), ("1 min / s", 60), ("5 min / s", 300),
                ("15 min / s", 900), ("1 h / s", 3600)]
@@ -228,6 +229,8 @@ DEFAULTS = {
     "send_url": "",                 # Send point: OsmAnd endpoint; blank = http://<server host>:5055
     "show_geofences": True,         # Traccar geofences drawn on the map
     "circle_radius": 500,           # ⭕ Circle / points sent as geofences: radius in metres
+    "geofence_color": "#E65100",    # colour given to geofences sent from QGIS (Traccar's 'color' attribute)
+    "hidden_geofences": "",         # comma-separated Traccar geofence ids not drawn on the map
     "v2_migrated": False,
 }
 
@@ -608,7 +611,7 @@ class _ClickTool(QgsMapToolEmitPoint):
 #  LATITUDE FIRST ("POLYGON ((52.1 -9.5, …))", "CIRCLE (52.1 -9.5, 500)").
 # ════════════════════════════════════════════════════════════════════════════
 
-GEOFENCE_MARK = "createdByTraccarLiveQgis"   # attribute on geofences the plugin sent (the only ones it changes)
+GEOFENCE_MARK = "createdByTraccarLiveQgis"   # attribute on geofences the plugin sent (the only ones re-sending replaces)
 GEOFENCE_MAX_WKT = 4000                     # Traccar keeps the area in a 4096-character column
 GEOFENCE_COLOR = "#E65100"
 CIRCLE_RADII = (250, 500, 1000)
@@ -815,8 +818,9 @@ class _LiveItem(QgsMapCanvasItem):
 
 class _GeofenceItem(_LiveItem):
     """Traccar geofences painted onto the map under the live view: outline, light fill
-    (not for lines) and the name. shapes: [{"poly": QPolygonF in map coordinates,
-    "closed": bool, "label": str, "label_pt": QgsPointXY}]."""
+    (not for lines) and the name, each in its own colour. They never go grey — a geofence
+    isn't a fix that gets old. shapes: [{"poly": QPolygonF in map coordinates,
+    "closed": bool, "label": str, "label_pt": QgsPointXY, "color": "#rrggbb"}]."""
 
     def __init__(self, canvas):
         super().__init__(canvas)
@@ -827,18 +831,18 @@ class _GeofenceItem(_LiveItem):
         if not self.shapes:
             return
         off = self.pos()
-        edge = QColor(GEOFENCE_COLOR)
-        fill = QColor(GEOFENCE_COLOR)
-        fill.setAlpha(35)
         painter.setRenderHint(_ANTIALIAS, True)
         painter.save()
         painter.setTransform(self._map_to_item(off), True)
-        pen = QPen(edge)
-        pen.setWidthF(2.0)
-        pen.setCosmetic(True)
-        pen.setJoinStyle(_JOIN_ROUND)
-        painter.setPen(pen)
         for s in self.shapes:
+            edge = QColor(s["color"])
+            fill = QColor(s["color"])
+            fill.setAlpha(55)
+            pen = QPen(edge)
+            pen.setWidthF(2.0)
+            pen.setCosmetic(True)
+            pen.setJoinStyle(_JOIN_ROUND)
+            painter.setPen(pen)
             if s["closed"]:
                 painter.setBrush(QBrush(fill))
                 painter.drawPolygon(s["poly"])
@@ -858,7 +862,7 @@ class _GeofenceItem(_LiveItem):
             path = QPainterPath()
             path.addText(c + QPointF(-3.5 * len(s["label"]), 4), font, s["label"])
             painter.strokePath(path, QPen(QColor(255, 255, 255, 230), 3))
-            painter.fillPath(path, QBrush(edge.darker(140)))
+            painter.fillPath(path, QBrush(QColor(s["color"]).darker(140)))
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -989,6 +993,32 @@ class MainDock(QgsDockWidget):
         self.table.setMinimumHeight(140)
         root.addWidget(self.table, 1)
 
+        # ── Geofences ─────────────────────────────────────────────────────
+        self.gf_box = QWidget()
+        gl = QVBoxLayout(self.gf_box)
+        gl.setContentsMargins(0, 0, 0, 0)
+        self.gf_lbl = QCheckBox("Geofences")          # also show all / none
+        self.gf_lbl.setTristate(True)
+        self.gf_lbl.setStyleSheet("font-weight:bold;")
+        self.gf_lbl.setToolTip("Show all geofences — or, when all are shown, hide them all")
+        gl.addWidget(self.gf_lbl)
+        self.gf_table = QTableWidget(0, 4)
+        self.gf_table.setHorizontalHeaderLabels(["Geofence", "Type", "From", ""])
+        self.gf_table.setEditTriggers(_NO_EDIT)
+        self.gf_table.setSelectionBehavior(_SEL_ROWS)
+        self.gf_table.verticalHeader().setVisible(False)
+        self.gf_table.setContextMenuPolicy(_CUSTOM_MENU)
+        gh = self.gf_table.horizontalHeader()
+        gh.setSectionResizeMode(0, _HV_STRETCH)
+        for c in range(1, 4):
+            gh.setSectionResizeMode(c, _HV_CONTENTS)
+        self.gf_table.setToolTip("Tick a geofence to show it on the map, double-click to zoom to it, "
+                                 "⋯ or right-click to change its colour or delete it")
+        self.gf_table.setMinimumHeight(90)
+        gl.addWidget(self.gf_table)
+        self.gf_box.setVisible(False)
+        root.addWidget(self.gf_box)
+
         # ── Playback ──────────────────────────────────────────────────────
         pb = QGroupBox("Playback")
         pl = QVBoxLayout(pb)
@@ -1102,6 +1132,13 @@ class MainDock(QgsDockWidget):
         self.table.itemChanged.connect(self._item_changed)
         self.table.customContextMenuRequested.connect(
             lambda pos: self._device_menu(self.table.rowAt(pos.y())))
+        self.gf_table.cellDoubleClicked.connect(
+            lambda r, _c: 0 <= r < len(self._gf_rows) and self.p.zoom_to_geofence(self._gf_rows[r]["id"]))
+        self.gf_table.cellClicked.connect(lambda r, c: c == _GF_MENU_COL and self._geofence_row_menu(r))
+        self.gf_table.itemChanged.connect(self._gf_item_changed)
+        self.gf_table.customContextMenuRequested.connect(
+            lambda pos: self._geofence_row_menu(self.gf_table.rowAt(pos.y())))
+        self.gf_lbl.clicked.connect(lambda: self.p.set_all_geofences_shown(not self._all_gf_shown()))
         self.zoom_all_btn.clicked.connect(self.p.zoom_to_all)
         self.devices_lbl.clicked.connect(
             lambda: self.p.hide_all() if all(r["shown"] for r in self._rows) else self.p.show_all())
@@ -1115,6 +1152,7 @@ class MainDock(QgsDockWidget):
         self.topLevelChanged.connect(lambda floating: self.p.set_cfg("dock_floating", bool(floating)))
 
         self._rows = []
+        self._gf_rows = []
         self._play_shown = False
 
     # ── State → widgets ───────────────────────────────────────────────────
@@ -1144,6 +1182,7 @@ class MainDock(QgsDockWidget):
             self.coord_combo.addItem(self.p.coord_label(key), key)
         self.coord_combo.setCurrentIndex(max(0, self.coord_combo.findData(c["coord_format"])))
         self.pb_speed.setCurrentIndex(max(0, self.pb_speed.findData(c["play_speed"])))
+        self.refresh_geofences()
         self._sync_mode()
         self.refresh()
 
@@ -1331,12 +1370,75 @@ class MainDock(QgsDockWidget):
         m.addAction(p.act_send_sel)
         m.addAction(p.act_circle)
         m.addAction("↻  Reload geofences", p.load_geofences)
-        mine = sorted((g for g in p.geofences if g["mine"]), key=lambda g: g["name"].lower())
         sub = m.addMenu("🗑  Delete from Traccar")
-        sub.setEnabled(bool(mine))
-        sub.setToolTip("Only geofences sent from QGIS")
-        for g in mine:
-            sub.addAction(g["name"] or "(no name)", lambda gid=g["id"], n=g["name"]: p.delete_geofence(gid, n))
+        sub.setEnabled(bool(p.geofences))
+        for title, mine in (("Sent from QGIS", True), ("Made in Traccar", False)):
+            gfs = [g for g in p.geofences if g["mine"] == mine]
+            if gfs:
+                sub.addSection(title)
+            for g in gfs:
+                sub.addAction(g["name"] or "(no name)", lambda gid=g["id"], n=g["name"]: p.delete_geofence(gid, n))
+
+    def _all_gf_shown(self):
+        hidden = self.p.hidden_geofence_ids()
+        return bool(self._gf_rows) and not any(g["id"] in hidden for g in self._gf_rows)
+
+    def refresh_geofences(self):
+        """The geofence list: shown when Traccar has any."""
+        p = self.p
+        rows = list(p.geofences)
+        self._gf_rows = rows
+        hidden = p.hidden_geofence_ids()
+        shown = sum(1 for g in rows if g["id"] not in hidden)
+        self.gf_box.setVisible(bool(rows))
+        self.gf_lbl.blockSignals(True)
+        self.gf_lbl.setText("Geofences  (%d)" % len(rows) if shown == len(rows)
+                            else "Geofences  (%d of %d shown)" % (shown, len(rows)))
+        self.gf_lbl.setCheckState(_CHECKED if rows and shown == len(rows)
+                                  else _UNCHECKED if shown == 0 else _PARTIAL)
+        self.gf_lbl.setEnabled(bool(p.cfg["show_geofences"]))
+        self.gf_lbl.blockSignals(False)
+        self.gf_table.setEnabled(bool(p.cfg["show_geofences"]))
+        self.gf_table.blockSignals(True)
+        self.gf_table.setRowCount(len(rows))
+        for r, g in enumerate(rows):
+            on = g["id"] not in hidden
+            for col, v in enumerate([g["name"] or "(no name)", p.geofence_type(g),
+                                     "QGIS" if g["mine"] else "Traccar", "⋯"]):
+                item = QTableWidgetItem(v)
+                if col == 0:
+                    item.setFlags(item.flags() | _ITEM_CHECKABLE)
+                    item.setCheckState(_CHECKED if on else _UNCHECKED)
+                    swatch = QPixmap(12, 12)
+                    swatch.fill(QColor(g["color"]))
+                    item.setIcon(QIcon(swatch))
+                elif col == _GF_MENU_COL:
+                    item.setToolTip("Zoom to, colour, delete…")
+                self.gf_table.setItem(r, col, item)
+        self.gf_table.blockSignals(False)
+
+    def _gf_item_changed(self, item):
+        r = item.row()
+        if item.column() == 0 and 0 <= r < len(self._gf_rows):
+            gid, on = self._gf_rows[r]["id"], item.checkState() == _CHECKED
+            # Later: the table is rebuilt, and this item replaced, while Qt still emits its signal
+            QTimer.singleShot(0, lambda: self.p.set_geofence_shown(gid, on))
+
+    def _geofence_row_menu(self, r):
+        if not 0 <= r < len(self._gf_rows):
+            return
+        g, p = self._gf_rows[r], self.p
+        gid = g["id"]
+        menu = QMenu(self.gf_table)
+        menu.addSection("%s  (%s, from %s)" % (g["name"] or "(no name)", p.geofence_type(g),
+                                               "QGIS" if g["mine"] else "Traccar"))
+        menu.addAction("Zoom to geofence", lambda: p.zoom_to_geofence(gid))
+        menu.addAction("🎨  Colour…", lambda: p.set_geofence_color(gid))
+        menu.addAction("📋  Copy as WKT", lambda: p.copy_text(p.geofence_wkt(gid), "WKT, WGS84"))
+        menu.addSeparator()
+        menu.addAction("🗑  Delete from Traccar…", lambda: p.delete_geofence(gid, g["name"]))
+        menu.exec(QCursor.pos())
+        menu.deleteLater()
 
     def _copy_menus(self, menu, row):
         """'Copy location' (each format, what3words, WKT) and 'Copy track' submenus."""
@@ -1802,8 +1904,12 @@ point, never for real trackers). Positions are sent with
 Traccar's OsmAnd protocol to port 5055 of your server, or to the <i>Send to</i> address in
 <b>Settings → Connection → Send point</b> if your server uses another.</p>
 <h3>Geofences (areas, lines, circles)</h3>
-<p>Traccar's <b>geofences</b> are drawn on the map in orange with their names (tick <i>Geofences</i> under
-Show), and refreshed with Live. To add your own, use the <b>⬡ Geofences</b> button in the panel:</p>
+<p>Traccar's <b>geofences</b> are drawn on the map with their names, each in its own colour (the colour set
+in Traccar, else orange) — they never go grey like old fixes. Tick <i>Geofences</i> under Show; they are
+refreshed with Live. They are also listed under the devices in the panel: tick one to show or hide it,
+double-click to zoom to it, and ⋯ or right-click to <b>change its colour</b> (saved in Traccar, so its map
+shows it too), copy it as WKT, or <b>delete it from Traccar</b>. To add your own, use the
+<b>⬡ Geofences</b> button in the panel:</p>
 <ul>
 <li><b>Send selected features to Traccar…</b> — select polygons, lines or points in the active layer
 (e.g. search sectors), pick the field that names them, and they become geofences. Points become circles
@@ -1811,8 +1917,9 @@ of the radius you choose. Any CRS works. Holes in polygons are dropped (Traccar 
 detailed shapes are simplified to fit Traccar's size limit.</li>
 <li><b>⭕ Circle</b> (also on the toolbar) — click the map, give a name and a radius (250, 500, 1000 m
 or any other).</li>
-<li><b>Delete from Traccar</b> — lists the geofences sent from QGIS; geofences made in Traccar itself are
-never changed or deleted here.</li>
+<li>Both ask for a <b>colour</b>, kept as the geofence's colour in Traccar.</li>
+<li><b>Delete from Traccar</b> — every geofence, sent from QGIS or made in Traccar. You are always asked
+first; deleting one made in Traccar gets an extra warning, as Traccar alerts may use it.</li>
 </ul>
 <p>Sending a geofence with the same name as one sent from QGIS before <b>replaces</b> it, so you can edit
 a sector in QGIS and send it again. Other Traccar users see a geofence when it is shared with them in
@@ -1870,7 +1977,7 @@ class TraccarLive:
         self._w3w_reply = None
         self._tools = {}           # "send" / "circle" → _ClickTool
         self._send_replies = set()
-        self.geofences = []        # [{id, name, area, mine}] from Traccar
+        self.geofences = []        # [{id, name, area, mine, raw, color, kind}] from Traccar, by name
         self._gf_item = None       # canvas item drawing them
         self._circle_name = ""
         self._send_name = ""       # last name sent to, offered again on the next click
@@ -2158,7 +2265,7 @@ class TraccarLive:
         self.status_msg = ""
         self._remove_overlays()
         self.geofences = []
-        self._remove_geofence_item()
+        self._draw_geofences()
         self._rebuild()
 
     def reload_window(self):
@@ -3140,15 +3247,69 @@ class TraccarLive:
             return
 
         def ok(gfs):
-            self.geofences = [{"id": g["id"], "name": g.get("name") or "", "area": g.get("area") or "",
-                               "mine": bool((g.get("attributes") or {}).get(GEOFENCE_MARK))} for g in gfs]
+            self.geofences = []
+            for g in gfs:
+                attrs = g.get("attributes") or {}
+                color = QColor(str(attrs.get("color") or ""))
+                parsed = parse_geofence_area(g.get("area") or "")
+                self.geofences.append({
+                    "id": g["id"], "name": g.get("name") or "", "area": g.get("area") or "",
+                    "mine": bool(attrs.get(GEOFENCE_MARK)), "raw": g,
+                    "color": color.name() if color.isValid() else GEOFENCE_COLOR,
+                    "kind": parsed[0] if parsed else ""})
+            self.geofences.sort(key=lambda g: g["name"].lower())
             self._draw_geofences()
 
         self.api.get("/api/geofences", ok, lambda m: self._log("Geofences: " + m, _MSG_WARN))
 
+    def hidden_geofence_ids(self):
+        """Traccar ids of the geofences unticked in the list (kept between sessions)."""
+        out = set()
+        for x in str(self.cfg["hidden_geofences"]).split(","):
+            try:
+                out.add(int(x))
+            except ValueError:
+                pass
+        return out
+
+    def set_geofence_shown(self, gid, on):
+        hidden = self.hidden_geofence_ids()
+        if on:
+            hidden.discard(gid)
+        else:
+            hidden.add(gid)
+        self.set_cfg("hidden_geofences", ",".join(str(i) for i in sorted(hidden)))
+        self._draw_geofences()
+
+    def set_all_geofences_shown(self, on):
+        self.set_cfg("hidden_geofences", "" if on else ",".join(str(g["id"]) for g in self.geofences))
+        self._draw_geofences()
+
+    def _geofence(self, gid):
+        return next((g for g in self.geofences if g["id"] == gid), None)
+
+    def geofence_wkt(self, gid):
+        """Standard WKT (longitude first, WGS84); a circle as its 72-sided polygon."""
+        g = self._geofence(gid)
+        parsed = parse_geofence_area(g["area"]) if g else None
+        if not parsed or not parsed[1]:
+            return ""
+        coords = ", ".join("%.6f %.6f" % xy for xy in parsed[1])
+        return "LINESTRING (%s)" % coords if parsed[0] == "line" else "POLYGON ((%s))" % coords
+
+    def geofence_type(self, g):
+        """'Area', 'Line' or 'Circle 500 m' for the list."""
+        if g["kind"] == "circle":
+            m = re.search(r",\s*%s\s*\)" % _NUM, g["area"])
+            return "Circle %d m" % round(float(m.group(1))) if m else "Circle"
+        return {"line": "Line", "polygon": "Area"}.get(g["kind"], "?")
+
     def _draw_geofences(self):
+        if self.dock is not None:
+            self.dock.refresh_geofences()
         canvas = self.iface.mapCanvas()
-        if not self.cfg["show_geofences"] or not self.geofences:
+        hidden = self.hidden_geofence_ids()
+        if not self.cfg["show_geofences"] or not any(g["id"] not in hidden for g in self.geofences):
             self._remove_geofence_item()
             return
         if self._gf_item is None:
@@ -3156,6 +3317,8 @@ class TraccarLive:
         tr = QgsCoordinateTransform(WGS84, canvas.mapSettings().destinationCrs(), QgsProject.instance())
         shapes = []
         for g in self.geofences:
+            if g["id"] in hidden:
+                continue
             parsed = parse_geofence_area(g["area"])
             if not parsed or not parsed[1]:
                 continue
@@ -3170,7 +3333,8 @@ class TraccarLive:
                 inner = QgsGeometry.fromPolygonXY([pts]).pointOnSurface()
                 label_pt = inner.asPoint() if not inner.isEmpty() else pts[0]
             shapes.append({"poly": QPolygonF([QPointF(p.x(), p.y()) for p in pts]),
-                           "closed": kind != "line", "label": g["name"], "label_pt": label_pt})
+                           "closed": kind != "line", "label": g["name"], "label_pt": label_pt,
+                           "color": g["color"]})
         self._gf_item.shapes = shapes
         self._gf_item.show_labels = bool(self.cfg["show_labels"])
         self._gf_item.updatePosition()
@@ -3185,9 +3349,10 @@ class TraccarLive:
             self._gf_item = None
             self.iface.mapCanvas().refresh()
 
-    def _upsert_geofences(self, items):
-        """items: [(name, area, simplified)]. A geofence sent from QGIS before under the same
-        name is replaced (PUT); anything else is added (POST). Then the map is redrawn."""
+    def _upsert_geofences(self, items, color):
+        """items: [(name, area, simplified)], all given colour ("#rrggbb", Traccar's 'color'
+        attribute). A geofence sent from QGIS before under the same name is replaced (PUT);
+        anything else is added (POST). Then the map is redrawn."""
         def got(existing):
             mine = {(g.get("name") or "").strip().lower(): g for g in existing
                     if (g.get("attributes") or {}).get(GEOFENCE_MARK)}
@@ -3222,15 +3387,24 @@ class TraccarLive:
                     done()
 
                 if old:
-                    body = dict(old, name=name, area=area,
-                                attributes=dict(old.get("attributes") or {}, **{GEOFENCE_MARK: True}))
+                    body = dict(old, name=name, area=area, attributes=dict(
+                        old.get("attributes") or {}, **{GEOFENCE_MARK: True, "color": color}))
                     self.api.put("/api/geofences/%d" % old["id"], body, ok, bad)
                 else:
-                    self.api.post("/api/geofences", {"name": name, "area": area,
-                                                     "attributes": {GEOFENCE_MARK: True}}, ok, bad)
+                    self.api.post("/api/geofences", {"name": name, "area": area, "attributes": {
+                        GEOFENCE_MARK: True, "color": color}}, ok, bad)
 
         self.api.get("/api/geofences", got,
                      lambda m: self._bar("Sending geofences needs your Traccar login: %s" % m, _MSG_WARN, 10))
+
+    def _color_button(self):
+        btn = QgsColorButton()
+        btn.setColor(QColor(self.cfg["geofence_color"]))
+        btn.setDefaultColor(QColor(GEOFENCE_COLOR))
+        btn.setShowNoColor(False)
+        btn.setAllowOpacity(False)
+        btn.setToolTip("Shown in QGIS and in Traccar's own map")
+        return btn
 
     def send_selected(self):
         """The active layer's selected features → geofences (polygons, lines; points as circles)."""
@@ -3264,6 +3438,8 @@ class TraccarLive:
         rad.setValue(int(self.cfg["circle_radius"]))
         if is_point:
             f.addRow("Circle radius:", rad)
+        col = self._color_button()
+        f.addRow("Colour:", col)
         hint = QLabel("A geofence sent from QGIS before with the same name is replaced.")
         hint.setStyleSheet("color:#666;")
         f.addRow(hint)
@@ -3272,10 +3448,11 @@ class TraccarLive:
         bb.rejected.connect(d.reject)
         f.addRow(bb)
         accepted = d.exec() == _DLG_OK
-        field, text, radius = fld.currentField(), txt.text().strip(), rad.value()
+        field, text, radius, color = fld.currentField(), txt.text().strip(), rad.value(), col.color().name()
         d.deleteLater()
         if not accepted:
             return
+        self.set_cfg("geofence_color", color)
         if is_point:
             self.set_cfg("circle_radius", radius)
         items, skipped = [], 0
@@ -3297,7 +3474,7 @@ class TraccarLive:
         if skipped:
             self._bar("%d feature(s) skipped: no geometry Traccar can take" % skipped, _MSG_WARN)
         if items:
-            self._upsert_geofences(items)
+            self._upsert_geofences(items, color)
 
     def circle_at(self, lat, lon):
         """⭕ Circle tool: ask for a name and radius, then send a circle geofence."""
@@ -3320,32 +3497,38 @@ class TraccarLive:
             b.setText("%d m" % r)
             b.clicked.connect(lambda _c=False, r=r: rad.setValue(r))
             row.addWidget(b)
+        col = self._color_button()
         f.addRow("Name:", name)
         f.addRow("Radius:", row)
+        f.addRow("Colour:", col)
         bb = QDialogButtonBox(_BTN_OK | _BTN_CANCEL)
         bb.accepted.connect(d.accept)
         bb.rejected.connect(d.reject)
         f.addRow(bb)
         name.selectAll()
         accepted = d.exec() == _DLG_OK
-        text, radius = name.text().strip(), rad.value()
+        text, radius, color = name.text().strip(), rad.value(), col.color().name()
         d.deleteLater()
         if not accepted:
             return
         text = text or "Circle %s" % datetime.now().strftime("%H:%M")
         self._circle_name = text
         self.set_cfg("circle_radius", radius)
-        self._upsert_geofences([(text, "CIRCLE (%s, %.1f)" % (_ll(lat, lon), radius), False)])
+        self.set_cfg("geofence_color", color)
+        self._upsert_geofences([(text, "CIRCLE (%s, %.1f)" % (_ll(lat, lon), radius), False)], color)
 
     def delete_geofence(self, gid, name):
-        """Ask, then delete a geofence sent from QGIS."""
-        if not any(g["id"] == gid and g["mine"] for g in self.geofences):
+        """Ask, then delete a geofence from Traccar (one made in Traccar itself gets a firmer warning)."""
+        g = self._geofence(gid)
+        if g is None:
             return
         yes = _e(QMessageBox, "StandardButton", "Yes")
         no = _e(QMessageBox, "StandardButton", "No")
+        made = ("" if g["mine"] else
+                "It was made in Traccar, not sent from QGIS — Traccar alerts may use it.\n\n")
         if QMessageBox.question(self.iface.mainWindow(), "Traccar Live – Delete geofence",
-                                "Delete the geofence '%s' from Traccar?\n\nIt disappears for everyone. "
-                                "This can't be undone." % name, yes | no, no) != yes:
+                                "Delete the geofence '%s' from Traccar?\n\n%sIt disappears for everyone. "
+                                "This can't be undone." % (name, made), yes | no, no) != yes:
             return
 
         def done(_none):
@@ -3355,6 +3538,43 @@ class TraccarLive:
 
         self.api.delete("/api/geofences/%d" % gid, done,
                         lambda m: self._bar("Couldn't delete '%s' from Traccar: %s" % (name, m), _MSG_WARN, 10))
+
+    def set_geofence_color(self, gid):
+        """Pick a colour and save it on the geofence in Traccar (its 'color' attribute)."""
+        g = self._geofence(gid)
+        if g is None:
+            return
+        color = QColorDialog.getColor(QColor(g["color"]), self.iface.mainWindow(),
+                                      "Traccar Live – Colour of '%s'" % g["name"])
+        if not color.isValid():
+            return
+        raw = g["raw"]
+        body = dict(raw, attributes=dict(raw.get("attributes") or {}, color=color.name()))
+
+        def done(_g):
+            self._bar("Colour of '%s' saved in Traccar" % g["name"], _MSG_OK, 3)
+            self.load_geofences()
+
+        self.api.put("/api/geofences/%d" % gid, body, done,
+                     lambda m: self._bar("Couldn't change '%s' in Traccar: %s" % (g["name"], m), _MSG_WARN, 10))
+
+    def zoom_to_geofence(self, gid):
+        g = self._geofence(gid)
+        parsed = parse_geofence_area(g["area"]) if g else None
+        if not parsed or not parsed[1]:
+            return
+        if gid in self.hidden_geofence_ids():
+            self.set_geofence_shown(gid, True)
+        canvas, tr = self._to_canvas()
+        xs = [lon for lon, _lat in parsed[1]]
+        ys = [lat for _lon, lat in parsed[1]]
+        try:
+            rect = tr.transformBoundingBox(QgsRectangle(min(xs), min(ys), max(xs), max(ys)))
+        except QgsCsException:
+            return
+        rect.scale(1.3)
+        canvas.setExtent(rect)
+        canvas.refresh()
 
     def is_sent_point(self, dev_id):
         """A device added by Send point (identifier qgis-…) — the only kind the plugin deletes."""
