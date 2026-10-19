@@ -59,6 +59,7 @@ def _fix(dev, t, lon, lat, i):
             "attributes": {"batteryLevel": 81, "motion": True}}
 
 
+OSMAND = []                                # fixes received on the OsmAnd port
 W3W_KEY, W3W_CALLS = "w3w-test-key", []   # pragma: allowlist secret  (fake what3words API)
 POS = {1: [], 2: [], 3: []}
 for i in range(240):                                   # last 2 h, every 30 s
@@ -113,6 +114,11 @@ class Handler(BaseHTTPRequestHandler):
             g = dict(self._body(), id=max([g["id"] for g in GEOFENCES] + [0]) + 1)
             GEOFENCES.append(g)
             self._json(200, g)
+        elif self.path == "/api/devices":
+            dev = dict(self._body(), id=max(x["id"] for x in DEVICES) + 1, status="unknown")
+            DEVICES.append(dev)
+            POS[dev["id"]] = []
+            self._json(200, dev)
         else:
             self._json(404, {})
 
@@ -143,12 +149,25 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._json(200, {"words": "filled.count.soap"})
             return
+        if self.path.startswith("/osmand/"):                   # Traccar's OsmAnd port: no login
+            q = parse_qs(urlparse(self.path).query)
+            dev = next((x for x in DEVICES if x.get("uniqueId") == q.get("id", [""])[0]), None)
+            if dev is None:
+                self._json(400, {})
+                return
+            OSMAND.append(q)
+            self._json(200, {})
+            return
         if not self._authed():
             return
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/api/geofences":
             body = GEOFENCES
+        elif u.path == "/api/groups":
+            body = [{"id": 4, "name": "Search teams"}]
+        elif u.path == "/api/calendars":
+            body = [{"id": 9, "name": "Operation hours"}]
         elif u.path == "/api/devices":
             body = DEVICES
         elif u.path == "/api/positions" and "deviceId" in q:
@@ -950,15 +969,26 @@ def t16i_geofences():
     d = plugin.dock
     plugin.cfg["show_geofences"] = True
     plugin.load_geofences()
-    check("geofences listed in the panel, by name, with their type and origin",
-          wait(lambda: d.gf_table.rowCount() == 2) and d.gf_box.isVisibleTo(d)
+    check("geofences listed in their own tab, by name, with their type and origin",
+          wait(lambda: d.gf_table.rowCount() == 2) and d.tabs.tabText(1) == "Geofences (2)"
+          and d.tabs.tabText(0) == "Devices (3)"
           and [d.gf_table.item(r, c).text() for r in range(2) for c in (0, 1, 2)]
-          == ["Lake sector", "Area", "Traccar", "Trail", "Line", "QGIS"],
-          [d.gf_table.item(r, c).text() for r in range(d.gf_table.rowCount()) for c in (0, 1, 2)])
+          == ["Lake sector", "Area", "Traccar", "Trail", "Line", "QGIS / QField"],
+          [d.tabs.tabText(i) for i in range(2)]
+          + [d.gf_table.item(r, c).text() for r in range(d.gf_table.rowCount()) for c in (0, 1, 2)])
     shapes = plugin._gf_item.shapes if plugin._gf_item else []
     check("each drawn in its own colour (Traccar's 'color', else the default)",
-          sorted(s["color"] for s in shapes) == sorted(["#1565c0", mod.GEOFENCE_COLOR]),
+          sorted(s["color"] for s in shapes) == sorted(["#1565C0", mod.GEOFENCE_COLOR]),
           [s["color"] for s in shapes])
+    d._set_column(d.gf_table, "geofence_columns_hidden", mod.GEOFENCE_COLUMNS, "From", False)
+    d._set_column(d.table, "device_columns_hidden", mod.DEVICE_COLUMNS, "Battery", False)
+    check("columns can be hidden (remembered); name and ⋯ always stay",
+          d.gf_table.isColumnHidden(2) and d.table.isColumnHidden(5) and not d.table.isColumnHidden(0)
+          and plugin.cfg["geofence_columns_hidden"] == "From" and plugin.cfg["device_columns_hidden"] == "Battery")
+    d._set_column(d.gf_table, "geofence_columns_hidden", mod.GEOFENCE_COLUMNS, None, True)
+    d._set_column(d.table, "device_columns_hidden", mod.DEVICE_COLUMNS, None, True)
+    check("Show all columns", not any(d.gf_table.isColumnHidden(i) for i in range(len(mod.GEOFENCE_COLUMNS)))
+          and plugin.cfg["device_columns_hidden"] == "")
     d.gf_table.item(0, 0).setCheckState(mod._UNCHECKED)
     wait(lambda: plugin.hidden_geofence_ids() == {7}, 2)
     check("unticking hides one geofence from the map",
@@ -970,13 +1000,16 @@ def t16i_geofences():
           plugin.geofence_wkt(8))
     orig_color, orig_q = QColorDialog.getColor, QMessageBox.question
     try:
-        QColorDialog.getColor = staticmethod(lambda *a, **k: QColor("#2e7d32"))
-        plugin.set_geofence_color(7)
-        check("colour change is saved in Traccar, keeping the rest of the geofence",
-              wait(lambda: GEOFENCES[0]["attributes"].get("color") == "#2e7d32")
+        plugin.set_geofence_color(7, "#AD1457")
+        check("swatch colour saved in Traccar, keeping the rest of the geofence",
+              wait(lambda: GEOFENCES[0]["attributes"].get("color") == "#AD1457")
               and GEOFENCES[0]["area"].startswith("POLYGON") and GEOFENCES[0]["name"] == "Lake sector",
               GEOFENCES[0])
-        wait(lambda: any(g["color"] == "#2e7d32" for g in plugin.geofences), 3)
+        QColorDialog.getColor = staticmethod(lambda *a, **k: QColor("#2e7d32"))
+        plugin.set_geofence_color(7)
+        check("'Other colour…' picks any colour",
+              wait(lambda: GEOFENCES[0]["attributes"].get("color") == "#2E7D32"), GEOFENCES[0])
+        wait(lambda: any(g["color"] == "#2E7D32" for g in plugin.geofences), 3)
         asked = []
         no = mod._e(QMessageBox, "StandardButton", "No")
         yes = mod._e(QMessageBox, "StandardButton", "Yes")
@@ -990,13 +1023,105 @@ def t16i_geofences():
               wait(lambda: d.gf_table.rowCount() == 1) and [g["id"] for g in GEOFENCES] == [8])
     finally:
         QColorDialog.getColor, QMessageBox.question = orig_color, orig_q
-    plugin.cfg["geofence_color"] = "#6a1b9a"
+    plugin.cfg["geofence_color"] = "#6A1B9A"
     plugin._upsert_geofences([("Trail", "LINESTRING (53.35 -6.30, 53.36 -6.28)", False)],
                              plugin.cfg["geofence_color"])
     check("re-sending replaces it and sets the chosen colour",
           wait(lambda: GEOFENCES[0]["area"].endswith("-6.28)")) and len(GEOFENCES) == 1
-          and GEOFENCES[0]["attributes"] == {"createdByTraccarLiveQgis": True, "color": "#6a1b9a"},
+          and GEOFENCES[0]["attributes"] == {"createdByTraccarLiveQgis": True, "color": "#6A1B9A"},
           GEOFENCES)
+
+
+@test
+def t16j_send_form_and_tools():
+    from qgis.PyQt.QtCore import QEvent, QPointF
+    from qgis.gui import QgsMapMouseEvent
+    plugin.open_main()
+    d = plugin.dock
+    plugin.load_geofences()
+    check("groups and calendars loaded for the send form",
+          wait(lambda: plugin.groups and plugin.calendars) and plugin.groups[0]["name"] == "Search teams")
+    # ── the form, as the QField plugin's: fields per shape ──
+    f = mod.SendDialog(plugin, "line", [(53.35, -6.30), (53.36, -6.29)])
+    check("line form: description, corridor width, speed limit, calendar, colour swatches",
+          f.corridor.isVisibleTo(f) and f.calendar.count() == 2 and f.calendar.itemText(1) == "Operation hours"
+          and len(f.swatches.buttons) == 10 and not f.radius.isVisibleTo(f))
+    f.name.setText("Trail 2")
+    f.description.setText("Main track")
+    f.corridor.setValue(40)
+    f.speed.setValue(20)
+    f.calendar.setCurrentIndex(1)
+    f.swatches.buttons["#2E7D32"].click()
+    v = f.values()
+    extra = mod.geofence_extra(v)
+    check("form values → Traccar fields (speed limit in knots)",
+          extra == {"description": "Main track", "calendarId": 9,
+                    "attributes": {"color": "#2E7D32", "speedLimit": 10.8, "polylineDistance": 40}}, extra)
+    f.deleteLater()
+    pf = mod.SendDialog(plugin, "point", [(53.36, -6.31)])
+    check("point form: identifier, category, group, phone, model, contact; no colour",
+          pf.category.count() == len(mod.DEVICE_CATEGORIES) and pf.group.itemText(1) == "Search teams"
+          and not hasattr(pf, "swatches"))
+    pf.deleteLater()
+    # ── Area tool: corners on the map, right-click → form → geofence ──
+    forms = []
+    orig = plugin._send_dialog
+    plugin._send_dialog = lambda mode, coords: forms.append((mode, coords)) or {
+        "name": "Sector B", "description": "North", "radius": 500, "corridor_m": 0, "speed_kmh": 0,
+        "calendar_id": 0, "color": "#00838F"}
+    try:
+        plugin.act_area.setChecked(True)
+        canvas = IFACE.mapCanvas()
+        tool = plugin._tools["area"]
+        check("⬡ Area is a map tool; Point / Line / Circle switch it off",
+              canvas.mapTool() is tool and isinstance(tool, mod._ShapeTool))
+
+
+        def click(lon, lat, button):
+            pt = canvas.getCoordinateTransform().transform(mod.QgsPointXY(lon, lat))
+            e = QgsMapMouseEvent(canvas, mod._e(QEvent, "Type", "MouseButtonRelease"), QPointF(pt.x(), pt.y()).toPoint(),
+                                 button, button, mod._e(mod.Qt, "KeyboardModifier", "NoModifier"))
+            tool.canvasReleaseEvent(e)
+
+        left = mod._e(mod.Qt, "MouseButton", "LeftButton")
+        right = mod._e(mod.Qt, "MouseButton", "RightButton")
+        canvas.setDestinationCrs(mod.WGS84)
+        canvas.setExtent(mod.QgsRectangle(-6.4, 53.3, -6.2, 53.4))
+        canvas.refresh()
+        click(-6.30, 53.37, left)
+        click(-6.29, 53.37, right)                     # too early: needs three corners
+        check("right-click with two corners: not finished", not forms and len(tool.pts) == 1, len(tool.pts))
+        click(-6.29, 53.37, left)
+        click(-6.29, 53.36, left)
+        click(0, 0, right)
+        check("right-click → the send form with the corners (lat, lon)",
+              forms and forms[0][0] == "area" and len(forms[0][1]) == 3
+              and abs(forms[0][1][0][0] - 53.37) < 0.001 and abs(forms[0][1][0][1] + 6.30) < 0.001, forms)
+        check("area sent with its fields; corners cleared",
+              wait(lambda: any(g.get("name") == "Sector B" for g in GEOFENCES)) and not tool.pts
+              and [g for g in GEOFENCES if g["name"] == "Sector B"][0]["description"] == "North"
+              and [g for g in GEOFENCES if g["name"] == "Sector B"][0]["area"].startswith("POLYGON ((53.37"))
+        plugin.act_line.setChecked(True)
+        check("Line tool takes over; Area unticked", canvas.mapTool() is plugin._tools["line"]
+              and not plugin.act_area.isChecked())
+        plugin.act_line.setChecked(False)
+        # ── Circle and Point use the same form ──
+        plugin.circle_at(53.36, -6.33)
+        check("circle from the form", wait(lambda: any(g.get("area", "").startswith("CIRCLE (53.360000 -6.330000, 500")
+                                                      for g in GEOFENCES)) and forms[-1][0] == "circle")
+        plugin.cfg["send_url"] = URL + "/osmand/"
+        plugin.send_point_to({"name": "Clue 9", "unique_id": "", "category": "person", "group_id": 4,
+                              "phone": "087 000", "model": "", "contact": "Team 2"}, 53.361, -6.31)
+        check("new point → device with its details, then a fix on the OsmAnd port",
+              wait(lambda: OSMAND) and [x for x in DEVICES if x["name"] == "Clue 9"][0].get("category") == "person"
+              and [x for x in DEVICES if x["name"] == "Clue 9"][0].get("groupId") == 4
+              and [x for x in DEVICES if x["name"] == "Clue 9"][0].get("contact") == "Team 2"
+              and [x for x in DEVICES if x["name"] == "Clue 9"][0]["uniqueId"].startswith("qgis-clue-9-"),
+              DEVICES[-1])
+        DEVICES[:] = [x for x in DEVICES if x["name"] != "Clue 9"]
+    finally:
+        plugin._send_dialog = orig
+        plugin.cfg["send_url"] = ""
 
 
 @test

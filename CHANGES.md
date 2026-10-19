@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Same tools and forms as the QField plugin
+- **Add** row in the panel (and on the toolbar): **📤 Point**, **⬡ Area**, **〰 Line**, **⭕ Circle**,
+  **📑 Send selected features…**. Area and Line are new map tools: click each corner, right-click or
+  Enter to finish, Backspace to undo, Esc to start again.
+- **One send form** for every shape, laid out like QField's: name, then Traccar's fields —
+  geofences: description, speed limit (km/h, saved in knots as `speedLimit`), corridor width for lines
+  (`polylineDistance`), calendar (`calendarId`) and a row of **colour swatches** (the same ten as QField);
+  points: identifier, category (icon), group, phone, model, contact for a new device. Groups and
+  calendars are read from Traccar.
+- *Send selected features* keeps its own dialog, now with the swatches, a description field and, for
+  point layers, *as circles* or *as points (devices)*.
+- Changing a geofence's colour: ⋯ → **Colour** shows the swatches, plus *Other colour…*.
+- **Tabs**: Devices and Geofences, with counts. Right-click a list's column titles to **hide columns**
+  (remembered: `device_columns_hidden`, `geofence_columns_hidden`). The geofence list has new
+  *Description* and *Speed limit* columns.
+
 ### Send point
 - **📤 Send point** (toolbar, plugin menu and the panel): click the map, give the point a name, and it is
   sent to Traccar. A new name adds a new device with that name (`POST /api/devices`, identifier
