@@ -1,3 +1,6 @@
+# Copyright (C) 2026 TyHol
+# SPDX-License-Identifier: GPL-2.0-or-later
+
 """
 Integration tests for Traccar Live (QGIS plugin), run inside a real QGIS Python.
 
