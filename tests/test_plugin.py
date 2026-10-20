@@ -386,6 +386,11 @@ def t06_template_gpkg():
     check("template GeoPackage: 2 layers, no errors", pts is not None and trk is not None and not err, err)
     check("tracks table is LineStringZM",
           QgsWkbTypes.hasZ(trk.wkbType()) and QgsWkbTypes.hasM(trk.wkbType()))
+    gfp, gfl, err2 = mod.create_geofence_tables(GPKG)
+    check("template GeoPackage: geofence polygon and line tables added",
+          gfp is not None and gfl is not None and not err2
+          and gfp.geometryType() == mod._GEOM_POLY and gfl.geometryType() == mod._GEOM_LINE
+          and "geofence_id" in gfp.fields().names(), err2)
     add(pts).setName("pts")
     add(trk).setName("trk")
     plugin.cfg.update(points_layer_id=pts.id(), tracks_layer_id=trk.id(), points_mode=0, tracks_mode=0)
@@ -1245,6 +1250,65 @@ def t16j_send_form_and_tools():
         plugin._send_dialog = orig
     check("Layers panel right-click: Send selected features to Traccar…",
           plugin.act_layer_send is not None and "Send selected features" in plugin.act_layer_send.text())
+
+
+@test
+def t16k_save_geofences_and_auto_save():
+    path = os.path.join(TMP, "save_test.gpkg")
+    pts, trk, err = mod.create_template_gpkg(path)
+    gfp, gfl, err2 = mod.create_geofence_tables(path)
+    for lyr in (pts, trk, gfp, gfl):
+        add(lyr)
+    keep = {k: plugin.cfg[k] for k in ("points_layer_id", "tracks_layer_id", "points_mode", "tracks_mode",
+                                       "geofences_layer_id", "geofence_lines_layer_id", "auto_save")}
+    plugin.cfg.update(geofences_layer_id=gfp.id(), geofence_lines_layer_id=gfl.id())
+    try:
+        plugin.load_geofences()
+        wait(lambda: plugin.geofences and not any(g.get("pending") for g in plugin.geofences), 5)
+        areas = [g for g in plugin.geofences if g["kind"] in ("polygon", "circle")]
+        lines = [g for g in plugin.geofences if g["kind"] == "line"]
+        plugin.save_geofences()
+        fs = {f["geofence_id"]: f for f in gfp.getFeatures()}
+        circle = next((g for g in areas if g["kind"] == "circle"), None)
+        check("Save geofences: areas and circles → polygon layer, lines → line layer",
+              len(fs) == len(areas) and gfl.featureCount() == len(lines) and areas and lines,
+              (len(fs), len(areas), gfl.featureCount(), len(lines)))
+        check("geofence fields: id, name, type, colour, radius of a circle",
+              circle is not None and fs[circle["id"]]["type"] == "circle" and fs[circle["id"]]["radius_m"] > 0
+              and fs[circle["id"]]["color"] == circle["color"] and fs[circle["id"]]["name"] == circle["name"]
+              and not fs[circle["id"]].geometry().isEmpty())
+        plugin.save_geofences()
+        check("saving again replaces them (no duplicates)",
+              gfp.featureCount() == len(areas) and gfl.featureCount() == len(lines))
+
+        # ── automatic saving after every refresh ──
+        plugin.show_all()
+        plugin.set_live(False)
+        plugin.cfg.update(points_layer_id=pts.id(), tracks_layer_id=trk.id(), points_mode=0, tracks_mode=0,
+                          auto_save=True)
+        load(180)
+        n_markers = len(plugin._shown(plugin.marker_pos))
+        check("auto-save: the refresh saved each device's latest fix and its track",
+              pts.featureCount() == n_markers and trk.featureCount() == len([v for v in plugin.tracks.values() if v])
+              and n_markers > 0, (pts.featureCount(), n_markers, trk.featureCount()))
+        load(180)
+        check("a refresh with nothing new saves nothing", pts.featureCount() == n_markers
+              and trk.featureCount() == len([v for v in plugin.tracks.values() if v]), pts.featureCount())
+        last = POS[1][-1]
+        t_new = datetime.now(timezone.utc).replace(microsecond=0)
+        POS[1].append(_fix(1, t_new, last["longitude"] + 0.001, last["latitude"], 9999))
+        plugin.poll_live()
+        check("a new fix: one more point, and that device's track replaced (still one per device)",
+              wait(lambda: pts.featureCount() == n_markers + 1) and trk.featureCount() == len(
+                  [v for v in plugin.tracks.values() if v]), (pts.featureCount(), trk.featureCount()))
+        g_before = gfp.featureCount()
+        plugin.load_geofences()
+        wait(lambda: False, 1)
+        check("auto-save: unchanged geofences aren't written again", gfp.featureCount() == g_before)
+        check("panel says it's saving automatically", "automatically" in plugin.saves_to_html())
+    finally:
+        plugin.cfg.update(keep)
+        POS[1].pop()
 
 
 @test

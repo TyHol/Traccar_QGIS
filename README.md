@@ -120,6 +120,9 @@ Either way: each device has its own colour, grey when its last fix is older than
 | | *Every fix in the time window* | one point per fix |
 | 〰 Save tracks | *Add a new track for each device on every save* | one line per device |
 | | *Keep only the most recent track per device* | replaces that device's earlier track (matched by `device_id`, or by the device-name field) |
+| ⬡ Save geofences | *Geofences*: a polygon layer and a line layer | areas and circles (as polygons) / lines, with `geofence_id`, name, description, type, radius, speed limit, colour, calendar; saving again replaces each one by `geofence_id` |
+
+- **Save automatically** (Settings… → Layers) saves after every refresh and Live update — only what's new: each device's new fixes (latest or every fix), its track kept to the most recent one, and geofences that changed. Hidden devices are left out.
 
 - Points and lines are reprojected to the layer's CRS and adapted to its type (2D / Z / M, single or multi). Tracks carry altitude as Z and the fix time as M where the layer has them.
 - If the layer is already being edited, the new features go into that edit session for you to save.
@@ -150,7 +153,7 @@ Everything in the plugin is shown in local time, with the right summer/winter of
 | Tab | Contains |
 |---|---|
 | **Connection** | Server URL, email / username, password (leave blank to keep the saved one), *Test connection*; *Send point*: name offered first, *Send to* (Traccar's OsmAnd address if not port 5055) |
-| **Layers** | Positions layer, device-name field, latest / every fix · Tracks layer, device-name field, add / keep most recent · *New GeoPackage…* |
+| **Layers** | Positions layer, device-name field, latest / every fix · Tracks layer, device-name field, add / keep most recent · Geofences: polygon and line layers · *Save automatically after every refresh* · *New GeoPackage…* (all four layers) |
 | **Tag** | On/off, tag text, field, use the feature's display value |
 | **Advanced** | Refresh interval (30 s by default), grey-marker limit, live view (on the map / temporary layers), **Location**: lat / long as decimal degrees, degrees + minutes or degrees + minutes + seconds, with N/S/E/W or +/−; custom CRS (EPSG:2157 by default); what3words API key, the layer and fields used by *From feature* |
 

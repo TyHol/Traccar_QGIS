@@ -2,6 +2,16 @@
 
 ## v0.4.2 (in development)
 
+- **⬡ Save geofences** (next to Save positions / tracks): Traccar's geofences to layers chosen in
+  Settings → Layers → Geofences — areas and circles (as polygons) to a polygon layer, lines to a line
+  layer, with `geofence_id`, name, description, type, radius_m, speed_kmh, color, calendar, made_in,
+  saved_at. Saving again replaces each one by `geofence_id`. *New GeoPackage…* now creates four layers
+  (`traccar_geofences`, `traccar_geofence_lines` added).
+- **Save automatically after every refresh and Live update** (Settings → Layers): only what's new —
+  each shown device's new fixes (latest or every fix), its track kept to the most recent one, and
+  geofences that changed. On the first refresh it reads the newest fix already in the layer, so nothing
+  is saved twice.
+
 - **Areas and lines are drawn while you add them**: the shape (filled for an area), a dot on each corner
   and a dashed line to the mouse. Before, nothing showed until the geofence came back from Traccar
   (the preview was never refreshed).

@@ -112,6 +112,8 @@ _LF_POINT = _new_or_old(getattr(Qgis, "LayerFilter", None), "PointLayer",
                         getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "PointLayer")
 _LF_LINE = _new_or_old(getattr(Qgis, "LayerFilter", None), "LineLayer",
                        getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "LineLayer")
+_LF_POLY = _new_or_old(getattr(Qgis, "LayerFilter", None), "PolygonLayer",
+                       getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "PolygonLayer")
 _LF_VECTOR = _new_or_old(getattr(Qgis, "LayerFilter", None), "VectorLayer",
                          getattr(QgsMapLayerProxyModel, "Filter", QgsMapLayerProxyModel), "VectorLayer")
 _FF_STRING = _e(QgsFieldProxyModel, "Filter", "String")
@@ -210,6 +212,12 @@ TRACK_SCHEMA = [
     ("saved_at", "datetime"), ("tag", "string(80)"),
 ]
 
+GEOFENCE_SCHEMA = [
+    ("geofence_id", "integer"), ("name", "string(80)"), ("description", "string(255)"),
+    ("type", "string(20)"), ("radius_m", "double"), ("speed_kmh", "double"), ("color", "string(9)"),
+    ("calendar", "string(80)"), ("made_in", "string(20)"), ("saved_at", "datetime"), ("tag", "string(80)"),
+]
+
 DEFAULTS = {
     "server_url": DEFAULT_URL, "username": "",
     "authcfg": "",                  # id of the login in QGIS's Authentication Manager
@@ -220,6 +228,9 @@ DEFAULTS = {
     "show_markers": True, "show_labels": True, "show_tracks": True, "show_accuracy": False,
     "points_layer_id": "", "points_name_field": "", "points_mode": 0,
     "tracks_layer_id": "", "tracks_name_field": "", "tracks_mode": 0,
+    "geofences_layer_id": "",       # polygon layer for areas and circles (Save geofences)
+    "geofence_lines_layer_id": "",  # line layer for line geofences
+    "auto_save": False,             # save to the layers after every refresh / Live update
     "tag_enabled": False, "tag_text": "", "tag_field": "", "tag_from_feature": False,
     "live_view": "canvas",          # "canvas" = drawn on the map, "layers" = Temp Markers / Temp Tracks
     "hidden_devices": "",           # comma-separated Traccar device ids not shown (nor saved by the buttons)
@@ -1066,6 +1077,29 @@ def create_template_gpkg(path, crs_authid="EPSG:4326"):
     return out[0], out[1], errors
 
 
+def create_geofence_tables(path, crs_authid="EPSG:4326"):
+    """Add traccar_geofences (polygons: areas and circles) and traccar_geofence_lines to an existing
+    GeoPackage. Returns (polygons, lines, errors)."""
+    out, errors = [], []
+    for geom, table in (("Polygon", "traccar_geofences"), ("LineString", "traccar_geofence_lines")):
+        tmp = QgsVectorLayer(_memory_uri(geom, GEOFENCE_SCHEMA, crs_authid), table, "memory")
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.layerName = table
+        opts.fileEncoding = "UTF-8"
+        opts.actionOnExistingFile = _GPKG_LAYER
+        res = QgsVectorFileWriter.writeAsVectorFormatV3(tmp, path, QgsProject.instance().transformContext(), opts)
+        if res[0] != _VFW_OK:
+            errors.append("%s: %s" % (table, res[1]))
+            out.append(None)
+            continue
+        lyr = QgsVectorLayer("%s|layername=%s" % (path, table), table, "ogr")
+        out.append(lyr if lyr.isValid() else None)
+        if not lyr.isValid():
+            errors.append("%s: could not open the new table" % table)
+    return out[0], out[1], errors
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  Live view drawn on the map (no layers)
 # ════════════════════════════════════════════════════════════════════════════
@@ -1463,6 +1497,10 @@ class MainDock(QgsDockWidget):
         for b in (self.save_pos_btn, self.save_trk_btn):
             b.setToolTip("Save the devices shown (ticked) to the layer chosen in Settings → Layers")
             save.addWidget(b)
+        self.save_gf_btn = QPushButton("⬡  Save geofences")
+        self.save_gf_btn.setToolTip("Save Traccar's geofences to the layers chosen in Settings → Layers "
+                                    "(each one replaced by its geofence_id)")
+        save.addWidget(self.save_gf_btn)
         root.addLayout(save)
         self.saves_to_lbl = QLabel()
         self.saves_to_lbl.setWordWrap(True)
@@ -1533,6 +1571,7 @@ class MainDock(QgsDockWidget):
             lambda: self.p.hide_all() if all(r["shown"] for r in self._rows) else self.p.show_all())
         self.save_pos_btn.clicked.connect(lambda: self.p.save_positions())
         self.save_trk_btn.clicked.connect(lambda: self.p.save_tracks())
+        self.save_gf_btn.clicked.connect(lambda: self.p.save_geofences())
         self.saves_to_lbl.linkActivated.connect(lambda _l: self.p.open_settings(1))
         self.settings_btn.clicked.connect(lambda: self.p.open_settings(0))
         self.help_btn.clicked.connect(self.p.show_help)
@@ -2022,7 +2061,32 @@ class SettingsDialog(QDialog):
         gf.addRow(self.ln_keep)
         v.addWidget(g)
 
-        gp = QPushButton("New GeoPackage…  (creates both layers)")
+        g = QGroupBox("⬡  Geofences")
+        gf = QFormLayout(g)
+        self.gf_poly_combo = QgsMapLayerComboBox()
+        self.gf_poly_combo.setFilters(_LF_POLY)
+        self.gf_poly_combo.setAllowEmptyLayer(True)
+        self.gf_poly_combo.setShowCrs(True)
+        self.gf_line_combo = QgsMapLayerComboBox()
+        self.gf_line_combo.setFilters(_LF_LINE)
+        self.gf_line_combo.setAllowEmptyLayer(True)
+        self.gf_line_combo.setShowCrs(True)
+        gf.addRow("Areas, circles:", self.gf_poly_combo)
+        gf.addRow("Lines:", self.gf_line_combo)
+        gf.addRow(_hint("Save geofences writes Traccar's geofences here; saving again replaces each one "
+                        "(matched by geofence_id). Circles are saved as polygons."))
+        v.addWidget(g)
+
+        g = QGroupBox("Automatic saving")
+        gf = QVBoxLayout(g)
+        self.auto_save_chk = QCheckBox("Save automatically after every refresh and Live update")
+        gf.addWidget(self.auto_save_chk)
+        gf.addWidget(_hint("Only what's new is saved: each device's new fixes (latest fix, or every fix, as "
+                           "chosen above) and its track, kept to the most recent one; geofences that "
+                           "changed. Hidden devices are left out."))
+        v.addWidget(g)
+
+        gp = QPushButton("New GeoPackage…  (creates all four layers)")
         gp.clicked.connect(self._new_gpkg)
         v.addWidget(gp)
         hint = QLabel("The name always goes into a field called 'name' if the layer has one; "
@@ -2035,10 +2099,17 @@ class SettingsDialog(QDialog):
         hint.setStyleSheet("color:#666;")
         v.addWidget(hint)
         v.addStretch()
-        self.tabs.addTab(t, "Layers")
+        sc = QScrollArea()
+        sc.setWidgetResizable(True)
+        sc.setFrameShape(_NO_FRAME)
+        sc.setWidget(t)
+        self.tabs.addTab(sc, "Layers")
 
         self._set_layer(self.pt_combo, c["points_layer_id"])
         self._set_layer(self.ln_combo, c["tracks_layer_id"])
+        self._set_layer(self.gf_poly_combo, c["geofences_layer_id"])
+        self._set_layer(self.gf_line_combo, c["geofence_lines_layer_id"])
+        self.auto_save_chk.setChecked(bool(c["auto_save"]))
         self.pt_name.setLayer(self.pt_combo.currentLayer())
         self.ln_name.setLayer(self.ln_combo.currentLayer())
         self.pt_name.setField(c["points_name_field"])
@@ -2207,8 +2278,12 @@ class SettingsDialog(QDialog):
             path += ".gpkg"
         QSettings().setValue(SETTINGS_NS + "/last_gpkg_dir", os.path.dirname(path))
         pts, trk, errors = create_template_gpkg(path)
+        gfp, gfl, more = create_geofence_tables(path) if not errors else (None, None, [])
+        errors += more
         for lyr, name, combo in ((pts, "Traccar Positions", self.pt_combo),
-                                 (trk, "Traccar Tracks", self.ln_combo)):
+                                 (trk, "Traccar Tracks", self.ln_combo),
+                                 (gfp, "Traccar Geofences", self.gf_poly_combo),
+                                 (gfl, "Traccar Geofence Lines", self.gf_line_combo)):
             if lyr is not None:
                 lyr.setName(name)
                 QgsProject.instance().addMapLayer(lyr)
@@ -2232,6 +2307,9 @@ class SettingsDialog(QDialog):
             "tracks_layer_id":   ln.id() if ln else "",
             "tracks_name_field": self.ln_name.currentField() if ln else "",
             "tracks_mode":       1 if self.ln_keep.isChecked() else 0,
+            "geofences_layer_id":      self.gf_poly_combo.currentLayer().id() if self.gf_poly_combo.currentLayer() else "",
+            "geofence_lines_layer_id": self.gf_line_combo.currentLayer().id() if self.gf_line_combo.currentLayer() else "",
+            "auto_save":         self.auto_save_chk.isChecked(),
             "tag_enabled":       self.tag_chk.isChecked(),
             "tag_text":          self.tag_text.text().strip(),
             "tag_field":         self.tag_field.currentText().strip(),
@@ -2326,7 +2404,14 @@ opens where you left it. The <b>Traccar Live</b> toolbar button shows and hides 
 that device's earlier track if <i>Keep only the most recent</i> is chosen.<br>
 Fields are filled by name; fields your layer doesn't have are skipped. The device name can also
 go into any text field (e.g. <i>title</i>). If the layer is already being edited, the features are
-added to that edit session for you to save.</p>
+added to that edit session for you to save.<br>
+<b>⬡ Save geofences</b> writes Traccar's geofences to the layers in Settings → Layers → Geofences: areas
+and circles (as polygons) to a polygon layer, lines to a line layer, with geofence_id, name, description,
+type, radius_m, speed_kmh, color, calendar and made_in. Saving again replaces each one by its
+geofence_id.<br>
+<b>Save automatically</b> (Settings → Layers) saves after every refresh and Live update — only what's
+new: each device's new fixes, its track (kept to the most recent one) and geofences that changed.
+<i>New GeoPackage…</i> creates all four layers.</p>
 <h3>Times</h3>
 <p>Times here are local, including summer time. Date/time fields are stored in UTC (QGIS shows them
 as UTC); the optional text fields <i>fix_local</i>, <i>start_local</i> and <i>last_local</i> hold the
@@ -2888,6 +2973,7 @@ class TraccarLive:
                         self.last_error = ""
                     self._rebuild()
                     self._settle_pending(started)
+                    self._auto_save()
 
                 def one_done():
                     state["pending"] -= 1
@@ -2965,6 +3051,7 @@ class TraccarLive:
                 self.last_error = ""
                 self._rebuild()
                 self._settle_pending(started)
+                self._auto_save()
 
             self.api.get("/api/positions", got_latest, fail)
 
@@ -3930,6 +4017,8 @@ class TraccarLive:
                     "speed_kmh": round(float(attrs["speedLimit"]) * 1.852) if attrs.get("speedLimit") else 0})
             self.geofences.sort(key=lambda g: g["name"].lower())
             self._draw_geofences()
+            if self.cfg["auto_save"]:
+                self.save_geofences(auto=True)
 
         def keep(key):
             def done(items):
@@ -4474,7 +4563,9 @@ class TraccarLive:
         prj = QgsProject.instance()
         pt = prj.mapLayer(self.cfg["points_layer_id"]) if self.cfg["points_layer_id"] else None
         ln = prj.mapLayer(self.cfg["tracks_layer_id"]) if self.cfg["tracks_layer_id"] else None
-        if pt is None and ln is None:
+        gp = prj.mapLayer(self.cfg["geofences_layer_id"]) if self.cfg["geofences_layer_id"] else None
+        gl = prj.mapLayer(self.cfg["geofence_lines_layer_id"]) if self.cfg["geofence_lines_layer_id"] else None
+        if pt is None and ln is None and gp is None and gl is None:
             return "<a href='#'>⚠ No layers chosen to save to — set them up</a>"
         parts = []
         if pt is not None:
@@ -4483,7 +4574,13 @@ class TraccarLive:
         if ln is not None:
             parts.append("Tracks → <b>%s</b> (%s)" % (
                 ln.name(), "keep most recent" if self.cfg["tracks_mode"] == 1 else "add new"))
-        return " · ".join(parts) + "  <a href='#'>change…</a>"
+        if gp is not None or gl is not None:
+            parts.append("Geofences → <b>%s</b>" % " + ".join(x.name() for x in (gp, gl) if x is not None))
+        auto = ""
+        if self.cfg["auto_save"]:
+            auto = "<br>Saving automatically after every refresh" + (
+                " — last %s" % self.last_auto_save if getattr(self, "last_auto_save", "") else "")
+        return " · ".join(parts) + auto + "  <a href='#'>change…</a>"
 
     def _target(self, key, what):
         lid = self.cfg[key]
@@ -4525,6 +4622,122 @@ class TraccarLive:
         n, note = self._write_tracks(lyr, by_dev)
         if n >= 0:
             self._bar("Saved %d track(s) to %s%s" % (n, lyr.name(), note), _MSG_OK)
+
+    def save_geofences(self, auto=False):
+        """Traccar's geofences → the geofence layers: areas and circles (as polygons) to one, lines to
+        the other. Each is replaced by its geofence_id (name if the layer has no geofence_id).
+        auto: quietly, and only geofences that changed since the last save."""
+        prj = QgsProject.instance()
+        poly = prj.mapLayer(self.cfg["geofences_layer_id"]) if self.cfg["geofences_layer_id"] else None
+        line = prj.mapLayer(self.cfg["geofence_lines_layer_id"]) if self.cfg["geofence_lines_layer_id"] else None
+        if poly is None and line is None:
+            if not auto:
+                self._bar("Choose a layer for geofences first", _MSG_WARN)
+                self.open_settings(1)
+            return
+        gfs = [g for g in self.geofences if not g.get("pending") and g["kind"]]
+        if auto:
+            seen = getattr(self, "_gf_saved", {})
+            gfs = [g for g in gfs if seen.get(g["id"]) != json.dumps(g["raw"], sort_keys=True)]
+        if not gfs:
+            if not auto:
+                self._bar("No geofences to save — click ↻ Refresh to load them", _MSG_WARN)
+            return
+        cal = {c["id"]: c.get("name") or "" for c in self.calendars}
+        tag = self.win["tag"] if self.win else ""
+        saved, total, notes = datetime.now(timezone.utc), 0, []
+        for lyr, kinds in ((poly, ("polygon", "circle")), (line, ("line",))):
+            mine = [g for g in gfs if g["kind"] in kinds]
+            if lyr is None or not mine:
+                continue
+            fields = lyr.fields()
+            names = fields.names()
+            match = "geofence_id" if "geofence_id" in names else ("name" if "name" in names else "")
+            keys = {str(g["id"]) if match == "geofence_id" else g["name"] for g in mine}
+            delete_ids = []
+            if match:
+                for f in lyr.getFeatures(QgsFeatureRequest().setSubsetOfAttributes([match], fields)):
+                    if not _is_null(f[match]) and str(f[match]) in keys:
+                        delete_ids.append(f.id())
+            tr = QgsCoordinateTransform(WGS84, lyr.crs(), QgsProject.instance())
+            feats = []
+            for g in mine:
+                parsed = parse_geofence_area(g["area"])
+                try:
+                    pts = [tr.transform(QgsPointXY(lon, lat)) for lon, lat in parsed[1]]
+                except (QgsCsException, TypeError):
+                    continue
+                if g["kind"] == "line":
+                    geom = QgsGeometry.fromPolylineXY(pts)
+                else:
+                    geom = QgsGeometry.fromPolygonXY([pts if pts[0] == pts[-1] else pts + pts[:1]])
+                attrs = g["raw"].get("attributes") or {}
+                m = re.search(r",\s*%s\s*\)" % _NUM, g["area"]) if g["kind"] == "circle" else None
+                vals = {"geofence_id": g["id"], "name": g["name"], "description": g["description"],
+                        "type": {"polygon": "area"}.get(g["kind"], g["kind"]),
+                        "radius_m": float(m.group(1)) if m else None, "speed_kmh": g["speed_kmh"] or None,
+                        "color": g["color"], "calendar": cal.get(g["raw"].get("calendarId") or 0, ""),
+                        "made_in": "QGIS / QField" if g["mine"] else "Traccar", "saved_at": saved}
+                feats.append(QgsVectorLayerUtils.createFeature(lyr, geom, self._attrs(fields, vals, tag)))
+            n, note = self._commit(lyr, feats, delete_ids)
+            if n < 0:
+                self._bar("Could not save to %s — see the log" % lyr.name(), _MSG_WARN)
+                continue
+            total += n
+            notes.append(note)
+            for g in mine:
+                self._gf_saved = getattr(self, "_gf_saved", {})
+                self._gf_saved[g["id"]] = json.dumps(g["raw"], sort_keys=True)
+        if not auto and total:
+            self._bar("Saved %d geofence(s)%s" % (total, next((x for x in notes if x), "")), _MSG_OK)
+
+    def _auto_save(self):
+        """After a refresh / Live update (Settings → Layers → Save automatically): what's new only.
+        Positions: each shown device's fixes newer than the last saved one (latest fix, or every fix).
+        Tracks: each device with new fixes, its track replaced. Quiet unless something fails."""
+        if not self.cfg["auto_save"] or self.win is None or self.play_t is not None:
+            return
+        prj = QgsProject.instance()
+        upto = self.__dict__.setdefault("_auto_upto", {})          # dev_id → newest fix saved
+        pts_lyr = prj.mapLayer(self.cfg["points_layer_id"]) if self.cfg["points_layer_id"] else None
+        trk_lyr = prj.mapLayer(self.cfg["tracks_layer_id"]) if self.cfg["tracks_layer_id"] else None
+        shown = self._shown(self.tracks)
+        if pts_lyr is not None:
+            for dev_id in set(self._shown(self.marker_pos)) | set(shown):
+                if dev_id not in upto:
+                    upto[dev_id] = self._newest_saved(pts_lyr, dev_id)
+            if int(self.cfg["points_mode"]) == 1:
+                new = [p for d, v in shown.items() for p in v if upto.get(d) is None or p["_t"] > upto[d]]
+            else:
+                new = [p for d, p in self._shown(self.marker_pos).items()
+                       if upto.get(d) is None or p["_t"] > upto[d]]
+            if new and self._write_points(pts_lyr, new)[0] >= 0:
+                for p in new:
+                    d = p.get("deviceId")
+                    upto[d] = max(p["_t"], upto[d]) if upto.get(d) is not None else p["_t"]
+        if trk_lyr is not None:
+            done = self.__dict__.setdefault("_auto_track_upto", {})
+            changed = {d: v for d, v in shown.items() if v and done.get(d) != v[-1]["_t"]}
+            if changed and self._write_tracks(trk_lyr, changed, replace=True)[0] >= 0:
+                for d, v in changed.items():
+                    done[d] = v[-1]["_t"]
+        self.last_auto_save = datetime.now().strftime("%H:%M:%S")
+
+    def _newest_saved(self, lyr, dev_id):
+        """The newest fix_time of this device already in the layer (None if none / no such fields)."""
+        names = lyr.fields().names()
+        if "device_id" not in names or "fix_time" not in names:
+            return None
+        best = None
+        req = QgsFeatureRequest().setFilterExpression('"device_id" = %d' % int(dev_id))
+        req.setSubsetOfAttributes(["fix_time"], lyr.fields())
+        for f in lyr.getFeatures(req):
+            v = f["fix_time"]
+            t = _parse_utc(v.toString(_e(Qt, "DateFormat", "ISODate"))) if hasattr(v, "toString") \
+                else (_parse_utc(str(v)) if not _is_null(v) else None)
+            if t is not None and (best is None or t > best):
+                best = t
+        return best
 
     # ── Field helpers ─────────────────────────────────────────────────────
     @staticmethod
@@ -4622,7 +4835,7 @@ class TraccarLive:
             self._bar("Could not save to %s — see the log" % lyr.name(), _MSG_WARN)
         return n, note
 
-    def _write_tracks(self, lyr, by_dev):
+    def _write_tracks(self, lyr, by_dev, replace=None):
         fields = lyr.fields()
         names = fields.names()
         name_field = self._name_field(names, self.cfg["tracks_name_field"])
@@ -4630,7 +4843,7 @@ class TraccarLive:
 
         # "Keep most recent": earlier tracks of the same device, by device_id or name
         delete_ids = []
-        if int(self.cfg["tracks_mode"]) == 1:
+        if (int(self.cfg["tracks_mode"]) == 1) if replace is None else replace:
             match = "device_id" if "device_id" in names else name_field
             if not match:
                 self._bar("Tracks layer has no device_id or name field — adding instead of replacing",
