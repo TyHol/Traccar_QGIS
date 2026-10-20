@@ -50,9 +50,10 @@ PKG = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # ── Fake Traccar server ──────────────────────────────────────────────────────
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
 USER, PWD = "test@example.com", "secret"  # pragma: allowlist secret  (fake server)
-DEVICES = [{"id": 1, "name": "Phone A", "status": "online"},
-           {"id": 2, "name": "Van 3", "status": "offline"},
-           {"id": 3, "name": "Spare", "status": "unknown"}]
+DEVICES = [{"id": 1, "name": "Phone A", "uniqueId": "352000000000001", "status": "online"},
+           {"id": 2, "name": "Van 3", "uniqueId": "van3", "status": "offline"},
+           {"id": 3, "name": "Spare", "uniqueId": "spare", "status": "unknown"}]
+REQUESTS = []                              # GET paths the plugin asked for
 
 
 def _fix(dev, t, lon, lat, i):
@@ -139,8 +140,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         if not self._authed():
             return
-        gid = int(self.path.rsplit("/", 1)[-1]) if self.path.startswith("/api/geofences/") else None
-        GEOFENCES[:] = [g for g in GEOFENCES if g["id"] != gid]
+        num = int(self.path.rsplit("/", 1)[-1])
+        if self.path.startswith("/api/devices/"):
+            DEVICES[:] = [x for x in DEVICES if x["id"] != num]
+        else:
+            GEOFENCES[:] = [g for g in GEOFENCES if g["id"] != num]
         self.send_response(204)
         self.end_headers()
 
@@ -165,8 +169,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        REQUESTS.append(u.path)
         if u.path == "/api/geofences":
             body = GEOFENCES
+        elif u.path == "/api/reports/route":       # every requested device's fixes in one reply
+            frm, to = _p(q["from"][0]), _p(q["to"][0])
+            body = [pos for d in q.get("deviceId", []) for pos in POS.get(int(d), []) if frm <= _p(pos["fixTime"]) <= to]
         elif u.path == "/api/groups":
             body = [{"id": 4, "name": "Search teams"}]
         elif u.path == "/api/calendars":
@@ -235,6 +243,8 @@ def test(fn):
 mod = __import__(PKG + ".traccar_live", fromlist=["*"])
 plugin = __import__(PKG, fromlist=["classFactory"]).classFactory(IFACE)
 plugin.initGui()
+LIVE_DEFAULT = plugin.cfg["live_on"]
+plugin.cfg["live_on"] = False               # tests start Live themselves
 plugin.set_login(URL, USER, "wrong")
 
 
@@ -278,6 +288,37 @@ def t02_load_last_3h():
     check("device list: 3 rows, Spare says 'no fixes'",
           len(rows) == 3 and rows["Spare"]["span"] == "no fixes in window")
     check("Phone A fresh, Van 3 stale", rows["Phone A"]["fresh"] and not rows["Van 3"]["fresh"])
+
+
+@test
+def t02a_one_route_request_and_live_default():
+    REQUESTS.clear()
+    load(180)
+    route = [r for r in REQUESTS if r == "/api/reports/route"]
+    per_dev = [r for r in REQUESTS if r == "/api/positions"]
+    check("a window loads with one route report for all devices (not one request per device)",
+          len(route) == 1 and len(per_dev) == 1 and len(plugin.tracks.get(1, [])) == 240, REQUESTS)
+    check("Live is on by default (remembered)", LIVE_DEFAULT is True)
+    plugin.open_main()
+    d = plugin.dock
+    plugin.cfg["live_on"] = True
+    plugin._panel_opened(True)
+    check("…and starts when the panel opens (login saved)", plugin.live)
+    d.refresh()
+    check("Refresh hidden while Live runs; 'Clear map'",
+          not d.refresh_btn.isVisibleTo(d) and d.clear_btn.text() == "Clear map")
+    plugin.set_live(False)
+    wait(lambda: not plugin.loading)            # the load Live started finishes before the next tests
+    d.refresh()
+    check("Live off: remembered, Refresh shown again", plugin.cfg["live_on"] is False and d.refresh_btn.isVisibleTo(d))
+    sd = mod.SettingsDialog(plugin, IFACE.mainWindow(), 2)
+    check("Settings: Connection, Layers, Incident (From feature + Tag), Advanced",
+          [sd.tabs.tabText(i) for i in range(sd.tabs.count())] == ["Connection", "Layers", "Incident", "Advanced"]
+          and sd.tabs.widget(2).isAncestorOf(sd.ev_combo) and sd.tabs.widget(2).isAncestorOf(sd.tag_chk),
+          [sd.tabs.tabText(i) for i in range(sd.tabs.count())])
+    sd._closed = True
+    sd.deleteLater()
+    flush_deletes()
 
 
 @test
@@ -1176,10 +1217,33 @@ def t16j_send_form_and_tools():
         check("fixed past window: the stand-in goes once Traccar accepts the point",
               pend("Clue 12") and wait(lambda: not pend("Clue 12"), 6), plugin.pending_points)
         load(180)
+        from qgis.PyQt.QtWidgets import QMessageBox
+        asked, orig_q = [], QMessageBox.question
+        no = mod._e(QMessageBox, "StandardButton", "No")
+        yes = mod._e(QMessageBox, "StandardButton", "Yes")
+        try:
+            QMessageBox.question = staticmethod(lambda *a, **k: asked.append(a[2]) or no)
+            n_fix = len(OSMAND)
+            plugin.send_point_to({"name": "Phone A"}, 53.36, -6.31)
+            check("moving a device the plugin didn't add asks first; No sends nothing",
+                  wait(lambda: asked) and "Phone A" in asked[0] and "real tracker" in asked[0]
+                  and wait(lambda: not pend("Phone A"), 3) and len(OSMAND) == n_fix, asked)
+            QMessageBox.question = staticmethod(lambda *a, **k: yes)
+            plugin.send_point_to({"name": "Phone A"}, 53.36, -6.31)
+            check("…Yes moves it", wait(lambda: len(OSMAND) == n_fix + 1))
+            asked.clear()
+            QMessageBox.question = staticmethod(lambda *a, **k: asked.append(a[2]) or no)
+            plugin.send_point_to({"name": "Clue 10"}, 53.3621, -6.3051)
+            check("a point added from QGIS / QField moves without asking",
+                  wait(lambda: len(OSMAND) == n_fix + 2) and not asked)
+        finally:
+            QMessageBox.question = orig_q
         plugin.cfg["send_url"] = URL + "/nope/"         # not an OsmAnd port: the fix is refused
         plugin.send_point_to({"name": "Clue 11"}, 53.363, -6.306)
         check("a point Traccar refuses: its marker goes at once",
               pend("Clue 11") and wait(lambda: not pend("Clue 11")), plugin.pending_points)
+        check("…and the empty device just added for it is removed from Traccar",
+              wait(lambda: not any(x["name"] == "Clue 11" for x in DEVICES)), [x["name"] for x in DEVICES])
         DEVICES[:] = [x for x in DEVICES if x["name"] not in ("Clue 10", "Clue 11", "Clue 12")]
     finally:
         plugin._send_dialog = orig

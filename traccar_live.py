@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 """
-Traccar Live – QGIS Plugin  v0.4.2
+Traccar Live – QGIS Plugin
 
 Follows Traccar devices on the QGIS map within one chosen time window, and saves
 their positions and tracks to two project layers on demand. Mirrors the QField
-plugin Traccar_QField v0.7.2, and uses the same layer schema, so one GeoPackage
+plugin Traccar_QField, and uses the same layer schema, so one GeoPackage
 works in both.
 
   Time window  — Last 15 min … 3 months, custom dates, or a feature's start/end.
@@ -56,7 +56,7 @@ from qgis.PyQt.QtWidgets import (
     QRadioButton, QButtonGroup, QPushButton, QDialogButtonBox, QTabWidget,
     QWidget, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QFileDialog, QMessageBox, QTextBrowser, QToolButton, QToolTip,
-    QMenu, QScrollArea, QFrame, QSlider, QInputDialog, QColorDialog, QCompleter,
+    QMenu, QScrollArea, QFrame, QSlider, QColorDialog, QCompleter,
 )
 from qgis.core import (
     Qgis, QgsApplication, QgsAuthMethodConfig, QgsProject, QgsVectorLayer, QgsFeature,
@@ -212,6 +212,7 @@ TRACK_SCHEMA = [
     ("saved_at", "datetime"), ("tag", "string(80)"),
 ]
 
+ROUTE_BATCH = 50                # devices per route-report request when loading a window
 AUTO_TRACK_FACTOR = 20          # auto-save: wait 20x a track rewrite's time before the next one…
 AUTO_TRACK_MAX_WAIT = 600       # …but never more than 10 minutes
 
@@ -228,6 +229,7 @@ DEFAULTS = {
     "event_layer_id": "", "event_display_field": "", "event_start_field": "",
     "event_end_field": "", "event_feature_fid": -1, "feature_span": 0, "feature_duration": 120,
     "live_interval_s": 30, "stale_minutes": 10,
+    "live_on": True,                # Live starts when the panel opens (remembered; needs a login)
     "show_markers": True, "show_labels": True, "show_tracks": True, "show_accuracy": False,
     "points_layer_id": "", "points_name_field": "", "points_mode": 0,
     "tracks_layer_id": "", "tracks_name_field": "", "tracks_mode": 0,
@@ -957,7 +959,8 @@ def geofence_extra(v):
 #  LATITUDE FIRST ("POLYGON ((52.1 -9.5, …))", "CIRCLE (52.1 -9.5, 500)").
 # ════════════════════════════════════════════════════════════════════════════
 
-GEOFENCE_MARK = "createdByTraccarLiveQgis"   # attribute on geofences the plugin sent (the only ones re-sending replaces)
+# Attribute on geofences the plugin sent (the only ones re-sending replaces)
+GEOFENCE_MARK = "createdByTraccarLiveQgis"
 GEOFENCE_MAX_WKT = 4000                     # Traccar keeps the area in a 4096-character column
 GEOFENCE_COLOR = "#E65100"
 CIRCLE_RADII = (250, 500, 1000)
@@ -1337,8 +1340,8 @@ class MainDock(QgsDockWidget):
                                  "(also on the toolbar)")
         self.refresh_btn = QPushButton("↻  Refresh")
         self.refresh_btn.setToolTip("Load the window once")
-        self.clear_btn = QPushButton("Clear")
-        self.clear_btn.setToolTip("Stop Live and remove the overlay from the map")
+        self.clear_btn = QPushButton("Clear map")
+        self.clear_btn.setToolTip("Stop Live and remove the devices, tracks and geofences from the map")
         row.addWidget(self.live_btn, 2)
         row.addWidget(self.refresh_btn, 1)
         row.addWidget(self.clear_btn, 1)
@@ -1631,6 +1634,7 @@ class MainDock(QgsDockWidget):
         self.live_btn.setText("⏹  Stop live" if self.p.live else "▶  Live")
         self.live_btn.blockSignals(False)
         self.refresh_btn.setEnabled(not self.p.loading)
+        self.refresh_btn.setVisible(not self.p.live)          # Live refreshes by itself
         self.clear_btn.setEnabled(self.p.win is not None or self.p.live)
         self.status_lbl.setText(self.p.window_summary())
         self.updated_lbl.setText(("updated " + self.p.last_update) if self.p.last_update else "")
@@ -1725,7 +1729,7 @@ class MainDock(QgsDockWidget):
         self.feature_combo.clear()
         feats = self.p.event_features()
         if not feats:
-            self.feature_combo.addItem("— set up the layer in Settings → Advanced —", -1)
+            self.feature_combo.addItem("— set up the layer in Settings → Incident —", -1)
             return
         for f in feats:
             self.feature_combo.addItem(f["label"], f["fid"])
@@ -2122,9 +2126,26 @@ class SettingsDialog(QDialog):
         self.pt_combo.layerChanged.connect(self.pt_name.setLayer)
         self.ln_combo.layerChanged.connect(self.ln_name.setLayer)
 
-        # ── Tag ───────────────────────────────────────────────────────────
+        # ── Incident: the time window 'From feature' and the tag ──────────
         t = QWidget()
-        f = QFormLayout(t)
+        iv = QVBoxLayout(t)
+        g = QGroupBox("Incident layer — time window 'From feature'")
+        gf = QFormLayout(g)
+        self.ev_combo = QgsMapLayerComboBox()
+        self.ev_combo.setFilters(_LF_VECTOR)
+        self.ev_combo.setAllowEmptyLayer(True)
+        self.ev_disp = QgsFieldComboBox()
+        self.ev_start = QgsFieldComboBox()
+        self.ev_end = QgsFieldComboBox()
+        for fc in (self.ev_disp, self.ev_start, self.ev_end):
+            fc.setAllowEmptyFieldName(True)
+        gf.addRow("Layer (e.g. incidents):", self.ev_combo)
+        gf.addRow("Name shown in the list:", self.ev_disp)
+        gf.addRow("Start time field:", self.ev_start)
+        gf.addRow("End time field (optional):", self.ev_end)
+        iv.addWidget(g)
+        g = QGroupBox("Tag — stamp saved points and tracks")
+        f = QFormLayout(g)
         self.tag_chk = QCheckBox("Tag saved points and tracks")
         self.tag_chk.setChecked(bool(c["tag_enabled"]))
         self.tag_text = QLineEdit(c["tag_text"])
@@ -2137,10 +2158,12 @@ class SettingsDialog(QDialog):
         f.addRow("Tag text:", self.tag_text)
         f.addRow("Write into field:", self.tag_field)
         f.addRow(self.tag_feat)
+        iv.addWidget(g)
+        iv.addStretch()
         self._fill_tag_fields()
         self.pt_combo.layerChanged.connect(lambda _l: self._fill_tag_fields())
         self.ln_combo.layerChanged.connect(lambda _l: self._fill_tag_fields())
-        self.tabs.addTab(t, "Tag")
+        self.tabs.addTab(t, "Incident")
 
         # ── Advanced ──────────────────────────────────────────────────────
         t = QWidget()
@@ -2203,21 +2226,6 @@ class SettingsDialog(QDialog):
         gf.addRow(hint)
         v.addWidget(g)
 
-        g = QGroupBox("Time window 'From feature'")
-        gf = QFormLayout(g)
-        self.ev_combo = QgsMapLayerComboBox()
-        self.ev_combo.setFilters(_LF_VECTOR)
-        self.ev_combo.setAllowEmptyLayer(True)
-        self.ev_disp = QgsFieldComboBox()
-        self.ev_start = QgsFieldComboBox()
-        self.ev_end = QgsFieldComboBox()
-        for fc in (self.ev_disp, self.ev_start, self.ev_end):
-            fc.setAllowEmptyFieldName(True)
-        gf.addRow("Layer (e.g. incidents):", self.ev_combo)
-        gf.addRow("Name shown in the list:", self.ev_disp)
-        gf.addRow("Start time field:", self.ev_start)
-        gf.addRow("End time field (optional):", self.ev_end)
-        v.addWidget(g)
         v.addStretch()
         self.tabs.addTab(t, "Advanced")
 
@@ -2298,6 +2306,7 @@ class SettingsDialog(QDialog):
         pt = self.pt_combo.currentLayer()
         ln = self.ln_combo.currentLayer()
         ev = self.ev_combo.currentLayer()
+        gfp, gfl = self.gf_poly_combo.currentLayer(), self.gf_line_combo.currentLayer()
         return {
             "server_url":  self.url_edit.text().strip().rstrip("/") or DEFAULT_URL,
             "username":    self.user_edit.text().strip(),
@@ -2310,8 +2319,8 @@ class SettingsDialog(QDialog):
             "tracks_layer_id":   ln.id() if ln else "",
             "tracks_name_field": self.ln_name.currentField() if ln else "",
             "tracks_mode":       1 if self.ln_keep.isChecked() else 0,
-            "geofences_layer_id":      self.gf_poly_combo.currentLayer().id() if self.gf_poly_combo.currentLayer() else "",
-            "geofence_lines_layer_id": self.gf_line_combo.currentLayer().id() if self.gf_line_combo.currentLayer() else "",
+            "geofences_layer_id":      gfp.id() if gfp else "",
+            "geofence_lines_layer_id": gfl.id() if gfl else "",
             "auto_save":         self.auto_save_chk.isChecked(),
             "tag_enabled":       self.tag_chk.isChecked(),
             "tag_text":          self.tag_text.text().strip(),
@@ -2347,7 +2356,7 @@ buttons save exactly that.</p>
 <li><b>Last 15 minutes … Last 3 months</b> — follows the current time.</li>
 <li><b>Custom dates</b> — From / To in local time, then <i>Show this window</i>.</li>
 <li><b>From feature</b> — the start/end of a feature such as an incident (set the layer up once in
-Settings → Advanced).</li>
+Settings → Incident).</li>
 </ul>
 <p>Each device row shows how many fixes it has in the window and their time span.</p>
 <h3>Devices</h3>
@@ -2374,9 +2383,11 @@ needs a plan that includes <i>convert-to-3wa</i>, and is only asked when you cop
 move through time, or type / pick a time in <b>At:</b> to go straight to it; <b>⏮</b> goes back to the
 first fix, and <b>Speed</b> runs from 1× (real time) to 1 hour per second. <b>⌖</b> pans to the selected
 device where it is at that moment (or to all devices shown when none is selected); double-click and
-<i>Pan to device</i> do the same, and <i>Copy location</i> in the ⋯ menu copies that position. The Location, Speed and Battery
+<i>Pan to device</i> do the same, and <i>Copy location</i> in the ⋯ menu copies that position. The Location,
+Speed and Battery
 columns show each device as it was at the playback time. Between fixes the accuracy circle uses the
-larger of the two fixes' accuracy: the device was somewhere inside it. Each device's marker moves smoothly between its fixes and its track is drawn up to that
+larger of the two fixes' accuracy: the device was somewhere inside it. Each device's marker moves smoothly
+between its fixes and its track is drawn up to that
 moment, with the rest of the track faint underneath (drawn-on-map view). Only the devices ticked in the
 list are played. <b>■</b> leaves playback and shows the latest positions again; changing the time window
 or <i>Clear</i> does too. Live updates keep coming in during playback.</p>
@@ -2456,12 +2467,13 @@ Traccar, else orange) — they never go grey like old fixes. Tick <i>Geofences</
 refreshed with Live. The <b>Geofences</b> tab lists them: tick one to show or hide it, double-click to zoom
 to it, and ⋯ or right-click to <b>edit</b> it (name, description, speed limit, corridor width, calendar,
 radius of a circle — the same form as for adding), <b>change its colour</b> (saved in Traccar, so its map
-shows it too), copy it as WKT, or <b>delete it from Traccar</b> — you are always asked first, and deleting one made in Traccar gets
+shows it too), copy it as WKT, or <b>delete it from Traccar</b> — you are always asked first, and deleting one
+made in Traccar gets
 an extra warning, as Traccar alerts may use it. Right-click the column titles of either tab to hide columns
 you don't need (remembered). Other Traccar users see a geofence when it is shared with them in Traccar
 (admins see all).</p>
 <h3>Tag</h3>
-<p>Settings → Tag stamps a text such as FIRE-2026-001 onto everything you save. With
+<p>Settings → Incident stamps a text such as FIRE-2026-001 onto everything you save. With
 <i>From feature</i>, the feature's display value can be used instead.</p>
 <p>Same layers and fields as the QField plugin <i>Traccar_QField</i>, so one GeoPackage works in both.</p>
 <h3>About</h3>
@@ -2733,6 +2745,8 @@ class TraccarLive:
         self.act_open.blockSignals(True)
         self.act_open.setChecked(bool(opened))
         self.act_open.blockSignals(False)
+        if opened and not self.live and self.cfg["live_on"] and self.cfg["username"] and self.cfg["authcfg"]:
+            self.set_live(True)                       # as it was left (on for a new setup)
 
     def open_settings(self, tab=0):
         dlg = SettingsDialog(self, self.iface.mainWindow(), tab)
@@ -2812,6 +2826,7 @@ class TraccarLive:
             on = False
             self.open_settings(0)
         self.live = on
+        self.set_cfg("live_on", on)                   # remembered: Live starts with the panel next time
         self.act_live.blockSignals(True)
         self.act_live.setChecked(on)
         self.act_live.setText("⏹ Live" if on else "▶ Live")
@@ -2864,7 +2879,7 @@ class TraccarLive:
         else:
             f = self._selected_event_feature()
             if f is None:
-                return {"error": "Choose a feature (set the layer up in Settings → Advanced)."}
+                return {"error": "Choose a feature (set the layer up in Settings → Incident)."}
             dur = timedelta(minutes=int(self.cfg["feature_duration"]))
             span = int(self.cfg["feature_span"])
             if span == 2:
@@ -2987,19 +3002,38 @@ class TraccarLive:
                     finish()
                     return
                 q_from, q_to = _quote(_iso(w["frm"])), _quote(_iso(w["to"]))
-                for dev_id in ids:
-                    def ok(hist, dev_id=dev_id):
-                        valid = [p for p in hist if self._prep(p)]
-                        valid.sort(key=lambda p: p["_t"])
-                        if valid:
-                            by_dev[dev_id] = valid
-                        one_done()
 
-                    def bad(_msg):
-                        state["failed"] += 1
-                        one_done()
-                    self.api.get("/api/positions?deviceId=%s&from=%s&to=%s" % (dev_id, q_from, q_to),
-                                 ok, bad)
+                def per_device(dev_ids):
+                    """Fallback: one request per device (servers that refuse the route report)."""
+                    for dev_id in dev_ids:
+                        def ok(hist, dev_id=dev_id):
+                            valid = [p for p in hist if self._prep(p)]
+                            valid.sort(key=lambda p: p["_t"])
+                            if valid:
+                                by_dev[dev_id] = valid
+                            one_done()
+
+                        def bad(_msg):
+                            state["failed"] += 1
+                            one_done()
+                        self.api.get("/api/positions?deviceId=%s&from=%s&to=%s" % (dev_id, q_from, q_to), ok, bad)
+
+                # One route report per batch of devices instead of one request per device
+                batches = [ids[i:i + ROUTE_BATCH] for i in range(0, len(ids), ROUTE_BATCH)]
+                for batch in batches:
+                    def ok_batch(rows, batch=batch):
+                        for p in rows or []:
+                            if self._prep(p) and p.get("deviceId") in self.devices:
+                                by_dev.setdefault(p["deviceId"], []).append(p)
+                        for dev_id in batch:
+                            if dev_id in by_dev:
+                                by_dev[dev_id].sort(key=lambda p: p["_t"])
+                            one_done()
+
+                    def bad_batch(_msg, batch=batch):
+                        per_device(batch)
+                    self.api.get("/api/reports/route?%s&from=%s&to=%s" % (
+                        "&".join("deviceId=%s" % d for d in batch), q_from, q_to), ok_batch, bad_batch)
 
             self.api.get("/api/positions", got_latest, fail)
 
@@ -3909,6 +3943,9 @@ class TraccarLive:
                 uid = next((d.get("uniqueId") for d in devs
                             if (d.get("name") or "").strip().lower() == name.lower()), None)
             if uid is not None:
+                if not uid.startswith(SENT_POINT_PREFIX) and not self._confirm_move(name, uid):
+                    self._drop_pending(key)               # not moved
+                    return
                 self._send_fix(base, uid, name, lat, lon, t, where, key)
                 return
             new_uid = v.get("unique_id") or SENT_POINT_PREFIX + "%s-%d" % (
@@ -3920,12 +3957,23 @@ class TraccarLive:
                 if v.get(field):
                     body[field] = v[field]
             self.api.post("/api/devices", body,
-                          lambda d: self._send_fix(base, d.get("uniqueId") or new_uid, name, lat, lon, t, where, key),
+                          lambda d: self._send_fix(base, d.get("uniqueId") or new_uid, name, lat, lon, t, where, key,
+                                                   created=d.get("id")),
                           lambda m: failed("Couldn't add '%s' to Traccar (%s) — your account may not be "
                                            "allowed to add devices." % (name, m)))
 
         self.api.get("/api/devices", got_devices,
                      lambda m: failed("Send point needs your Traccar login to find or add '%s': %s" % (name, m)))
+
+    def _confirm_move(self, name, uid):
+        """Before moving a device the plugin didn't add (a real tracker, say): ask, default No."""
+        yes = _e(QMessageBox, "StandardButton", "Yes")
+        no = _e(QMessageBox, "StandardButton", "No")
+        return QMessageBox.question(
+            self.iface.mainWindow(), "Traccar Live – Move a device?",
+            "This moves '%s' (identifier %s) to the spot you clicked.\n\nIt isn't a point added from QGIS or "
+            "QField — it may be a real tracker, and its track will jump there.\n\nMove it?" % (name, uid),
+            yes | no, no) == yes
 
     # ── Points being sent: shown at once, until a refresh after Traccar accepted them ──
     def _add_pending(self, name, lat, lon):
@@ -4420,9 +4468,10 @@ class TraccarLive:
         self.api.delete("/api/devices/%d" % dev_id, done,
                         lambda m: self._bar("Couldn't delete '%s' from Traccar: %s" % (name, m), _MSG_WARN, 10))
 
-    def _send_fix(self, base, dev, name, lat, lon, t, where, key=None):
+    def _send_fix(self, base, dev, name, lat, lon, t, where, key=None, created=None):
         """OsmAnd fix for the device with identifier dev (shown to the user as name); key: its
-        stand-in marker (kept until a refresh after this fix, dropped if it fails)."""
+        stand-in marker (kept until a refresh after this fix, dropped if it fails); created: the id of a
+        device just added for it — removed again if Traccar refuses this first fix (no empty devices)."""
         url = "%s%sid=%s&lat=%.7f&lon=%.7f&timestamp=%d&valid=true" % (
             base, "&" if "?" in base else "?", _quote(dev, safe=""), lat, lon, t)
         req = QNetworkRequest(QUrl(url))
@@ -4443,6 +4492,8 @@ class TraccarLive:
                 self._confirm_pending(key)               # refreshes until it shows, Live on or off
                 return
             self._drop_pending(key)
+            if created is not None:
+                self.api.delete("/api/devices/%d" % int(created), lambda _r: None, lambda _m: None)
             if status and int(status) == 400:
                 self._bar("Traccar refused the point for '%s' (HTTP 400, identifier '%s') — check the "
                           "device isn't disabled, and that 'Send to' is the same Traccar server as the "
@@ -4674,7 +4725,6 @@ class TraccarLive:
                     geom = QgsGeometry.fromPolylineXY(pts)
                 else:
                     geom = QgsGeometry.fromPolygonXY([pts if pts[0] == pts[-1] else pts + pts[:1]])
-                attrs = g["raw"].get("attributes") or {}
                 m = re.search(r",\s*%s\s*\)" % _NUM, g["area"]) if g["kind"] == "circle" else None
                 vals = {"geofence_id": g["id"], "name": g["name"], "description": g["description"],
                         "type": {"polygon": "area"}.get(g["kind"], g["kind"]),

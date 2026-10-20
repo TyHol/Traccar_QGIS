@@ -28,7 +28,7 @@ You need a Traccar account — your own server or e.g. `https://server.traccar.o
 
 ## Getting started
 1. Click **Traccar Live** on the toolbar, then **Settings… → Connection**: enter the server address (the one you open in a browser), your Traccar email / username and password, and click *Test connection*. The login is saved in QGIS's password manager; the first time, QGIS asks you to create (or enter) its **master password**.
-2. Choose a **Time window** and click **▶ Live** to follow devices, or **↻ Refresh** to load the window once.
+2. Choose a **Time window**. **Live** is on by default and follows devices; turn it off (**⏹ Live**) and use **↻ Refresh** to load the window once.
 3. To keep what you see: **Settings… → Layers** → pick a positions layer and a tracks layer — or click **New GeoPackage…** to create both (`traccar.gpkg` in your project folder) — then use **📍 Save positions** / **〰 Save tracks**.
 
 ## Using it
@@ -53,7 +53,7 @@ The panel docks on the right of the map by default; drag its title bar to dock i
 |---|---|
 | Last 15 min … Last 3 months | Follows the current time. With Live on, new fixes are added and old ones drop off. |
 | Custom dates… | From / To pickers in local time, then *Show this window*. |
-| From feature… | The start/end of a feature, e.g. an incident: start → end, start + duration, or end − duration. Set the layer up once in Settings → Advanced. |
+| From feature… | The start/end of a feature, e.g. an incident: start → end, start + duration, or end − duration. Set the layer up once in Settings → Incident. |
 
 The device table shows each device's fixes in the window, their time span, speed and battery. **Double-click** a device to centre the map on it; **Zoom to all** fits every device and track shown. A window that ends in the past cannot change, so Live pauses for it and the markers show each device's last fix in that window.
 
@@ -154,8 +154,8 @@ Everything in the plugin is shown in local time, with the right summer/winter of
 |---|---|
 | **Connection** | Server URL, email / username, password (leave blank to keep the saved one), *Test connection*; *Send point*: name offered first, *Send to* (Traccar's OsmAnd address if not port 5055) |
 | **Layers** | Positions layer, device-name field, latest / every fix · Tracks layer, device-name field, add / keep most recent · Geofences: polygon and line layers · *Save automatically after every refresh* · *New GeoPackage…* (all four layers) |
-| **Tag** | On/off, tag text, field, use the feature's display value |
-| **Advanced** | Refresh interval (30 s by default), grey-marker limit, live view (on the map / temporary layers), **Location**: lat / long as decimal degrees, degrees + minutes or degrees + minutes + seconds, with N/S/E/W or +/−; custom CRS (EPSG:2157 by default); what3words API key, the layer and fields used by *From feature* |
+| **Incident** | The layer and fields used by *From feature* · Tag: on/off, tag text, field, use the feature's display value |
+| **Advanced** | Refresh interval (30 s by default), grey-marker limit, live view (on the map / temporary layers), **Location**: lat / long as decimal degrees, degrees + minutes or degrees + minutes + seconds, with N/S/E/W or +/−; custom CRS (EPSG:2157 by default); what3words API key |
 
 Your Traccar login is kept in **QGIS's password manager** (Settings → Options → Authentication, entry *Traccar Live*), encrypted behind QGIS's master password — never in the plugin's settings; so is the what3words API key. The other settings are stored in your QGIS user profile, so a new computer or QGIS profile needs them entering once. Settings from earlier versions are carried over automatically, and a password saved by an earlier version is moved into the password manager and removed from the settings.
 

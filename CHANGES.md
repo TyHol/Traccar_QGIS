@@ -2,6 +2,20 @@
 
 ## v0.4.2 (in development)
 
+- **Moving a device you didn't add asks first.** Send point / Add → Point with the name of a device that
+  wasn't added from QGIS or QField (a real tracker, say) now asks "This moves '…' — move it?" before
+  sending; points added from QGIS / QField (identifier `qgis-…`) still move without asking.
+- **No empty devices left behind**: if Traccar refuses the first position of a point the plugin has just
+  added, that new device is removed again.
+- **Live is on by default** and remembered; **Refresh** shows only while Live is off; **Clear** is now
+  **Clear map**.
+- **Settings: Connection, Layers, Incident, Advanced.** *Incident* holds the time window 'From feature'
+  layer and the Tag together (both are about the incident you're working on).
+- **Faster loading**: a time window's fixes come in one route report for all devices (in batches of 50)
+  instead of one request per device; servers that refuse it get one request per device as before.
+- The version number lives only in `metadata.txt` and here (not in code comments).
+- Lint clean (an unused import and variable, long lines).
+
 - **⬡ Save geofences** (next to Save positions / tracks): Traccar's geofences to layers chosen in
   Settings → Layers → Geofences — areas and circles (as polygons) to a polygon layer, lines to a line
   layer, with `geofence_id`, name, description, type, radius_m, speed_kmh, color, calendar, made_in,
