@@ -212,6 +212,9 @@ TRACK_SCHEMA = [
     ("saved_at", "datetime"), ("tag", "string(80)"),
 ]
 
+AUTO_TRACK_FACTOR = 20          # auto-save: wait 20x a track rewrite's time before the next one…
+AUTO_TRACK_MAX_WAIT = 600       # …but never more than 10 minutes
+
 GEOFENCE_SCHEMA = [
     ("geofence_id", "integer"), ("name", "string(80)"), ("description", "string(255)"),
     ("type", "string(20)"), ("radius_m", "double"), ("speed_kmh", "double"), ("color", "string(9)"),
@@ -4694,7 +4697,9 @@ class TraccarLive:
     def _auto_save(self):
         """After a refresh / Live update (Settings → Layers → Save automatically): what's new only.
         Positions: each shown device's fixes newer than the last saved one (latest fix, or every fix).
-        Tracks: each device with new fixes, its track replaced. Quiet unless something fails."""
+        Tracks: each device with new fixes, its track replaced — backing off for long tracks: after a
+        rewrite, the next waits at least 20× as long as it took (at most 10 min), so writing never takes
+        more than about 5% of the time. Quiet unless something fails."""
         if not self.cfg["auto_save"] or self.win is None or self.play_t is not None:
             return
         prj = QgsProject.instance()
@@ -4715,12 +4720,17 @@ class TraccarLive:
                 for p in new:
                     d = p.get("deviceId")
                     upto[d] = max(p["_t"], upto[d]) if upto.get(d) is not None else p["_t"]
-        if trk_lyr is not None:
+        if trk_lyr is not None and time.monotonic() >= getattr(self, "_auto_track_next", 0):
             done = self.__dict__.setdefault("_auto_track_upto", {})
             changed = {d: v for d, v in shown.items() if v and done.get(d) != v[-1]["_t"]}
-            if changed and self._write_tracks(trk_lyr, changed, replace=True)[0] >= 0:
-                for d, v in changed.items():
-                    done[d] = v[-1]["_t"]
+            if changed:
+                began = time.monotonic()
+                ok = self._write_tracks(trk_lyr, changed, replace=True)[0] >= 0
+                took = time.monotonic() - began
+                self._auto_track_next = time.monotonic() + min(AUTO_TRACK_MAX_WAIT, AUTO_TRACK_FACTOR * took)
+                if ok:
+                    for d, v in changed.items():
+                        done[d] = v[-1]["_t"]
         self.last_auto_save = datetime.now().strftime("%H:%M:%S")
 
     def _newest_saved(self, lyr, dev_id):

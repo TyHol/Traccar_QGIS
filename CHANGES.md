@@ -11,6 +11,9 @@
   each shown device's new fixes (latest or every fix), its track kept to the most recent one, and
   geofences that changed. On the first refresh it reads the newest fix already in the layer, so nothing
   is saved twice.
+  Long tracks back off by themselves: after a track rewrite, the next waits at least 20x as long as it
+  took (at most 10 minutes), so writing never takes more than about 5% of the time; new positions are
+  still saved on every refresh.
 
 - **Areas and lines are drawn while you add them**: the shape (filled for an area), a dot on each corner
   and a dashed line to the mouse. Before, nothing showed until the geofence came back from Traccar

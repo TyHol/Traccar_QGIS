@@ -1301,6 +1301,24 @@ def t16k_save_geofences_and_auto_save():
         check("a new fix: one more point, and that device's track replaced (still one per device)",
               wait(lambda: pts.featureCount() == n_markers + 1) and trk.featureCount() == len(
                   [v for v in plugin.tracks.values() if v]), (pts.featureCount(), trk.featureCount()))
+        import time as _time
+        now = _time.monotonic()
+        check("after a track rewrite the next waits 20x its time (here: short, at most 10 min)",
+              now - 1 <= plugin._auto_track_next <= now + mod.AUTO_TRACK_MAX_WAIT, plugin._auto_track_next - now)
+        last_upd = lambda: max(f["last_update"].toMSecsSinceEpoch() for f in trk.getFeatures()  # noqa: E731
+                               if f["device_id"] == 1)
+        before_upd, n_pts = last_upd(), pts.featureCount()
+        plugin._auto_track_next = _time.monotonic() + 60       # as after a slow rewrite of a long track
+        POS[1].append(_fix(1, t_new + timedelta(seconds=10), last["longitude"] + 0.002, last["latitude"], 9998))
+        plugin.poll_live()
+        check("backing off: the new fix is saved as a point, the track waits",
+              wait(lambda: pts.featureCount() == n_pts + 1) and last_upd() == before_upd)
+        plugin._auto_track_next = 0
+        plugin.poll_live()
+        check("…and the next refresh after the wait rewrites the track with everything since",
+              wait(lambda: last_upd() > before_upd) and trk.featureCount() == len(
+                  [v for v in plugin.tracks.values() if v]))
+        POS[1].pop()
         g_before = gfp.featureCount()
         plugin.load_geofences()
         wait(lambda: False, 1)
