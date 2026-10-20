@@ -14,6 +14,9 @@
 - **A sent point shows at once too**: a dashed ring in the device's colour and "*name* (sending…)",
   until the first refresh or Live update after Traccar accepted it — then the real marker is there
   (in a past time window it simply goes). If Traccar refuses the point, it goes at once.
+- Once Traccar accepts a sent point, the plugin **refreshes by itself every 2 s (up to 5 times), Live on
+  or off,** until the real device shows. In a time window that ends in the past (custom dates, from
+  feature) the point can't appear, so its stand-in goes at once with a note.
 - Fixed: the point's details loop reused a variable name, which would have lost track of the marker.
 - Tests: the drawing, the dashed line, getting the previous map tool back after sending, Esc and
   Cancel, a sent geofence and a sent point shown at once; 193 checks.

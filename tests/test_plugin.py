@@ -1156,23 +1156,26 @@ def t16j_send_form_and_tools():
         DEVICES[:] = [x for x in DEVICES if x["name"] != "Clue 9"]
         # ── a sent point stays on the map until a refresh shows the real device ──
         pend = lambda n: [m for m in plugin.pending_points if m["name"] == n]     # noqa: E731
+        plugin.set_live(False)
+        load(180)                                       # a 'Last 3 hours' window, Live off
         plugin.send_point_to({"name": "Clue 10"}, 53.362, -6.305)
         item = plugin._pending_item
         check("sent point shown at once, 'Clue 10 (sending…)'",
               pend("Clue 10") and item is not None and "Clue 10 (sending…)" in [m["label"] for m in item.points],
               [m["label"] for m in item.points] if item else None)
-        check("…still shown once Traccar accepts it",
-              wait(lambda: pend("Clue 10") and pend("Clue 10")[0]["confirmed"] is not None), plugin.pending_points)
-        plugin.load_window()
-        check("…gone after the next refresh (the real device is there)",
-              wait(lambda: not plugin.loading and not plugin.pending_points) and plugin._pending_item is None
-              and any(dv["name"] == "Clue 10" for dv in plugin.devices.values()),
-              (plugin.loading, plugin.pending_points))
+        check("Live off: re-checked by itself until the real device shows, then the stand-in goes",
+              wait(lambda: not pend("Clue 10"), 12) and any(dv["name"] == "Clue 10" for dv in plugin.devices.values()),
+              plugin.pending_points)
+        plugin.win = dict(plugin.win, moving=False)     # as a custom-dates window that ends in the past
+        plugin.send_point_to({"name": "Clue 12"}, 53.364, -6.304)
+        check("fixed past window: the stand-in goes once Traccar accepts the point",
+              pend("Clue 12") and wait(lambda: not pend("Clue 12"), 6), plugin.pending_points)
+        load(180)
         plugin.cfg["send_url"] = URL + "/nope/"         # not an OsmAnd port: the fix is refused
         plugin.send_point_to({"name": "Clue 11"}, 53.363, -6.306)
         check("a point Traccar refuses: its marker goes at once",
               pend("Clue 11") and wait(lambda: not pend("Clue 11")), plugin.pending_points)
-        DEVICES[:] = [x for x in DEVICES if x["name"] not in ("Clue 10", "Clue 11")]
+        DEVICES[:] = [x for x in DEVICES if x["name"] not in ("Clue 10", "Clue 11", "Clue 12")]
     finally:
         plugin._send_dialog = orig
         plugin.cfg["send_url"] = ""

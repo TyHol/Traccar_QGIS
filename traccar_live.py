@@ -2400,6 +2400,9 @@ class TraccarLive:
         self.api = _Api(self.cfg, self._credentials)
         self.timer = QTimer()
         self.timer.timeout.connect(self.poll_live)
+        self.pending_timer = QTimer()     # re-checks after Traccar accepted a sent point
+        self.pending_timer.setInterval(2000)
+        self.pending_timer.timeout.connect(self._pending_tick)
         self.play_timer = QTimer()
         self.play_timer.timeout.connect(self._play_tick)
         self._actions = []
@@ -2506,6 +2509,7 @@ class TraccarLive:
                 tool.remove_bands()
         self._tools = {}
         self._remove_geofence_item()
+        self.pending_timer.stop()
         self.pending_points = []
         self._draw_pending()
         for r in list(self._send_replies):
@@ -3849,6 +3853,31 @@ class TraccarLive:
         for m in self.pending_points:
             if m["key"] == key:
                 m["confirmed"] = time.time()
+                m["tries"] = 0
+        if not self.pending_timer.isActive():
+            self.pending_timer.start()
+
+    def _pending_tick(self):
+        """Every 2 s after Traccar accepted a point: refresh until the real device is shown (the
+        refresh drops the stand-in). In a fixed past window, or with nothing loaded, it can't be
+        shown: drop it now. Gives up after 5 tries."""
+        done = [m for m in self.pending_points if m["confirmed"] is not None]
+        if not done:
+            self.pending_timer.stop()
+            return
+        if self.win is None or not self.win["moving"]:
+            for m in done:
+                self._drop_pending(m["key"])
+            self._bar("Sent to Traccar — not shown here: the time window ends in the past (or nothing is "
+                      "loaded). Choose a 'Last …' window to see it.", _MSG_INFO, 6)
+            self.pending_timer.stop()
+            return
+        for m in done:
+            m["tries"] += 1
+            if m["tries"] > 5:
+                self._drop_pending(m["key"])
+        if not self.loading:
+            self.poll_live()
 
     def _settle_pending(self, fetch_started):
         """A refresh that started after Traccar accepted a point shows the real device: drop the stand-in."""
@@ -4318,10 +4347,8 @@ class TraccarLive:
             err, errstr = reply.error(), reply.errorString()
             reply.deleteLater()
             if err == _NET_OK and (status is None or int(status) == 200):
-                self._confirm_pending(key)
                 self._bar("Sent to Traccar as '%s':  %s" % (name, where), _MSG_OK, 4)
-                if self.win is not None and self.win["moving"]:
-                    QTimer.singleShot(2000, self.poll_live)      # show it without waiting for Live
+                self._confirm_pending(key)               # refreshes until it shows, Live on or off
                 return
             self._drop_pending(key)
             if status and int(status) == 400:
