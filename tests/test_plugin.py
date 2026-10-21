@@ -1424,11 +1424,31 @@ def t16k_save_geofences_and_auto_save():
               and trk.featureCount() == len([v for v in plugin.tracks.values() if v]), (n_pts1, len(plugin.tracks[1])))
         plugin._auto_track_next = 0
         load(60)
+        n_pts1 = [f["n_points"] for f in trk.getFeatures() if f["device_id"] == 1]
         check("a narrower window again: nothing saved twice", pts.featureCount() == n180, pts.featureCount())
+        check("…and the tracks are rewritten at once to the shorter window (no new fix needed)",
+              n_pts1 == [len(plugin.tracks[1])] and trk_start() > start60 - 1000, (n_pts1, len(plugin.tracks[1])))
         plugin._auto_saved = None
         load(180)
         check("…not even after a restart (what's in the layer is read first)", pts.featureCount() == n180,
               pts.featureCount())
+        # ── only the saved fixes that could come up again are read, not the layer's whole history ──
+        from qgis.core import QgsFeature, QgsGeometry, QgsPointXY
+        old_t = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(days=30)
+        old = QgsFeature(pts.fields())
+        old.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-6.3, 53.3)))
+        old["device_id"], old["fix_time"] = 1, mod._qdt(old_t)
+        pts.dataProvider().addFeatures([old])
+        plugin._auto_saved = None
+        load(60)
+        memo = plugin._auto_saved
+        check("only saved fixes from the window's start on are read (a month-old one isn't)",
+              int(old_t.timestamp()) not in memo["devs"].get(1, set()) and len(memo["devs"].get(1, ())) > 0
+              and memo["since"] > old_t + timedelta(days=29), memo["since"])
+        since60 = memo["since"]
+        load(180)
+        check("…a wider window reads the earlier part too, nothing saved twice",
+              plugin._auto_saved["since"] < since60 and pts.featureCount() == n180 + 1, pts.featureCount())
         POS[1].pop()
         g_before = gfp.featureCount()
         plugin.load_geofences()

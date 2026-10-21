@@ -6,13 +6,17 @@
   saved (matched by device and fix time), so widening e.g. 1 h → 3 h saves the earlier fixes too, and
   nothing is ever saved twice — also after a restart, as the layer is read first. Before, only fixes
   newer than the newest saved one went in.
-- **Tracks are rewritten straight away when they start earlier** (a wider window), not only when a new
-  fix comes in. A narrower window gives a shorter track at the next new fix, as before.
+- **A new time window or Refresh rewrites the saved tracks straight away**, longer or shorter, so they
+  always match the window; Live updates rewrite only the tracks that got a newer fix. Before, a track
+  waited for its device's next fix (or Save tracks).
+- **The first auto-save after a start stays quick with a long history in the layer**: it reads only the
+  saved fixes from the window's start on (and just the earlier part when the window widens), in one
+  pass. A 500,000-fix layer: 0.2 s instead of 5.6 s in QGIS.
 - **Automatic saving is at the top of Settings → Layers.**
 - **Default names for points: a comma-separated list** (Settings → Connection), e.g. `Team 1, Team 2,
   Clue`. Adding a point offers them in a drop-down next to the name (the first is filled in, or the
   last name you sent); any other name can still be typed.
-- Tests: 224 checks.
+- Tests: 227 checks.
 
 ## v0.4.2 — Save geofences, safer sending, Live by default
 

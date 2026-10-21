@@ -60,7 +60,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import (
     Qgis, QgsApplication, QgsAuthMethodConfig, QgsProject, QgsVectorLayer, QgsFeature,
-    QgsFeatureRequest, QgsGeometry, QgsPoint, QgsPointXY, QgsLineString,
+    QgsFeatureRequest, QgsExpression, QgsGeometry, QgsPoint, QgsPointXY, QgsLineString,
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsRectangle, QgsCsException,
     QgsVectorFileWriter, QgsVectorLayerUtils, QgsWkbTypes, QgsMessageLog,
     QgsNetworkAccessManager, QgsMapLayerProxyModel, QgsFieldProxyModel,
@@ -215,6 +215,8 @@ TRACK_SCHEMA = [
 ROUTE_BATCH = 50                # devices per route-report request when loading a window
 AUTO_TRACK_FACTOR = 20          # auto-save: wait 20x a track rewrite's time before the next one…
 AUTO_TRACK_MAX_WAIT = 600       # …but never more than 10 minutes
+SAVED_READ_MARGIN = timedelta(hours=14)   # auto-save reads saved fixes from this long before the oldest
+#                                           one it might save (covers fix_times stored in local time)
 
 GEOFENCE_SCHEMA = [
     ("geofence_id", "integer"), ("name", "string(80)"), ("description", "string(255)"),
@@ -3012,6 +3014,7 @@ class TraccarLive:
                         self.last_error = ""
                     self._rebuild()
                     self._settle_pending(started)
+                    self._auto_track_upto = {}            # a new window / Refresh: rewrite every track
                     self._auto_save()
 
                 def one_done():
@@ -4769,8 +4772,10 @@ class TraccarLive:
         """After a refresh / Live update (Settings → Layers → Save automatically): what's new only.
         Positions: each shown device's fixes not in the layer yet (latest fix, or every fix) — so widening
         the time window saves the earlier fixes too, and nothing is saved twice.
-        Tracks: each device with a newer fix or whose track now starts earlier (a wider window), its
-        track replaced by the window's — backing off for long tracks: after a
+        Saved fixes are read once, and only from the oldest fix that might be saved on (again for the
+        earlier part when the window widens), so a long history in the layer doesn't slow it down.
+        Tracks: after a full load (a new time window, Refresh) every shown track, after a Live update
+        each device with a newer fix — its track replaced by the window's; backing off for long tracks: after a
         rewrite, the next waits at least 20× as long as it took (at most 10 min), so writing never takes
         more than about 5% of the time. Quiet unless something fails."""
         if not self.cfg["auto_save"] or self.win is None or self.play_t is not None:
@@ -4781,24 +4786,25 @@ class TraccarLive:
         shown = self._shown(self.tracks)
         if pts_lyr is not None:
             memo = getattr(self, "_auto_saved", None)
-            if memo is None or memo[0] != pts_lyr.id():
-                memo = self._auto_saved = (pts_lyr.id(), {})
-            saved = memo[1]                                  # dev_id → its fix times (s) in the layer
+            if memo is None or memo["layer"] != pts_lyr.id():
+                memo = self._auto_saved = {"layer": pts_lyr.id(), "since": None, "devs": {}}
+            saved = memo["devs"]                             # dev_id → its fix times (s) in the layer
             if int(self.cfg["points_mode"]) == 1:
                 maybe = [p for v in shown.values() for p in v]
             else:
                 maybe = list(self._shown(self.marker_pos).values())
-            for p in maybe:
-                if p.get("deviceId") not in saved:
-                    saved[p.get("deviceId")] = self._saved_fix_times(pts_lyr, p.get("deviceId"))
-            new = [p for p in maybe if _fix_second(p) not in saved[p.get("deviceId")]]
+            if maybe:
+                since = min(p["_t"] for p in maybe) - SAVED_READ_MARGIN
+                if memo["since"] is None or since < memo["since"]:
+                    self._read_saved_fixes(pts_lyr, since, memo["since"], saved)
+                    memo["since"] = since
+            new = [p for p in maybe if _fix_second(p) not in saved.get(p.get("deviceId"), ())]
             if new and self._write_points(pts_lyr, new)[0] >= 0:
                 for p in new:
-                    saved[p.get("deviceId")].add(_fix_second(p))
+                    saved.setdefault(p.get("deviceId"), set()).add(_fix_second(p))
         if trk_lyr is not None and time.monotonic() >= getattr(self, "_auto_track_next", 0):
-            done = self.__dict__.setdefault("_auto_track_upto", {})    # dev_id → (first, last) fix saved
-            changed = {d: v for d, v in shown.items()
-                       if v and (d not in done or v[-1]["_t"] != done[d][1] or v[0]["_t"] < done[d][0])}
+            done = self.__dict__.setdefault("_auto_track_upto", {})    # dev_id → newest fix in its saved track
+            changed = {d: v for d, v in shown.items() if v and done.get(d) != v[-1]["_t"]}
             if changed:
                 began = time.monotonic()
                 ok = self._write_tracks(trk_lyr, changed, replace=True)[0] >= 0
@@ -4806,24 +4812,35 @@ class TraccarLive:
                 self._auto_track_next = time.monotonic() + min(AUTO_TRACK_MAX_WAIT, AUTO_TRACK_FACTOR * took)
                 if ok:
                     for d, v in changed.items():
-                        done[d] = (v[0]["_t"], v[-1]["_t"])
+                        done[d] = v[-1]["_t"]
         self.last_auto_save = datetime.now().strftime("%H:%M:%S")
 
-    def _saved_fix_times(self, lyr, dev_id):
-        """This device's fix times already in the layer, in whole seconds (none if no such fields)."""
-        names = lyr.fields().names()
-        if "device_id" not in names or "fix_time" not in names:
-            return set()
-        out = set()
-        req = QgsFeatureRequest().setFilterExpression('"device_id" = %d' % int(dev_id))
-        req.setSubsetOfAttributes(["fix_time"], lyr.fields())
+    def _read_saved_fixes(self, lyr, since, until, out):
+        """The fix times (whole seconds) already in the layer from since (up to until, if given), per
+        device → out {dev_id: set}. One pass; the layer filters by time, so it stays quick however much
+        older history it holds. Nothing if the layer has no device_id / fix_time."""
+        fields = lyr.fields()
+        i_dev, i_t = fields.indexOf("device_id"), fields.indexOf("fix_time")
+        if i_dev < 0 or i_t < 0:
+            return
+        expr = '"fix_time" >= to_datetime(%s)' % QgsExpression.quotedString(_iso(since))
+        if until is not None:
+            expr += ' AND "fix_time" < to_datetime(%s)' % QgsExpression.quotedString(_iso(until))
+        req = QgsFeatureRequest().setFilterExpression(expr)
+        req.setFlags(_e(QgsFeatureRequest, "Flag", "NoGeometry"))
+        req.setSubsetOfAttributes([i_dev, i_t])
         for f in lyr.getFeatures(req):
-            v = f["fix_time"]
-            t = _parse_utc(v.toString(_e(Qt, "DateFormat", "ISODate"))) if hasattr(v, "toString") \
-                else (_parse_utc(str(v)) if not _is_null(v) else None)
+            a = f.attributes()
+            dev, v = a[i_dev], a[i_t]
+            if _is_null(dev) or _is_null(v):
+                continue
+            if hasattr(v, "toSecsSinceEpoch"):
+                t = v.toSecsSinceEpoch() if v.isValid() else None
+            else:
+                t = _parse_utc(str(v))
+                t = int(t.timestamp()) if t is not None else None
             if t is not None:
-                out.add(int(t.timestamp()))
-        return out
+                out.setdefault(int(dev), set()).add(int(t))
 
     # ── Field helpers ─────────────────────────────────────────────────────
     @staticmethod
