@@ -215,6 +215,7 @@ TRACK_SCHEMA = [
 ROUTE_BATCH = 50                # devices per route-report request when loading a window
 AUTO_TRACK_FACTOR = 20          # auto-save: wait 20x a track rewrite's time before the next one…
 AUTO_TRACK_MAX_WAIT = 600       # …but never more than 10 minutes
+CATCH_UP_MARGIN = timedelta(minutes=5)    # after missed Live updates, fetch from this long before the last good one
 SAVED_READ_MARGIN = timedelta(hours=14)   # auto-save reads saved fixes from this long before the oldest
 #                                           one it might save (covers fix_times stored in local time)
 
@@ -2560,6 +2561,11 @@ class TraccarLive:
         self.geofences = []        # [{id, name, area, mine, raw, color, kind}] from Traccar, by name
         self._gf_item = None       # canvas item drawing them
         self._send_name = ""       # last name sent to, offered again on the next click
+        self._load_gen = 0         # +1 per full load: replies for an older one are ignored
+        self._prev = None          # (win, tracks, latest) before a reload: shown again if it fails
+        self.reload_pending = False   # a full load failed: Live tries it again instead of an update
+        self.catch_up = None       # {from, ids (None = all)}: fixes missed (failed Live updates, devices a
+        #                            load couldn't get) — fetched by the next good Live update
         self.pending_points = []   # points just sent: drawn until a refresh shows the real device
         self._pending_item = None
         self.groups = []           # Traccar groups and calendars, for the send form
@@ -2879,6 +2885,8 @@ class TraccarLive:
 
     def reload_window(self):
         self.stop_playback()
+        if self.win is not None:
+            self._prev = (self.win, self.tracks, self.latest)
         self.win = None
         self.tracks, self.latest, self.marker_pos = {}, {}, {}
         self.load_window()
@@ -2980,13 +2988,22 @@ class TraccarLive:
             return
         self.loading, self.load_started = True, time.time()
         started = self.load_started
+        self._load_gen += 1
+        gen = self._load_gen
         self.status_msg = "Loading…"
         self._ui()
         self.load_geofences()
 
         def fail(msg):
+            if gen != self._load_gen:
+                return
             self.loading = False
             self.status_msg = ""
+            self.reload_pending = True                # Live tries the load again
+            if self.win is None and self._prev is not None:
+                # Offline, say: show what was there before instead of an empty map
+                self.win, self.tracks, self.latest = self._prev
+                self._rebuild()
             self._error(msg)
 
         def got_devices(devs):
@@ -2999,75 +3016,129 @@ class TraccarLive:
                 for p in positions:
                     if self._prep(p):
                         latest[p["deviceId"]] = p
-                ids = list(self.devices)
-                by_dev = {}
-                state = {"pending": len(ids), "failed": 0}
+                if gen != self._load_gen:
+                    return
 
-                def finish():
+                def finish(by_dev, failed):
+                    if gen != self._load_gen:
+                        return
+                    # A device that couldn't be loaded keeps the fixes it had, within the new window
+                    before = dict((self._prev or (None, {}, None))[1])
+                    before.update(self.tracks)
+                    for d in failed:
+                        kept = [p for p in before.get(d, []) if w["frm"] <= p["_t"] <= w["to"]]
+                        if kept:
+                            by_dev[d] = kept
                     self.loading = False
                     self.status_msg = ""
                     self.win, self.tracks, self.latest = w, by_dev, latest
+                    self._prev, self.reload_pending = None, False
+                    self.catch_up = {"from": w["frm"], "ids": set(failed)} if failed else None
                     self.last_update = datetime.now().strftime("%H:%M:%S")
-                    if state["failed"]:
-                        self._error("%d device(s) could not be loaded" % state["failed"])
+                    if failed:
+                        self._error("%d device(s) could not be loaded — Live (or Refresh) tries them again"
+                                    % len(failed))
                     else:
                         self.last_error = ""
                     self._rebuild()
                     self._settle_pending(started)
-                    self._auto_track_upto = {}            # a new window / Refresh: rewrite every track
+                    # a new window / Refresh: rewrite every track (but not one kept from before)
+                    self._auto_track_upto = {d: t for d, t in getattr(self, "_auto_track_upto", {}).items()
+                                             if d in failed}
                     self._auto_save()
 
-                def one_done():
-                    state["pending"] -= 1
-                    if state["pending"] <= 0:
-                        finish()
-
-                if not ids:
-                    finish()
-                    return
-                q_from, q_to = _quote(_iso(w["frm"])), _quote(_iso(w["to"]))
-
-                def per_device(dev_ids):
-                    """Fallback: one request per device (servers that refuse the route report)."""
-                    for dev_id in dev_ids:
-                        def ok(hist, dev_id=dev_id):
-                            valid = [p for p in hist if self._prep(p)]
-                            valid.sort(key=lambda p: p["_t"])
-                            if valid:
-                                by_dev[dev_id] = valid
-                            one_done()
-
-                        def bad(_msg):
-                            state["failed"] += 1
-                            one_done()
-                        self.api.get("/api/positions?deviceId=%s&from=%s&to=%s" % (dev_id, q_from, q_to), ok, bad)
-
-                # One route report per batch of devices instead of one request per device
-                batches = [ids[i:i + ROUTE_BATCH] for i in range(0, len(ids), ROUTE_BATCH)]
-                for batch in batches:
-                    def ok_batch(rows, batch=batch):
-                        for p in rows or []:
-                            if self._prep(p) and p.get("deviceId") in self.devices:
-                                by_dev.setdefault(p["deviceId"], []).append(p)
-                        for dev_id in batch:
-                            if dev_id in by_dev:
-                                by_dev[dev_id].sort(key=lambda p: p["_t"])
-                            one_done()
-
-                    def bad_batch(_msg, batch=batch):
-                        per_device(batch)
-                    self.api.get("/api/reports/route?%s&from=%s&to=%s" % (
-                        "&".join("deviceId=%s" % d for d in batch), q_from, q_to), ok_batch, bad_batch)
+                self._fetch_fixes(list(self.devices), w["frm"], w["to"], finish)
 
             self.api.get("/api/positions", got_latest, fail)
 
         self.api.get("/api/devices", got_devices, fail)
 
+    def _fetch_fixes(self, ids, frm, to, done):
+        """Every fix of these devices from frm to to: one route report per batch of devices, or one
+        request per device where the server refuses it. done(by_dev, failed_ids) once all replied."""
+        by_dev, failed = {}, set()
+        state = {"pending": len(ids)}
+        if not ids:
+            done(by_dev, failed)
+            return
+        q_from, q_to = _quote(_iso(frm)), _quote(_iso(to))
+
+        def one_done():
+            state["pending"] -= 1
+            if state["pending"] <= 0:
+                done(by_dev, failed)
+
+        def per_device(dev_ids):
+            """Fallback: one request per device (servers that refuse the route report)."""
+            for dev_id in dev_ids:
+                def ok(hist, dev_id=dev_id):
+                    valid = [p for p in hist if self._prep(p)]
+                    valid.sort(key=lambda p: p["_t"])
+                    if valid:
+                        by_dev[dev_id] = valid
+                    one_done()
+
+                def bad(_msg, dev_id=dev_id):
+                    failed.add(dev_id)
+                    one_done()
+                self.api.get("/api/positions?deviceId=%s&from=%s&to=%s" % (dev_id, q_from, q_to), ok, bad)
+
+        # One route report per batch of devices instead of one request per device
+        for i in range(0, len(ids), ROUTE_BATCH):
+            batch = ids[i:i + ROUTE_BATCH]
+
+            def ok_batch(rows, batch=batch):
+                mine = set(batch)
+                for p in rows or []:
+                    if self._prep(p) and p.get("deviceId") in mine:
+                        by_dev.setdefault(p["deviceId"], []).append(p)
+                for dev_id in batch:
+                    if dev_id in by_dev:
+                        by_dev[dev_id].sort(key=lambda p: p["_t"])
+                    one_done()
+
+            def bad_batch(_msg, batch=batch):
+                per_device(batch)
+            self.api.get("/api/reports/route?%s&from=%s&to=%s" % (
+                "&".join("deviceId=%s" % d for d in batch), q_from, q_to), ok_batch, bad_batch)
+
+    def _run_catch_up(self):
+        """After missed Live updates (out of coverage, say) or devices a load couldn't get: fetch their
+        fixes since then and merge them in, so the map and auto-save get the gap without a Refresh."""
+        cu, w, gen = self.catch_up, self.win, self._load_gen
+        if cu is None or w is None or getattr(self, "_catching_up", False):
+            return
+        ids = [d for d in self.devices if cu["ids"] is None or d in cu["ids"]]
+        now = datetime.now(timezone.utc)
+        self._catching_up = True
+
+        def done(by_dev, failed):
+            self._catching_up = False
+            if gen != self._load_gen or self.win is None:
+                return                                   # a new window was loaded meanwhile
+            w2 = self.win
+            tracks = dict(self.tracks)
+            for d, fixes in by_dev.items():
+                merged = {p["_t"]: p for p in tracks.get(d, [])}
+                for p in fixes:
+                    if p["_t"] >= w2["frm"] and (w2["end"] is None or p["_t"] <= w2["end"]):
+                        merged.setdefault(p["_t"], p)
+                tracks[d] = sorted(merged.values(), key=lambda p: p["_t"])
+                getattr(self, "_auto_track_upto", {}).pop(d, None)    # fixes in the middle: rewrite it
+            self.tracks = {k: v for k, v in tracks.items() if v}
+            if self.catch_up is cu:                      # (a newer gap, if any, already covers this one)
+                self.catch_up = {"from": cu["from"], "ids": failed} if failed else None
+            self._rebuild()
+            self._auto_save()
+
+        self._fetch_fixes(ids, max(cu["from"], w["frm"]), now if w["end"] is None else min(now, w["end"]), done)
+
     def poll_live(self):
-        """Add each device's new fix to its track and move a 'Last …' window on."""
+        """Add each device's new fix to its track and move a 'Last …' window on; fetch any gap left by
+        missed updates. A full load that failed is tried again instead."""
         if self.loading:
             return
-        if self.win is None:
+        if self.win is None or self.reload_pending:
             self.load_window()
             return
         self.load_geofences()
@@ -3077,6 +3148,10 @@ class TraccarLive:
 
         def fail(msg):
             self._error(msg)
+            if self.win is not None:                     # missed: fetch from the last good update next time
+                frm = self.win["to"] - CATCH_UP_MARGIN
+                cu = self.catch_up
+                self.catch_up = {"from": min(frm, cu["from"]) if cu else frm, "ids": None}
 
         def got_devices(devs):
             self.devices = {d["id"]: {"name": d.get("name") or str(d["id"]),
@@ -3113,6 +3188,8 @@ class TraccarLive:
                 self._rebuild()
                 self._settle_pending(started)
                 self._auto_save()
+                if self.catch_up is not None:
+                    self._run_catch_up()
 
             self.api.get("/api/positions", got_latest, fail)
 

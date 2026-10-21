@@ -54,6 +54,7 @@ DEVICES = [{"id": 1, "name": "Phone A", "uniqueId": "352000000000001", "status":
            {"id": 2, "name": "Van 3", "uniqueId": "van3", "status": "offline"},
            {"id": 3, "name": "Spare", "uniqueId": "spare", "status": "unknown"}]
 REQUESTS = []                              # GET paths the plugin asked for
+DOWN = {"all": False, "route": False, "devices": set()}   # out of coverage: every / the route / these devices' requests fail
 
 
 def _fix(dev, t, lon, lat, i):
@@ -170,6 +171,11 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         REQUESTS.append(u.path)
+        if DOWN["all"] or (DOWN["route"] and u.path == "/api/reports/route") or (
+                u.path == "/api/positions" and "deviceId" in q and int(q["deviceId"][0]) in DOWN["devices"]):
+            self.send_response(503)
+            self.end_headers()
+            return
         if u.path == "/api/geofences":
             body = GEOFENCES
         elif u.path == "/api/reports/route":       # every requested device's fixes in one reply
@@ -1331,6 +1337,85 @@ def t16j_send_form_and_tools():
         plugin._send_dialog = orig
     check("Layers panel right-click: Send selected features to Traccar…",
           plugin.act_layer_send is not None and "Send selected features" in plugin.act_layer_send.text())
+
+
+@test
+def t16j_outage_keeps_tracks_and_catches_up():
+    path = os.path.join(TMP, "outage_test.gpkg")
+    pts, trk, err = mod.create_template_gpkg(path)
+    for lyr in (pts, trk):
+        add(lyr)
+    keep = {k: plugin.cfg[k] for k in ("points_layer_id", "tracks_layer_id", "points_mode", "auto_save")}
+    n_pos = len(POS[1])
+    try:
+        plugin.set_live(False)
+        plugin.show_all()
+        load(180)
+        n1 = len(plugin.tracks.get(1, []))
+        # ── a device the load can't get keeps its track ──
+        DOWN["route"], DOWN["devices"] = True, {1}
+        try:
+            load(180)
+        finally:
+            DOWN["route"], DOWN["devices"] = False, set()
+        check("a device a load couldn't get keeps its track (within the window)",
+              n1 > 0 and len(plugin.tracks.get(1, [])) == n1 and plugin.catch_up is not None
+              and plugin.catch_up["ids"] == {1}, (n1, len(plugin.tracks.get(1, [])), plugin.catch_up))
+        plugin.poll_live()
+        check("…and the next Live update gets it again",
+              wait(lambda: plugin.catch_up is None) and len(plugin.tracks.get(1, [])) >= n1)
+        # ── an offline Refresh keeps the map; Live tries the load again ──
+        DOWN["all"] = True
+        try:
+            plugin.reload_window()
+            wait(lambda: not plugin.loading)
+            check("offline Refresh: the map keeps what it showed; the load is tried again",
+                  len(plugin.tracks.get(1, [])) >= n1 and plugin.win is not None and plugin.reload_pending)
+        finally:
+            DOWN["all"] = False
+        plugin.poll_live()
+        check("…back online: the next Live update loads the window", wait(lambda: not plugin.reload_pending
+                                                                         and not plugin.loading))
+        # ── missed Live updates: the gap is fetched with the next good one, and auto-saved ──
+        plugin.cfg.update(points_layer_id=pts.id(), tracks_layer_id=trk.id(), points_mode=1, auto_save=True)
+        plugin._auto_saved, plugin._auto_track_next = None, 0
+        load(180)
+        n_saved, n_before, good_to = pts.featureCount(), len(plugin.tracks[1]), plugin.win["to"]
+        DOWN["all"] = True
+        try:
+            plugin.poll_live()
+            wait(lambda: plugin.catch_up is not None, 5)
+            check("a failed Live update: the map keeps its tracks, the gap is noted",
+                  len(plugin.tracks[1]) == n_before and plugin.catch_up is not None
+                  and plugin.catch_up["from"] <= good_to and plugin.catch_up["ids"] is None, plugin.catch_up)
+            wait(lambda: False, 3)
+            last = POS[1][-1]
+            gap = [good_to + timedelta(seconds=0.5 + k) for k in range(3)]   # reach Traccar while we're offline
+            for k, t in enumerate(gap):
+                POS[1].append(_fix(1, t, last["longitude"] + 0.001 * (k + 1), last["latitude"], 7000 + k))
+        finally:
+            DOWN["all"] = False
+        plugin.poll_live()
+        secs = {int(t.replace(microsecond=0).timestamp()) for t in gap}
+        have = lambda: {int(p["_t"].timestamp()) for p in plugin.tracks.get(1, [])}  # noqa: E731
+        check("back in coverage: the next Live update fetches the whole gap, not just the latest fix",
+              wait(lambda: plugin.catch_up is None and secs <= have()) and len(plugin.tracks[1]) == n_before + 3
+              and plugin.tracks[1] == sorted(plugin.tracks[1], key=lambda p: p["_t"]),
+              (len(plugin.tracks[1]), n_before, plugin.catch_up))
+        saved = lambda: {f["fix_time"].toSecsSinceEpoch() for f in pts.getFeatures()  # noqa: E731
+                         if f["device_id"] == 1}
+        n_pts1 = lambda: [f["n_points"] for f in trk.getFeatures() if f["device_id"] == 1]  # noqa: E731
+        check("…and auto-save saves the gap: every fix once", wait(lambda: secs <= saved())
+              and pts.featureCount() == n_saved + 3, (pts.featureCount(), n_saved))
+        plugin._auto_track_next = 0                     # (the rewrite for the latest fix just ran: backing off)
+        plugin.poll_live()
+        check("…and the track is rewritten with it once the back-off allows",
+              wait(lambda: n_pts1() == [len(plugin.tracks[1])]), (n_pts1(), len(plugin.tracks[1])))
+    finally:
+        DOWN.update(all=False, route=False, devices=set())
+        del POS[1][n_pos:]
+        plugin.cfg.update(keep)
+        plugin._auto_track_next, plugin._auto_saved = 0, None
 
 
 @test

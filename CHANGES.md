@@ -16,7 +16,13 @@
 - **Default names for points: a comma-separated list** (Settings → Connection), e.g. `Team 1, Team 2,
   Clue`. Adding a point offers them in a drop-down next to the name (the first is filled in, or the
   last name you sent); any other name can still be typed.
-- Tests: 227 checks.
+- **In and out of coverage.** A Live update that fails keeps the map as it is (as before), and the next
+  one that gets through now also fetches everything the devices sent in between — on the map and to
+  auto-save — instead of only each device's latest fix, which left a gap until Refresh.
+- **A load that fails keeps what was there.** A Refresh or new time window while offline shows the
+  previous window again (not an empty map), and Live tries the load again. A device whose part of a load
+  fails keeps its track (the part inside the window) and is fetched again with the next Live update.
+- Tests: 235 checks.
 
 ## v0.4.2 — Save geofences, safer sending, Live by default
 
