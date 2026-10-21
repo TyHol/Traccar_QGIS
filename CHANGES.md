@@ -1,6 +1,6 @@
 # Traccar Live (QGIS) — Changes
 
-## v0.4.2 (in development)
+## v0.4.2 — Save geofences, safer sending, Live by default
 
 - **Moving a device you didn't add asks first.** Send point / Add → Point with the name of a device that
   wasn't added from QGIS or QField (a real tracker, say) now asks "This moves '…' — move it?" before
@@ -46,7 +46,8 @@
   feature) the point can't appear, so its stand-in goes at once with a note.
 - Fixed: the point's details loop reused a variable name, which would have lost track of the marker.
 - Tests: the drawing, the dashed line, getting the previous map tool back after sending, Esc and
-  Cancel, a sent geofence and a sent point shown at once; 193 checks.
+  Cancel, a sent geofence and a sent point shown at once, saving geofences, auto-save, asking before
+  moving a device, one route report; 215 checks.
 
 ## v0.4.1 — Right-click to send
 
