@@ -245,7 +245,7 @@ DEFAULTS = {
     "latlon_style": "dd",           # lat / long as "dd" decimal degrees, "dm" deg + min, "dms" deg + min + sec
     "latlon_hemi": "signs",         # "signs" (-6.31) or "letters" (6.31 W)
     "play_speed": 60,               # playback: seconds of track per real second
-    "send_device_id": "",           # Send point: name offered first when a point is clicked
+    "send_device_id": "",           # Send point: names offered in the form's drop-down ("Team 1, Team 2, …")
     "send_url": "",                 # Send point: OsmAnd endpoint; blank = http://<server host>:5055
     "show_geofences": True,         # Traccar geofences drawn on the map
     "circle_radius": 500,           # ⭕ Circle / points sent as geofences: radius in metres
@@ -265,6 +265,16 @@ DEFAULTS = {
 # ════════════════════════════════════════════════════════════════════════════
 
 _TZ_NO_COLON = re.compile(r"([+-]\d{2})(\d{2})$")
+
+
+def _fix_second(p):
+    """A fix's time in whole seconds — what a layer's fix_time keeps."""
+    return int(p["_t"].timestamp())
+
+
+def name_list(text):
+    """'Team 1, Team 2,, Clue' → ['Team 1', 'Team 2', 'Clue'] (the default names for Send point)."""
+    return [n.strip() for n in str(text or "").split(",") if n.strip()]
 
 
 def _parse_utc(s):
@@ -816,15 +826,21 @@ class SendDialog(QDialog):
             f.addRow(_hint(("Centre: " if mode == "circle" else "At: ") + where))
         else:
             f.addRow(_hint("%d corners" % len(coords)))
-        self.name = QLineEdit()
-        f.addRow("Name:", self.name)
         if mode == "point":
-            self.name.setText(plugin._send_name or plugin.cfg["send_device_id"])
+            # The default names (Settings → Connection) in a drop-down; any other name can be typed
+            defaults = name_list(plugin.cfg["send_device_id"])
+            self.name_box = QComboBox()
+            self.name_box.setEditable(True)
+            self.name_box.setInsertPolicy(_e(QComboBox, "InsertPolicy", "NoInsert"))
+            self.name_box.addItems(defaults)
+            self.name = self.name_box.lineEdit()
+            f.addRow("Name:", self.name_box)
+            self.name.setText(plugin._send_name or (defaults[0] if defaults else ""))
             self.name.setPlaceholderText("e.g. Team 2 or Clue 4")
             names = sorted({(d.get("name") or "") for d in plugin.devices.values()} - {""}, key=str.lower)
             comp = QCompleter(names, self)
             comp.setCaseSensitivity(_e(Qt, "CaseSensitivity", "CaseInsensitive"))
-            self.name.setCompleter(comp)
+            self.name_box.setCompleter(comp)
             f.addRow(_hint("A new name adds a new point (device) in Traccar; the name of an existing device "
                            "moves it here. The details below are for a new point."))
             self.uid = QLineEdit()
@@ -844,6 +860,8 @@ class SendDialog(QDialog):
             f.addRow("Model:", self.model)
             f.addRow("Contact:", self.contact)
         else:
+            self.name = QLineEdit()
+            f.addRow("Name:", self.name)
             self.name.setPlaceholderText("e.g. Sector A")
             if edit is None:
                 f.addRow(_hint("A geofence sent from QGIS or QField before with the same name is replaced."))
@@ -2008,14 +2026,15 @@ class SettingsDialog(QDialog):
         g = QGroupBox("📤  Send point")
         gf = QFormLayout(g)
         self.send_id_edit = QLineEdit(c["send_device_id"])
-        self.send_id_edit.setPlaceholderText("e.g. qgis-marker")
+        self.send_id_edit.setPlaceholderText("e.g. Team 1, Team 2, Clue")
         self.send_url_edit = QLineEdit(c["send_url"])
         self.send_url_edit.setPlaceholderText(osmand_url(dict(c, send_url="")))
-        gf.addRow("Default name:", self.send_id_edit)
+        gf.addRow("Default names:", self.send_id_edit)
         gf.addRow("Send to (OsmAnd):", self.send_url_edit)
-        hint = QLabel("Each point clicked with <i>📤 Send point</i> asks for a name (this one is offered "
-                      "first). A new name adds a new device with that name in Traccar at the point; the "
-                      "name or identifier of an existing device moves that device there. Positions go to "
+        hint = QLabel("Each point clicked with <i>📤 Send point</i> asks for a name: the default names, "
+                      "separated by commas, are in its drop-down, and any other name can be typed. A new "
+                      "name adds a new device with that name in Traccar at the point; the name or identifier "
+                      "of an existing device moves that device there. Positions go to "
                       "Traccar's OsmAnd port (5055 unless your server uses another); leave <i>Send to</i> "
                       "blank for the server above on port 5055.")
         hint.setWordWrap(True)
@@ -2027,6 +2046,16 @@ class SettingsDialog(QDialog):
         # ── Layers ────────────────────────────────────────────────────────
         t = QWidget()
         v = QVBoxLayout(t)
+
+        g = QGroupBox("Automatic saving")
+        gf = QVBoxLayout(g)
+        self.auto_save_chk = QCheckBox("Save automatically after every refresh and Live update")
+        gf.addWidget(self.auto_save_chk)
+        gf.addWidget(_hint("Only what's new is saved: each device's fixes not yet in the layer (latest fix, or "
+                           "every fix, as chosen below — a wider time window saves the earlier ones too) and "
+                           "its track, kept to the most recent one; geofences that changed. Hidden devices "
+                           "are left out."))
+        v.addWidget(g)
 
         g = QGroupBox("📍  Positions")
         gf = QFormLayout(g)
@@ -2082,15 +2111,6 @@ class SettingsDialog(QDialog):
         gf.addRow("Lines:", self.gf_line_combo)
         gf.addRow(_hint("Save geofences writes Traccar's geofences here; saving again replaces each one "
                         "(matched by geofence_id). Circles are saved as polygons."))
-        v.addWidget(g)
-
-        g = QGroupBox("Automatic saving")
-        gf = QVBoxLayout(g)
-        self.auto_save_chk = QCheckBox("Save automatically after every refresh and Live update")
-        gf.addWidget(self.auto_save_chk)
-        gf.addWidget(_hint("Only what's new is saved: each device's new fixes (latest fix, or every fix, as "
-                           "chosen above) and its track, kept to the most recent one; geofences that "
-                           "changed. Hidden devices are left out."))
         v.addWidget(g)
 
         gp = QPushButton("New GeoPackage…  (creates all four layers)")
@@ -2424,7 +2444,8 @@ and circles (as polygons) to a polygon layer, lines to a line layer, with geofen
 type, radius_m, speed_kmh, color, calendar and made_in. Saving again replaces each one by its
 geofence_id.<br>
 <b>Save automatically</b> (Settings → Layers) saves after every refresh and Live update — only what's
-new: each device's new fixes, its track (kept to the most recent one) and geofences that changed.
+new: each device's fixes not yet in the layer (a wider time window saves the earlier ones too), its
+track (kept to the most recent one) and geofences that changed.
 <i>New GeoPackage…</i> creates all four layers.</p>
 <h3>Times</h3>
 <p>Times here are local, including summer time. Date/time fields are stored in UTC (QGIS shows them
@@ -4746,33 +4767,38 @@ class TraccarLive:
 
     def _auto_save(self):
         """After a refresh / Live update (Settings → Layers → Save automatically): what's new only.
-        Positions: each shown device's fixes newer than the last saved one (latest fix, or every fix).
-        Tracks: each device with new fixes, its track replaced — backing off for long tracks: after a
+        Positions: each shown device's fixes not in the layer yet (latest fix, or every fix) — so widening
+        the time window saves the earlier fixes too, and nothing is saved twice.
+        Tracks: each device with a newer fix or whose track now starts earlier (a wider window), its
+        track replaced by the window's — backing off for long tracks: after a
         rewrite, the next waits at least 20× as long as it took (at most 10 min), so writing never takes
         more than about 5% of the time. Quiet unless something fails."""
         if not self.cfg["auto_save"] or self.win is None or self.play_t is not None:
             return
         prj = QgsProject.instance()
-        upto = self.__dict__.setdefault("_auto_upto", {})          # dev_id → newest fix saved
         pts_lyr = prj.mapLayer(self.cfg["points_layer_id"]) if self.cfg["points_layer_id"] else None
         trk_lyr = prj.mapLayer(self.cfg["tracks_layer_id"]) if self.cfg["tracks_layer_id"] else None
         shown = self._shown(self.tracks)
         if pts_lyr is not None:
-            for dev_id in set(self._shown(self.marker_pos)) | set(shown):
-                if dev_id not in upto:
-                    upto[dev_id] = self._newest_saved(pts_lyr, dev_id)
+            memo = getattr(self, "_auto_saved", None)
+            if memo is None or memo[0] != pts_lyr.id():
+                memo = self._auto_saved = (pts_lyr.id(), {})
+            saved = memo[1]                                  # dev_id → its fix times (s) in the layer
             if int(self.cfg["points_mode"]) == 1:
-                new = [p for d, v in shown.items() for p in v if upto.get(d) is None or p["_t"] > upto[d]]
+                maybe = [p for v in shown.values() for p in v]
             else:
-                new = [p for d, p in self._shown(self.marker_pos).items()
-                       if upto.get(d) is None or p["_t"] > upto[d]]
+                maybe = list(self._shown(self.marker_pos).values())
+            for p in maybe:
+                if p.get("deviceId") not in saved:
+                    saved[p.get("deviceId")] = self._saved_fix_times(pts_lyr, p.get("deviceId"))
+            new = [p for p in maybe if _fix_second(p) not in saved[p.get("deviceId")]]
             if new and self._write_points(pts_lyr, new)[0] >= 0:
                 for p in new:
-                    d = p.get("deviceId")
-                    upto[d] = max(p["_t"], upto[d]) if upto.get(d) is not None else p["_t"]
+                    saved[p.get("deviceId")].add(_fix_second(p))
         if trk_lyr is not None and time.monotonic() >= getattr(self, "_auto_track_next", 0):
-            done = self.__dict__.setdefault("_auto_track_upto", {})
-            changed = {d: v for d, v in shown.items() if v and done.get(d) != v[-1]["_t"]}
+            done = self.__dict__.setdefault("_auto_track_upto", {})    # dev_id → (first, last) fix saved
+            changed = {d: v for d, v in shown.items()
+                       if v and (d not in done or v[-1]["_t"] != done[d][1] or v[0]["_t"] < done[d][0])}
             if changed:
                 began = time.monotonic()
                 ok = self._write_tracks(trk_lyr, changed, replace=True)[0] >= 0
@@ -4780,24 +4806,24 @@ class TraccarLive:
                 self._auto_track_next = time.monotonic() + min(AUTO_TRACK_MAX_WAIT, AUTO_TRACK_FACTOR * took)
                 if ok:
                     for d, v in changed.items():
-                        done[d] = v[-1]["_t"]
+                        done[d] = (v[0]["_t"], v[-1]["_t"])
         self.last_auto_save = datetime.now().strftime("%H:%M:%S")
 
-    def _newest_saved(self, lyr, dev_id):
-        """The newest fix_time of this device already in the layer (None if none / no such fields)."""
+    def _saved_fix_times(self, lyr, dev_id):
+        """This device's fix times already in the layer, in whole seconds (none if no such fields)."""
         names = lyr.fields().names()
         if "device_id" not in names or "fix_time" not in names:
-            return None
-        best = None
+            return set()
+        out = set()
         req = QgsFeatureRequest().setFilterExpression('"device_id" = %d' % int(dev_id))
         req.setSubsetOfAttributes(["fix_time"], lyr.fields())
         for f in lyr.getFeatures(req):
             v = f["fix_time"]
             t = _parse_utc(v.toString(_e(Qt, "DateFormat", "ISODate"))) if hasattr(v, "toString") \
                 else (_parse_utc(str(v)) if not _is_null(v) else None)
-            if t is not None and (best is None or t > best):
-                best = t
-        return best
+            if t is not None:
+                out.add(int(t.timestamp()))
+        return out
 
     # ── Field helpers ─────────────────────────────────────────────────────
     @staticmethod

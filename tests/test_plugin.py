@@ -316,6 +316,8 @@ def t02a_one_route_request_and_live_default():
           [sd.tabs.tabText(i) for i in range(sd.tabs.count())] == ["Connection", "Layers", "Incident", "Advanced"]
           and sd.tabs.widget(2).isAncestorOf(sd.ev_combo) and sd.tabs.widget(2).isAncestorOf(sd.tag_chk),
           [sd.tabs.tabText(i) for i in range(sd.tabs.count())])
+    lay = sd.tabs.widget(1).widget().layout()
+    check("Layers: Automatic saving comes first", lay.itemAt(0).widget().isAncestorOf(sd.auto_save_chk))
     sd._closed = True
     sd.deleteLater()
     flush_deletes()
@@ -1117,11 +1119,26 @@ def t16j_send_form_and_tools():
           extra == {"description": "Main track", "calendarId": 9,
                     "attributes": {"color": "#2E7D32", "speedLimit": 10.8, "polylineDistance": 40}}, extra)
     f.deleteLater()
+    keep_names, keep_last = plugin.cfg["send_device_id"], plugin._send_name
+    plugin.cfg["send_device_id"], plugin._send_name = "Team 1, Team 2,, Clue ", ""
     pf = mod.SendDialog(plugin, "point", [(53.36, -6.31)])
     check("point form: identifier, category, group, phone, model, contact; no colour",
           pf.category.count() == len(mod.DEVICE_CATEGORIES) and pf.group.itemText(1) == "Search teams"
           and not hasattr(pf, "swatches"))
+    check("default names (comma-separated) are the name drop-down; the first is filled in",
+          [pf.name_box.itemText(i) for i in range(pf.name_box.count())] == ["Team 1", "Team 2", "Clue"]
+          and pf.name.text() == "Team 1", [pf.name_box.itemText(i) for i in range(pf.name_box.count())])
+    pf.name_box.setCurrentIndex(2)
+    v2 = pf.values()["name"]
+    pf.name.setText("Clue 9")
+    check("…picking one fills the name; any other name can still be typed",
+          v2 == "Clue" and pf.values()["name"] == "Clue 9" and pf.name_box.count() == 3)
     pf.deleteLater()
+    plugin._send_name = "Clue 9"
+    pf = mod.SendDialog(plugin, "point", [(53.36, -6.31)])
+    check("…the last name sent is offered first next time", pf.name.text() == "Clue 9")
+    pf.deleteLater()
+    plugin.cfg["send_device_id"], plugin._send_name = keep_names, keep_last
     # ── Area tool: corners on the map, right-click → form → geofence ──
     forms = []
     orig = plugin._send_dialog
@@ -1382,6 +1399,36 @@ def t16k_save_geofences_and_auto_save():
         check("…and the next refresh after the wait rewrites the track with everything since",
               wait(lambda: last_upd() > before_upd) and trk.featureCount() == len(
                   [v for v in plugin.tracks.values() if v]))
+        # ── a wider time window: the earlier fixes are saved too (none twice); the track at once ──
+        plugin.cfg.update(points_mode=1)
+        for lyr in (pts, trk):
+            lyr.dataProvider().deleteFeatures([f.id() for f in lyr.getFeatures()])
+        plugin._auto_saved = None
+        plugin._auto_track_upto = {}
+        in_win = lambda: sum(len(v) for v in plugin._shown(plugin.tracks).values())  # noqa: E731
+        trk_start = lambda: min(f["start_time"].toMSecsSinceEpoch() for f in trk.getFeatures()  # noqa: E731
+                                if f["device_id"] == 1)
+        plugin._auto_track_next = 0
+        load(60)
+        n60, start60 = in_win(), trk_start()
+        check("every fix: the refresh saves each fix in the window", pts.featureCount() == n60 > 0,
+              (pts.featureCount(), n60))
+        plugin._auto_track_next = 0
+        load(180)
+        n180 = in_win()
+        check("a wider window: the earlier fixes are saved too, none twice", pts.featureCount() == n180 > n60,
+              (pts.featureCount(), n180, n60))
+        n_pts1 = [f["n_points"] for f in trk.getFeatures() if f["device_id"] == 1]
+        check("…and each track is rewritten at once to start earlier (still one per device)",
+              trk_start() < start60 and n_pts1 == [len(plugin.tracks[1])]
+              and trk.featureCount() == len([v for v in plugin.tracks.values() if v]), (n_pts1, len(plugin.tracks[1])))
+        plugin._auto_track_next = 0
+        load(60)
+        check("a narrower window again: nothing saved twice", pts.featureCount() == n180, pts.featureCount())
+        plugin._auto_saved = None
+        load(180)
+        check("…not even after a restart (what's in the layer is read first)", pts.featureCount() == n180,
+              pts.featureCount())
         POS[1].pop()
         g_before = gfp.featureCount()
         plugin.load_geofences()
